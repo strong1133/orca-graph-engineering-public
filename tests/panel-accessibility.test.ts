@@ -153,6 +153,57 @@ describe.each([
     }
   });
 
+  it("shows active Todos by default while preserving completed and cancelled history", async () => {
+    const dom = await mountPanel(wide, (bootstrap) => {
+      const now = "2026-08-09T00:00:00.000Z";
+      const statuses = [
+        ...Array<"open">(21).fill("open"),
+        ...Array<"in_progress">(2).fill("in_progress"),
+        ...Array<"done">(6).fill("done"),
+        "cancelled" as const,
+      ];
+      bootstrap.store.todos = statuses.map((status, index) => ({
+        id: `todo-${index + 1}`,
+        version: index + 1,
+        title: `Todo ${index + 1}`,
+        notes: "",
+        draft: `Todo ${index + 1}`,
+        promptRevisions: [],
+        status,
+        priority: "medium",
+        tags: [],
+        createdAt: now,
+        updatedAt: now,
+      }));
+    });
+    try {
+      const { document, Event } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
+
+      const filter = document.querySelector<HTMLSelectElement>('[data-action="todo-status-filter"]');
+      expect(filter?.value).toBe("active");
+      expect(document.querySelector('[aria-label="Todo 관리"]')?.textContent).toContain("표시 23 · 활성 23 · 전체 30");
+      expect(document.querySelectorAll(".work-list .work-card")).toHaveLength(23);
+
+      if (filter) {
+        filter.value = "all";
+        filter.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      expect(document.querySelector('[aria-label="Todo 관리"]')?.textContent).toContain("표시 30 · 활성 23 · 전체 30");
+      expect(document.querySelectorAll(".work-list .work-card")).toHaveLength(30);
+
+      const rerenderedFilter = document.querySelector<HTMLSelectElement>('[data-action="todo-status-filter"]');
+      if (rerenderedFilter) {
+        rerenderedFilter.value = "done";
+        rerenderedFilter.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      expect(document.querySelector('[aria-label="Todo 관리"]')?.textContent).toContain("표시 6 · 활성 23 · 전체 30");
+      expect(document.querySelectorAll(".work-list .work-card")).toHaveLength(6);
+    } finally {
+      dom.window.close();
+    }
+  });
+
   it("manages Domain and Milestone scopes and filters grouped Task lists", async () => {
     const dom = await mountPanel(wide);
     try {
@@ -198,6 +249,20 @@ describe.each([
         groupSelect.dispatchEvent(new Event("change", { bubbles: true }));
       }
       expect([...document.querySelectorAll(".work-group > header strong")].some((item) => item.textContent?.includes("제품 개발 / v1 출시"))).toBe(true);
+
+      const groupToggle = [...document.querySelectorAll<HTMLButtonElement>('[data-action="toggle-work-group"]')]
+        .find((item) => item.textContent?.includes("제품 개발 / v1 출시"));
+      expect(groupToggle?.getAttribute("aria-expanded")).toBe("true");
+      groupToggle?.click();
+      const collapsedToggle = [...document.querySelectorAll<HTMLButtonElement>('[data-action="toggle-work-group"]')]
+        .find((item) => item.textContent?.includes("제품 개발 / v1 출시"));
+      expect(collapsedToggle?.getAttribute("aria-expanded")).toBe("false");
+      expect(collapsedToggle?.closest(".work-group")?.querySelector(".work-card")).toBeNull();
+      collapsedToggle?.click();
+      const expandedToggle = [...document.querySelectorAll<HTMLButtonElement>('[data-action="toggle-work-group"]')]
+        .find((item) => item.textContent?.includes("제품 개발 / v1 출시"));
+      expect(expandedToggle?.getAttribute("aria-expanded")).toBe("true");
+      expect(expandedToggle?.closest(".work-group")?.querySelector(".work-card")).not.toBeNull();
 
       const search = document.querySelector<HTMLInputElement>('[data-action="work-search"]');
       if (search) {

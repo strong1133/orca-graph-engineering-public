@@ -100,10 +100,11 @@ interface ViewState {
   includeArchived: boolean;
   workQuery: string;
   taskStatusFilter: LocalTaskStatus | "all";
-  todoStatusFilter: LocalTodoStatus | "all";
+  todoStatusFilter: LocalTodoStatus | "active" | "all";
   workDomainFilter: string;
   workMilestoneFilter: string;
   workGroup: "none" | "domain" | "milestone" | "status" | "priority";
+  collapsedWorkGroups: Set<string>;
   workSort: "updated-desc" | "due-asc" | "priority" | "title";
   scopeQuery: string;
   nodeQuery: string;
@@ -175,10 +176,11 @@ const view: ViewState = {
   includeArchived: false,
   workQuery: "",
   taskStatusFilter: "all",
-  todoStatusFilter: "all",
+  todoStatusFilter: "active",
   workDomainFilter: "all",
   workMilestoneFilter: "all",
   workGroup: "domain",
+  collapsedWorkGroups: new Set(),
   workSort: "updated-desc",
   scopeQuery: "",
   nodeQuery: "",
@@ -2131,9 +2133,13 @@ function renderWorkCards(items: Array<LocalTask | LocalTodo>, isTask: boolean, s
     const label = workGroupLabel(item, isTask);
     groups.set(label, [...(groups.get(label) ?? []), item]);
   }
-  return [...groups.entries()].map(([label, grouped]) => `<section class="work-group" aria-label="그룹 ${esc(label)}">
-    ${view.workGroup !== "none" ? `<header><strong>${esc(label)}</strong><span>${grouped.length}</span></header>` : ""}
-    ${grouped.map((item) => {
+  return [...groups.entries()].map(([label, grouped]) => {
+    const groupKey = `${isTask ? "task" : "todo"}:${view.workGroup}:${label}`;
+    const collapsible = view.workGroup !== "none";
+    const collapsed = collapsible && view.collapsedWorkGroups.has(groupKey);
+    return `<section class="work-group ${collapsed ? "collapsed" : ""}" aria-label="그룹 ${esc(label)}">
+    ${collapsible ? `<header><button class="work-group-toggle" data-action="toggle-work-group" data-id="${esc(groupKey)}" aria-expanded="${collapsed ? "false" : "true"}" aria-label="${esc(label)} 그룹 ${collapsed ? "펼치기" : "접기"}"><span class="work-group-chevron" aria-hidden="true">${collapsed ? "▸" : "▾"}</span><strong>${esc(label)}</strong><span>${grouped.length}</span></button></header>` : ""}
+    ${collapsed ? "" : grouped.map((item) => {
       const selected = item.id === selectedId;
       const status = isTask ? taskStatusLabel[(item as LocalTask).status] : todoStatusLabel[(item as LocalTodo).status];
       const detail = item.draft;
@@ -2145,16 +2151,20 @@ function renderWorkCards(items: Array<LocalTask | LocalTodo>, isTask: boolean, s
         <span class="work-card-meta"><span>${esc(status)}</span><span>${esc(itemScope(item).label)}</span><span class="meta-label meta-${metaState}">Meta ${metaState === "current" ? "최신" : metaState === "running" ? "생성 중" : metaState === "stale" ? "이전본" : metaState === "failed" ? "실패" : "없음"}</span><span>${esc(link)}</span>${item.dueDate ? `<span>마감 ${esc(item.dueDate)}</span>` : ""}</span>
       </button>`;
     }).join("")}
-  </section>`).join("");
+  </section>`;
+  }).join("");
 }
 
 function renderLocalWorkManager(kind: "task" | "todo"): string {
   const isTask = kind === "task";
+  const activeTodoCount = store.todos.filter((todo) => todo.status === "open" || todo.status === "in_progress").length;
   const tasks = sortWorkItems(store.tasks.filter((task) =>
     (view.taskStatusFilter === "all" || task.status === view.taskStatusFilter)
     && workScopeMatches(task) && workItemMatches(task, `${task.draft} ${task.metaDraft ?? ""}`)));
   const todos = sortWorkItems(store.todos.filter((todo) =>
-    (view.todoStatusFilter === "all" || todo.status === view.todoStatusFilter)
+    (view.todoStatusFilter === "all"
+      || (view.todoStatusFilter === "active" && (todo.status === "open" || todo.status === "in_progress"))
+      || todo.status === view.todoStatusFilter)
     && workScopeMatches(todo) && workItemMatches(todo, `${todo.draft} ${todo.metaDraft ?? ""} ${todo.notes}`)));
   const detailTask = isTask && view.taskDetailOpen
     ? store.tasks.find((task) => task.id === view.selectedTaskId)
@@ -2166,11 +2176,14 @@ function renderLocalWorkManager(kind: "task" | "todo"): string {
   if (!isTask && selectedTodo && view.selectedTodoId !== selectedTodo.id) view.selectedTodoId = selectedTodo.id;
   const statusSelect = isTask
     ? `<select data-action="task-status-filter" aria-label="Task 상태 필터">${option("all", "모든 상태", view.taskStatusFilter)}${(Object.entries(taskStatusLabel) as Array<[LocalTaskStatus, string]>).map(([value, label]) => option(value, label, view.taskStatusFilter)).join("")}</select>`
-    : `<select data-action="todo-status-filter" aria-label="Todo 상태 필터">${option("all", "모든 상태", view.todoStatusFilter)}${(Object.entries(todoStatusLabel) as Array<[LocalTodoStatus, string]>).map(([value, label]) => option(value, label, view.todoStatusFilter)).join("")}</select>`;
+    : `<select data-action="todo-status-filter" aria-label="Todo 상태 필터">${option("active", "활성 Todo", view.todoStatusFilter)}${option("all", "모든 상태", view.todoStatusFilter)}${(Object.entries(todoStatusLabel) as Array<[LocalTodoStatus, string]>).map(([value, label]) => option(value, label, view.todoStatusFilter)).join("")}</select>`;
   const milestoneOptions = store.milestones.filter((item) => view.workDomainFilter === "all" || view.workDomainFilter === "standalone" || item.domainId === view.workDomainFilter);
+  const countLabel = isTask
+    ? `표시 ${items.length} · 전체 ${store.tasks.length}`
+    : `표시 ${items.length} · 활성 ${activeTodoCount} · 전체 ${store.todos.length}`;
   return `<section class="work-manager" aria-label="${isTask ? "Task" : "Todo"} 관리">
     <header class="work-manager-header">
-      <div><strong>${isTask ? "Task 관리" : "Todo 관리"}</strong><span>${items.length} / ${isTask ? store.tasks.length : store.todos.length}</span><span class="badge">${dataSource.config.mode === "structured" ? "구조화 원천 · 양방향" : dataSource.config.mode === "folder" ? "폴더 원천 · 저장형" : dataSource.config.mode === "unstructured" ? "로컬 + 외부 후보" : "로컬"}</span></div>
+      <div><strong>${isTask ? "Task 관리" : "Todo 관리"}</strong><span>${countLabel}</span><span class="badge">${dataSource.config.mode === "structured" ? "구조화 원천 · 양방향" : dataSource.config.mode === "folder" ? "폴더 원천 · 저장형" : dataSource.config.mode === "unstructured" ? "로컬 + 외부 후보" : "로컬"}</span></div>
       <span class="work-manager-actions"><button data-action="open-data-source">데이터 원천</button><button class="primary" data-action="${isTask ? "new-local-task" : "new-local-todo"}">＋ 새 ${isTask ? "Task" : "Todo"}</button></span>
       <div class="work-controls">
         <label class="graph-search"><span>⌕</span><input data-action="work-search" value="${esc(view.workQuery)}" placeholder="제목, Draft, Meta, Domain, Milestone 검색" aria-label="${kind} 검색"></label>
@@ -2920,6 +2933,14 @@ app.addEventListener("click", (event) => {
       view.graphFacet = (target.dataset.id ?? "all") as ViewState["graphFacet"];
       render();
       break;
+    case "toggle-work-group": {
+      const groupKey = target.dataset.id;
+      if (!groupKey) return;
+      if (view.collapsedWorkGroups.has(groupKey)) view.collapsedWorkGroups.delete(groupKey);
+      else view.collapsedWorkGroups.add(groupKey);
+      render();
+      break;
+    }
     case "new-domain": {
       if (!localWorkMutable()) return;
       const now = new Date().toISOString();

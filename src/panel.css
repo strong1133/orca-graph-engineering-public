@@ -547,9 +547,13 @@ textarea { resize: vertical; min-height: 74px; line-height: 1.45; }
 .source-only .work-list { border: 0; }
 .task-list-only .work-list { height: 100%; border-right: 0; }
 .work-group { overflow: hidden; border: 1px solid var(--border); border-radius: 11px; margin-bottom: 9px; background: color-mix(in srgb, var(--card) 70%, transparent); }
-.work-group > header { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); padding: 8px 10px; background: color-mix(in srgb, var(--accent) 40%, transparent); }
-.work-group > header strong { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
-.work-group > header span { color: var(--muted-foreground); font-size: 9px; }
+.work-group > header { border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--accent) 40%, transparent); }
+.work-group.collapsed > header { border-bottom: 0; }
+.work-group-toggle { display: flex; width: 100%; align-items: center; gap: 8px; border: 0; border-radius: 0; padding: 8px 10px; background: transparent; text-align: left; }
+.work-group-toggle:hover { background: color-mix(in srgb, var(--accent) 64%, transparent); }
+.work-group-toggle strong { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.work-group-toggle span { color: var(--muted-foreground); font-size: 9px; }
+.work-group-toggle .work-group-chevron { width: 10px; color: var(--foreground); font-size: 10px; }
 .work-group .work-card { border-width: 0 0 1px; border-radius: 0; margin: 0; }
 .work-group .work-card:last-child { border-bottom: 0; }
 .work-card { display: flex; width: 100%; min-height: 82px; flex-direction: column; align-items: stretch; gap: 7px; border-radius: 9px; margin-bottom: 7px; padding: 9px 10px; background: var(--card); text-align: left; }
