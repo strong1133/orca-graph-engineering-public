@@ -28,7 +28,7 @@
     {
       "id": "whitespace-live-selection",
       "bridgeMode": "live",
-      "expected": { "code": "CONDITION_BRANCH_SELECTION_REQUIRED", "severity": "error" },
+      "expected": { "code": null, "severity": null },
       "nodes": [
         { "id": "decision", "kind": "condition", "branchTaken": "   " },
         { "id": "yes" },

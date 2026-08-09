@@ -86,6 +86,7 @@ if (args[0] === "worktree" && args[1] === "ps") {
       paneKey,
       state: mode === "busy" ? "working" : "done",
       agentType: "codex",
+      lastAssistantMessage: process.env.ORCA_GRAPH_FAKE_ASSISTANT || '{"branch":"y","reason":"fake result selects y"}',
     }],
   };
   result = { worktrees: mode === "missing-worktree" ? [] : [worktree] };
@@ -104,6 +105,8 @@ if (args[0] === "worktree" && args[1] === "ps") {
   result = { wait: { satisfied: !["busy", "idle-timeout"].includes(mode) } };
 } else if (args[0] === "terminal" && args[1] === "create") {
   result = { terminal: { handle: "fake-session" } };
+} else if (args[0] === "terminal" && args[1] === "show") {
+  result = { terminal: { handle: "fake-session", worktreeId: "fake-worktree", tabId: "fake-tab", leafId: "fake-leaf" } };
 } else if (args[0] === "terminal" && args[1] === "send") {
   result = { terminal: { handle: "fake-session" } };
 }
@@ -376,28 +379,38 @@ describe("bridge graph calls", () => {
     expect(after.graphs.map((graph: { runs: unknown[] }) => graph.runs.length)).toEqual(beforeRunCounts);
   });
 
-  it("requires manual condition decisions before any live dispatch", async () => {
+  it("evaluates an undecided condition from upstream agent results during live execution", async () => {
     const root = process.cwd();
     const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
     temporaryDirectories.push(runtimeDirectory);
     const store = JSON.parse(await readFile(path.join(root, "fixtures/default-store.json"), "utf8"));
     const graph = store.graphs[0];
     graph.edges = graph.edges.filter((edge: { kind: string }) => edge.kind !== "loop");
+    graph.defaults = { sessionId: "fake-session" };
+    for (const node of graph.nodes) {
+      if (node.routing) delete node.routing.reasoning;
+    }
     const condition = graph.nodes.find((node: { kind: string }) => node.kind === "condition");
     delete condition.branchTaken;
     await writeFile(path.join(runtimeDirectory, "store.json"), `${JSON.stringify(store)}\n`, "utf8");
-    const beforeRunCounts = store.graphs.map((item: { runs: unknown[] }) => item.runs.length);
-
-    const output = await sendToBridge(
+    const fake = await installFakeOrca(runtimeDirectory);
+    await sendToBridge(
       runtimeDirectory,
       { type: "run", graphId: graph.id, dryRun: false },
-      "live execution requires a selected condition branch",
+      `graph ${graph.id} executed`,
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_ASSISTANT: '{"branch":"y","reason":"blocking finding exists"}',
+      },
     );
 
-    expect(output).toContain("graph preflight failed");
     const after = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
-    expect(after.graphs.map((item: { runs: unknown[] }) => item.runs.length)).toEqual(beforeRunCounts);
-  });
+    const result = after.graphs[0].runs[0].nodeResults.find((item: { nodeId: string }) => item.nodeId === condition.id);
+    expect(result).toMatchObject({ status: "done" });
+    expect(result.message).toContain("branch=y · AI 자동 판정");
+    expect(after.graphs[0].nodes.find((item: { id: string }) => item.id === condition.id)).not.toHaveProperty("branchTaken");
+  }, 15_000);
 
   describe.each(["root", "child"] as const)("%s pure route scope", (scope) => {
     describe.each([true, false])("dryRun=%s", (dryRun) => {

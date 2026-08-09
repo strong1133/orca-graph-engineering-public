@@ -523,13 +523,13 @@ function validateMetaPromptOutput(value) {
 async function terminalAgentMessage(handle) {
   const shown = await runOrca(["terminal", "show", "--terminal", handle]);
   const terminal = shown?.terminal;
-  if (!terminal?.worktreeId || !terminal.tabId || !terminal.leafId) throw new Error("Meta Prompt terminal identity is unavailable");
+  if (!terminal?.worktreeId || !terminal.tabId || !terminal.leafId) throw new Error("agent terminal identity is unavailable");
   const processes = await runOrca(["worktree", "ps", "--limit", "300"]);
   const worktree = (processes.worktrees ?? []).find((candidate) => candidate.worktreeId === terminal.worktreeId);
   const paneKey = `${terminal.tabId}:${terminal.leafId}`;
   const agent = (worktree?.agents ?? []).find((candidate) => candidate.paneKey === paneKey);
-  if (!agent) throw new Error("Meta Prompt agent state is unavailable");
-  if (!["done", "idle"].includes(String(agent.state || "").toLowerCase())) throw new Error(`Meta Prompt agent did not finish cleanly (${agent.state || "unknown"})`);
+  if (!agent) throw new Error("agent state is unavailable");
+  if (!["done", "idle"].includes(String(agent.state || "").toLowerCase())) throw new Error(`agent did not finish cleanly (${agent.state || "unknown"})`);
   return agent.lastAssistantMessage;
 }
 
@@ -809,7 +809,97 @@ async function dispatchTask(graph, node, targets, runId) {
   await runOrca(["terminal", "send", "--terminal", handle, "--text", prompt, "--enter"]);
   const timeoutMs = Math.max(5_000, Number(node.engineering?.timeoutSeconds || 900) * 1000);
   await runOrca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", String(timeoutMs)], timeoutMs + 10_000);
-  return handle;
+  let resultSummary = "";
+  try {
+    resultSummary = String(await terminalAgentMessage(handle) || "").trim().slice(0, 20_000);
+  } catch {
+    // 실행 성공의 정본은 idle 도달이다. 공개 Orca surface가 결과 메시지를 주지 않는
+    // 구버전에서도 일반 task를 실패시키지 않고, 자동 조건 판정만 명시적으로 막는다.
+  }
+  return { sessionId: handle, resultSummary };
+}
+
+function conditionBranches(graph, node) {
+  return [...new Set(graph.edges
+    .filter((edge) => edge.from === node.id)
+    .map((edge) => normalizeBranch(edge.branch))
+    .filter(Boolean))];
+}
+
+function conditionAncestorIds(graph, nodeId) {
+  const ancestors = new Set();
+  const queue = [nodeId];
+  while (queue.length) {
+    const current = queue.shift();
+    for (const edge of graph.edges.filter((item) => item.kind !== "loop" && item.to === current)) {
+      if (ancestors.has(edge.from)) continue;
+      ancestors.add(edge.from);
+      queue.push(edge.from);
+    }
+  }
+  return ancestors;
+}
+
+function parseConditionDecision(value, branches) {
+  const text = String(value || "").trim();
+  if (!text) throw new Error("condition evaluator returned no result");
+  const candidates = [text];
+  const object = text.match(/\{[\s\S]*\}/u)?.[0];
+  if (object && object !== text) candidates.push(object);
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed.branch === "string") {
+        const selected = branches.find((branch) => branch === parsed.branch.trim())
+          ?? branches.find((branch) => branch.toLocaleLowerCase("en-US") === parsed.branch.trim().toLocaleLowerCase("en-US"));
+        if (selected) return { branch: selected, reason: typeof parsed.reason === "string" ? parsed.reason.trim().slice(0, 2_000) : "" };
+      }
+    } catch {
+      // JSON 이외 응답도 아래의 제한된 branch 표기만 허용한다.
+    }
+  }
+  const labelled = /(?:^|\n)\s*branch\s*[:=]\s*([^\s,;}]+)/iu.exec(text)?.[1]?.trim();
+  const exact = branches.find((branch) => branch === labelled || branch === text)
+    ?? branches.find((branch) => branch.toLocaleLowerCase("en-US") === String(labelled || text).toLocaleLowerCase("en-US"));
+  if (exact) return { branch: exact, reason: "" };
+  throw new Error(`condition evaluator must return one of: ${branches.join(", ")}`);
+}
+
+async function evaluateCondition(graph, node, targets, runId, nodeOutputs) {
+  const branches = conditionBranches(graph, node);
+  if (!branches.length) throw new Error(`${node.label || node.id}: condition has no labelled output branch`);
+  const ancestors = conditionAncestorIds(graph, node.id);
+  const upstreamResults = [...nodeOutputs.entries()].filter(([nodeId]) => ancestors.has(nodeId)).map(([nodeId, result]) => {
+    const source = graph.nodes.find((item) => item.id === nodeId);
+    return {
+      nodeId,
+      label: source?.label || nodeId,
+      result: String(result || "").slice(0, 8_000),
+    };
+  });
+  const branchRoutes = graph.edges.filter((edge) => edge.from === node.id).map((edge) => ({
+    branch: normalizeBranch(edge.branch),
+    target: graph.nodes.find((item) => item.id === edge.to)?.label || edge.to,
+  }));
+  const prompt = [
+    "Decide this execution-graph condition from the completed upstream results.",
+    "Return exactly one JSON object and no prose: {\"branch\":\"<allowed label>\",\"reason\":\"<short reason>\"}.",
+    `Condition: ${node.conditionExpr || node.label || node.id}`,
+    `Allowed branches: ${branches.join(", ")}`,
+    `Branch targets JSON: ${JSON.stringify(branchRoutes)}`,
+    `Upstream results JSON: ${JSON.stringify(upstreamResults)}`,
+    "Do not invent another branch. If the evidence is incomplete, choose the safest matching branch and explain why briefly.",
+  ].join("\n");
+  const evaluator = {
+    ...node,
+    kind: "task",
+    label: `${node.label || node.id} · 자동 판정`,
+    task: { id: `${node.id}:condition-evaluator`, title: node.label || node.id, prompt },
+    engineering: { ...(node.engineering || {}), role: "router", contextMode: "summary" },
+  };
+  const dispatched = await dispatchTask(graph, evaluator, targets, runId);
+  const decision = parseConditionDecision(dispatched.resultSummary, branches);
+  return { ...decision, sessionId: dispatched.sessionId, resultSummary: dispatched.resultSummary };
 }
 
 async function persistRunProgress(store, message) {
@@ -917,9 +1007,6 @@ function preflightGraph(graph, { live = false } = {}) {
     if (selected && !labels.includes(selected)) {
       add("CONDITION_BRANCH_SELECTION_INVALID", `${node.label || node.id}: selected branch '${selected}' has no matching output edge`);
     }
-    if (live && !selected) {
-      add("CONDITION_BRANCH_SELECTION_REQUIRED", `${node.label || node.id}: live execution requires a selected condition branch`);
-    }
   }
   const loopEdges = graph.edges.filter((edge) => edge.kind === "loop");
   for (const edge of loopEdges) {
@@ -1002,7 +1089,17 @@ function compileExecutionPlan(store, rootGraph, targets, dryRun) {
     for (const nodeId of topologicalOrder(executionGraph)) {
       if (!executable.nodeIds.has(nodeId)) continue;
       const node = executionGraph.nodes.find((item) => item.id === nodeId);
-      if (!node || node.kind === "condition" || node.engineering?.role === "human_gate") continue;
+      if (!node || node.engineering?.role === "human_gate") continue;
+      if (node.kind === "condition") {
+        if (!normalizeBranch(node.branchTaken)) {
+          try {
+            tasks.push({ graph: executionGraph, node, route: resolveTaskRoute(executionGraph, node, targets), conditionEvaluator: true });
+          } catch (error) {
+            problems.push(`${graph.name} / ${node.label || node.id} 자동 판정: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        continue;
+      }
       if (node.kind === "graph_call") {
         if (!node.childGraphId) {
           problems.push(`${graph.name} / ${node.label || node.id}: child graph is not selected`);
@@ -1045,7 +1142,13 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
     throw new Error(`graph-call depth limit exceeded (${context.depthLimit})`);
   }
   preflightGraph(graph, { live: !dryRun });
-  const executionGraph = context.defaults ? { ...graph, defaults: context.defaults } : graph;
+  const executionGraph = {
+    ...graph,
+    ...(context.defaults ? { defaults: context.defaults } : {}),
+    // 자동 condition의 런타임 branch는 설계값이 아니다. 별도 node copy에만
+    // 기록해야 다음 run도 다시 판정하며, 중간 저장에도 고정 분기로 새지 않는다.
+    nodes: graph.nodes.map((node) => node.kind === "condition" ? { ...node } : node),
+  };
   const order = topologicalOrder(executionGraph);
   const now = new Date();
   const run = {
@@ -1068,6 +1171,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
   const completed = new Set();
   const closed = new Set();
   const unresolved = new Set();
+  const nodeOutputs = new Map();
   const planLines = [];
   await persistRunProgress(store, `${graph.name} · ${dryRun ? "실행 계획" : "Run"} #${run.runNo} 시작`);
 
@@ -1113,18 +1217,44 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
         continue;
       }
       if (node.kind === "condition") {
-        if (!node.branchTaken) {
-          if (!dryRun) node.status = "waiting";
-          run.nodeResults.push({ nodeId, status: dryRun ? "pending" : "waiting", message: "branch decision required" });
-          unresolved.add(node.id);
-          if (!dryRun) throw new Error(`${node.label || node.id}: branch decision required`);
-        } else {
-          if (!dryRun) node.status = "done";
-          completed.add(node.id);
-          if (!dryRun) run.stats.completed += 1;
-          planLines.push(`${node.label || node.id}: branch=${node.branchTaken}`);
-          run.nodeResults.push({ nodeId, status: dryRun ? "pending" : "done", message: `branch=${node.branchTaken}` });
+        let branch = normalizeBranch(node.branchTaken);
+        if (dryRun) {
+          const message = branch
+            ? `branch=${branch} · 고정 분기`
+            : "branch will be evaluated automatically from upstream results at runtime";
+          run.nodeResults.push({ nodeId, status: "pending", message });
+          if (branch) completed.add(node.id); else unresolved.add(node.id);
+          planLines.push(`${node.label || node.id}: ${message}`);
+          continue;
         }
+        let decision = null;
+        if (!branch) {
+          node.status = "running";
+          await persistRunProgress(store, `${graph.name} · ${node.label || node.id} 자동 판정 중 · Run #${run.runNo}`);
+          run.stats.attempts += 1;
+          try {
+            decision = await evaluateCondition(executionGraph, node, targets, run.id, nodeOutputs);
+            branch = decision.branch;
+            const runtimeCondition = executionGraph.nodes.find((item) => item.id === node.id);
+            if (runtimeCondition) runtimeCondition.branchTaken = branch;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            node.status = "failed";
+            run.stats.failed += 1;
+            run.terminationReason = "node_failed";
+            run.nodeResults.push({ nodeId, status: "failed", attempt: 1, message });
+            throw error;
+          }
+        }
+        node.status = "done";
+        completed.add(node.id);
+        run.stats.completed += 1;
+        const message = decision
+          ? `branch=${branch} · AI 자동 판정${decision.reason ? ` · ${decision.reason}` : ""}`
+          : `branch=${branch} · 고정 분기`;
+        planLines.push(`${node.label || node.id}: ${message}`);
+        run.nodeResults.push({ nodeId, status: "done", ...(decision?.sessionId ? { sessionId: decision.sessionId } : {}), message });
+        nodeOutputs.set(node.id, message);
         continue;
       }
       if (node.kind === "graph_call") {
@@ -1192,12 +1322,15 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
       const nodeStartedAt = Date.now();
       const maxAttempts = Math.max(1, Number(node.engineering?.maxAttempts || 1));
       let sessionId = null;
+      let resultSummary = "";
       let lastError = null;
       let attempt = 0;
       for (attempt = 1; attempt <= maxAttempts; attempt += 1) {
         run.stats.attempts += 1;
         try {
-          sessionId = await dispatchTask(executionGraph, node, targets, run.id);
+          const dispatched = await dispatchTask(executionGraph, node, targets, run.id);
+          sessionId = dispatched.sessionId;
+          resultSummary = dispatched.resultSummary;
           lastError = null;
           break;
         } catch (error) {
@@ -1219,7 +1352,8 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
       node.status = "done";
       completed.add(node.id);
       run.stats.completed += 1;
-      run.nodeResults.push({ nodeId, status: "done", sessionId, attempt: Math.min(attempt, maxAttempts), durationMs });
+      if (resultSummary) nodeOutputs.set(node.id, resultSummary);
+      run.nodeResults.push({ nodeId, status: "done", sessionId, attempt: Math.min(attempt, maxAttempts), durationMs, ...(resultSummary ? { message: resultSummary.slice(0, 2_000) } : {}) });
       await persistRunProgress(store, `${graph.name} · ${node.label || node.id} 완료 · Run #${run.runNo}`);
     }
     run.status = dryRun ? "planned" : "done";
@@ -1278,6 +1412,7 @@ async function executeGraphRemotely({ config, store, targets, graph }) {
     throw new Error(`the source executes these node kinds itself; run this graph in the source workspace: ${names}`);
   }
   const localNode = (nodeId) => graph.nodes.find((node) => node.id === nodeId);
+  const nodeOutputs = new Map();
   let completed = 0;
   let skipped = 0;
   for (let step = 0; step < REMOTE_EXECUTION_MAX_STEPS; step += 1) {
@@ -1300,17 +1435,27 @@ async function executeGraphRemotely({ config, store, targets, graph }) {
       outcome = { result: "skipped", note: "branch closed" };
       skipped += 1;
     } else if (runnable.kind === "condition") {
-      // 판정은 사람이 패널에서 고른 분기다. preflight가 live 실행에서 선택을
-      // 이미 요구하므로 여기서 임의로 정하지 않는다.
-      const branch = normalizeBranch(localNode(runnable.id)?.branchTaken);
+      const design = localNode(runnable.id);
+      if (!design) throw new Error(`${runnable.label || runnable.id}: condition is missing from the panel snapshot`);
+      let branch = normalizeBranch(design.branchTaken);
+      let decision = null;
       if (!branch) {
-        await completeStructuredNode(config, graph.id, runnable.id, {
-          expectedVersion: claim.graph.version, result: "failed",
-          note: "no condition branch was selected in the panel",
-        });
-        throw new Error(`${runnable.label || runnable.id}: live execution requires a selected condition branch`);
+        try {
+          decision = await evaluateCondition(graph, design, targets, frontier.run?.id ?? graph.id, nodeOutputs);
+          branch = decision.branch;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          await completeStructuredNode(config, graph.id, runnable.id, {
+            expectedVersion: claim.graph.version, result: "failed", note: message.slice(0, 2000),
+          });
+          throw error;
+        }
       }
-      outcome = { result: "done", branch };
+      const note = decision
+        ? `AI auto decision${decision.reason ? `: ${decision.reason}` : ""}`
+        : "fixed branch selected in the run settings";
+      outcome = { result: "done", branch, note, ...(decision?.sessionId ? { sessionId: decision.sessionId } : {}) };
+      nodeOutputs.set(runnable.id, `branch=${branch} · ${note}`);
     } else {
       // 라우팅은 설계 노드(project/session/model override와 Task)에 실려 있다.
       // frontier에는 없으므로 없으면 임의로 보내지 않고 이 노드를 실패로 닫는다.
@@ -1324,8 +1469,13 @@ async function executeGraphRemotely({ config, store, targets, graph }) {
       }
       await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} 실행 중 · 원격 run`);
       try {
-        const sessionId = await dispatchTask(graph, design, targets, frontier.run?.id ?? graph.id);
-        outcome = { result: "done", sessionId };
+        const dispatched = await dispatchTask(graph, design, targets, frontier.run?.id ?? graph.id);
+        if (dispatched.resultSummary) nodeOutputs.set(runnable.id, dispatched.resultSummary);
+        outcome = {
+          result: "done",
+          sessionId: dispatched.sessionId,
+          ...(dispatched.resultSummary ? { note: dispatched.resultSummary.slice(0, 2_000) } : {}),
+        };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         await completeStructuredNode(config, graph.id, runnable.id, {

@@ -370,6 +370,70 @@ describe.each([
     }
   });
 
+  it("keeps Run visible and configures per-node routing with automatic conditions", async () => {
+    const dom = await mountPanel(wide, ({ store, targets }) => {
+      store.bridgeWorkspace = "current-project";
+      targets.projects = [{ id: "repo:current-project", name: "current-project", worktreeId: "worktree-current-project" }];
+      const graph = store.graphs[0];
+      graph.defaults = {};
+      delete graph.engineering;
+      graph.nodes = [
+        {
+          id: "review", kind: "task", label: "코드 검토", x: 0, y: 0, status: "pending", joinMode: "all",
+          task: { id: "task-review", title: "코드 검토", prompt: "review" },
+        },
+        {
+          id: "decision", kind: "condition", label: "수정 필요?", x: 260, y: 0, status: "pending", joinMode: "all",
+          conditionExpr: "blocking_findings == true",
+        },
+        {
+          id: "request", kind: "task", label: "수정 요청", x: 520, y: -80, status: "pending", joinMode: "all",
+          task: { id: "task-request", title: "수정 요청", prompt: "request changes" },
+        },
+        {
+          id: "approve", kind: "task", label: "승인", x: 520, y: 80, status: "pending", joinMode: "all",
+          task: { id: "task-approve", title: "승인", prompt: "approve" },
+        },
+      ];
+      graph.edges = [
+        { id: "review-decision", from: "review", to: "decision", kind: "sequence" },
+        { id: "decision-request", from: "decision", to: "request", kind: "sequence", branch: "y" },
+        { id: "decision-approve", from: "decision", to: "approve", kind: "sequence", branch: "n" },
+      ];
+    });
+    try {
+      const { document, Event } = dom.window;
+      expect(document.querySelectorAll('.topbar [data-action="open-run"]')).toHaveLength(1);
+      expect(document.querySelector('.toolbar [data-action="open-run"]')).toBeNull();
+      expect(document.querySelector('.node[data-node-id="review"] .node-route-summary')?.textContent).toContain("AI");
+      expect(document.querySelector('.node[data-node-id="decision"] .condition-route')?.textContent).toContain("AI 자동");
+
+      document.querySelector<HTMLButtonElement>('.topbar [data-action="open-run"]')?.click();
+      let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).toContain("현재 브리지 작업공간 자동 선택");
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="run-routing"][data-field="projectId"]')?.value).toBe("repo:current-project");
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="run-routing"][data-field="model"]')?.value).toBe("gpt-5.6-sol");
+      expect(dialog?.querySelectorAll(".run-route-row")).toHaveLength(4);
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="run-condition"]')?.value).toBe("");
+      expect(dialog?.textContent).toContain("실행 중 AI가 선행 결과로 자동 판정");
+      expect(dialog?.textContent).not.toContain("실제 실행 전에 조건 분기를 선택하십시오");
+      expect(dialog?.textContent).not.toContain("실행 프로젝트나 세션이 지정되지 않았습니다");
+      expect(dialog?.textContent).not.toContain("checkpoint를 권장합니다");
+      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.disabled).toBe(false);
+
+      const nodeModel = dialog?.querySelector<HTMLSelectElement>('[data-scope="run-node-routing"][data-node-id="review"][data-field="model"]');
+      if (nodeModel) {
+        nodeModel.value = "claude-opus-5";
+        nodeModel.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="run-node-routing"][data-node-id="review"][data-field="model"]')?.value).toBe("claude-opus-5");
+      expect(dialog?.querySelector('.run-route-row[data-run-node-id="review"]')?.textContent).toContain("Claude Opus 5");
+    } finally {
+      dom.window.close();
+    }
+  });
+
   it("does not offer Claude-unsupported reasoning for a new session", async () => {
     const dom = await mountPanel(wide, ({ store }) => {
       store.graphs[0].defaults = { projectId: "project", model: "claude-opus-5" };

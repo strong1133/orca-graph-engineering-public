@@ -731,8 +731,8 @@ export function normalizeGraphStore(
   };
 }
 
-export const NODE_WIDTH = 208;
-export const NODE_HEIGHT = 86;
+export const NODE_WIDTH = 228;
+export const NODE_HEIGHT = 104;
 export const GRID = 16;
 
 export interface EngineeringFinding {
@@ -896,7 +896,7 @@ export function autoLayout(
   return { ...graph, nodes, version: graph.version + 1, updatedAt: new Date().toISOString() };
 }
 
-function basicValidation(graph: GraphDefinition, { live = false, targets }: { live?: boolean; targets?: OrcaTargets } = {}): EngineeringFinding[] {
+function basicValidation(graph: GraphDefinition, { targets }: { live?: boolean; targets?: OrcaTargets } = {}): EngineeringFinding[] {
   const findings: EngineeringFinding[] = [];
   const add = (
     severity: EngineeringFinding["severity"],
@@ -919,16 +919,10 @@ function basicValidation(graph: GraphDefinition, { live = false, targets }: { li
     if (node.kind === "condition" && !node.conditionExpr?.trim()) {
       add("error", "structure", `${node.label || node.id}: 조건 정의가 필요합니다.`, 20, node.id);
     }
-    if (node.kind === "condition" && !normalizeBranch(node.branchTaken)) {
-      add(live ? "error" : "warning", "operations", `${node.label || node.id}: 실행 전에 판정 분기를 선택해야 합니다.`, 20, node.id, "CONDITION_BRANCH_SELECTION_REQUIRED");
-    }
     if (node.kind === "graph_call" && !node.childGraphId) {
       add("error", "structure", `${node.label || node.id}: 호출할 그래프가 필요합니다.`, 25, node.id);
     }
     const route = effectiveRouting(graph, node);
-    if (node.kind === "task" && !route.projectId && !route.sessionId) {
-      add("warning", "operations", `${node.label || node.id}: 실행 프로젝트나 세션이 지정되지 않았습니다.`, 25, node.id);
-    }
     if (node.kind === "task" && targets) {
       const reasoningError = reasoningRouteError(route, targets, {
         existingSession: Boolean(route.sessionId && node.engineering?.contextMode !== "fresh"),
@@ -1203,7 +1197,8 @@ export function analyzeGraph(graph: GraphDefinition, options: { live?: boolean; 
     if (!(graph.runGuards.maxBudgetTokens || graph.engineering?.globalBudgetTokens)) missing.push("토큰 예산");
     if (missing.length) add("error", "operations", `루프 안전장치가 부족합니다: ${missing.join(", ")}.`, 20);
   }
-  if ((graph.engineering?.checkpointPolicy ?? "none") === "none" && graph.nodes.length > 3) {
+  if ((graph.engineering?.checkpointPolicy ?? "none") === "none"
+    && (graph.nodes.length >= 12 || criticalPathNodeIds.length >= 10)) {
     add("warning", "reliability", "장기 그래프에는 superstep 또는 node checkpoint를 권장합니다.", 21);
   }
   if (graph.engineering?.maxParallelism && maxParallelism > graph.engineering.maxParallelism) {

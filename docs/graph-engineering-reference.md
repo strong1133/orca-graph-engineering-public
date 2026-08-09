@@ -24,7 +24,7 @@
 | 17 | session/project 참조 경계는 있으나 hybrid retrieval/GraphRAG는 미지원 | 경계 |
 | 18 | path/diamond/router/star/cycle/tree/tool-bipartite topology와 graph-call | 동작 |
 | 19 | superstep, fan-out, critical path, 병렬 writes와 reducer 충돌 | 동작 |
-| 20 | 조건 분기 선택·label·join과 loop back-edge/guard를 검사. loop 재진입 scheduler는 미지원이며 live-run은 fail-closed | 동작·경계 |
+| 20 | 조건 label·고정 선택·join과 loop back-edge/guard를 검사. 미선택 분기는 선행 결과 기반 AI evaluator가 판정하고, loop 재진입 scheduler는 미지원이라 live-run은 fail-closed | 동작·경계 |
 | 21 | 노드별 atomic 진행 저장, checkpoint policy, retry/backoff/timeout/idempotency | 동작·계약 |
 | 22 | side effect, irreversible, compensation, approval 계약. compensation 자동 실행은 미지원 | 계약 |
 | 23 | human gate의 pending/approved/rejected 상태와 실행 중단 | 동작 |

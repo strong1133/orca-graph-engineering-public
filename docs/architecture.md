@@ -82,7 +82,7 @@ Meta Prompt는 저장과 분리된 명시적 버튼 동작이다. 패널은 먼�
 
 Agent가 idle로 종료된 뒤 Orca `worktree ps`의 해당 pane `lastAssistantMessage`를 결과 정본으로 읽는다. 결과는 `역할`, `목표`, `작업 컨텍스트`, `요구사항`, `제약사항`, `실행 절차`, `출력 형식`, `품질 기준`, `입력`의 순서 있는 9개 H1 section과 1 MiB 상한을 통과해야 한다. 저장 직전에 같은 `draftRevisionId`가 여전히 current인지 다시 검사하는 CAS-style guard를 적용한다. 검증 실패나 원문 변경은 사람 Draft와 이전 Meta를 보존하고 `metaPromptRun.status=failed`로 기록한다. 성공한 결과만 새 Meta revision으로 append하고 연결 Graph node의 실행 projection을 갱신한다.
 
-캔버스는 DAG의 level을 superstep으로 분석한다. 가장 긴 의존 경로를 critical path로, loop back-edge의 head에서 tail까지를 loop 영역으로 표시한다. condition은 CSS clip-path나 장식 아이콘에 기대지 않는 실제 160×112 SVG polygon과 동일 크기 hit area로 렌더링한다. 연결선은 상대 위치에 따라 노드의 상·우·하·좌 port를 선택하고, 둥근 직교 route·넓은 투명 hit path·색상별 marker·source 근처 Y/N 배지를 함께 그린다. 모눈은 viewport pan/zoom에 맞춰 이동·확대되며 node drag는 grid snap 뒤 좌·중앙·우 및 상·중앙·하 정렬 guide를 적용한다. 병렬 writer가 같은 state key에 쓰면 reducer를 요구하며, condition branch·고아 노드·위험 권한·context·provenance·예산·loop guard를 장 번호가 붙은 finding으로 보고한다. condition의 모든 출력은 trim-normalized 고유 branch label이 필요하고 선택 값은 실제 출력과 일치해야 하며, loop는 label이 있는 condition back-edge만 허용한다. model과 bridge의 trust boundary는 분리하되 stable validation code와 `fixtures/graph-validation-matrix.json`을 양쪽 test가 함께 소비해 drift를 막는다.
+캔버스는 DAG의 level을 superstep으로 분석한다. 가장 긴 의존 경로를 critical path로, loop back-edge의 head에서 tail까지를 loop 영역으로 표시한다. condition은 CSS clip-path나 장식 아이콘에 기대지 않는 실제 160×112 SVG polygon과 동일 크기 hit area로 렌더링한다. 연결선은 상대 위치에 따라 노드의 상·우·하·좌 port를 선택하고, 둥근 직교 route·넓은 투명 hit path·색상별 marker·source 근처 Y/N 배지를 함께 그린다. 모눈은 viewport pan/zoom에 맞춰 이동·확대되며 node drag는 grid snap 뒤 좌·중앙·우 및 상·중앙·하 정렬 guide를 적용한다. 각 Task 노드는 session/project와 AI model을 본문에 표시하며 자동 condition도 evaluator의 target/model을 표시한다. 상단의 고정 실행 버튼은 기본값과 노드별 override를 한 modal에서 편집하고 실행 확인 시 graph에 저장한다. 병렬 writer가 같은 state key에 쓰면 reducer를 요구하며, condition branch·고아 노드·위험 권한·context·provenance·예산·loop guard를 장 번호가 붙은 finding으로 보고한다. condition의 모든 출력은 trim-normalized 고유 branch label이 필요하고 고정 선택 값은 실제 출력과 일치해야 하며, loop는 label이 있는 condition back-edge만 허용한다. model과 bridge의 trust boundary는 분리하되 stable validation code와 `fixtures/graph-validation-matrix.json`을 양쪽 test가 함께 소비해 drift를 막는다.
 
 캔버스 node와 SVG edge는 focus 가능한 button semantics와 이름을 가지며 Enter/Space로 inspector를 연다. modal은 labelled dialog, initial focus, Tab 순환, Escape/닫기 후 opener focus 복원을 제공한다. 저장·bridge 상태와 toast는 polite live region이다. 동일 renderer를 side panel과 loopback wide view에서 사용하며 jsdom 회귀 검사가 두 mode를 각각 실행한다.
 
@@ -95,7 +95,7 @@ Agent가 idle로 종료된 뒤 Orca `worktree ps`의 해당 pane `lastAssistantM
 - session 지정: cached pane identity와 fresh Orca agent pane이 일치하고 `tui-idle`인 terminal에만 Task prompt 전송
 - project 지정, session 미지정: project worktree에 model 명령으로 새 terminal 생성 후 Task prompt 전송
 - dry-run: live와 같은 selected graph-call tree와 모든 Task의 pure route를 먼저 검증한 뒤, Orca를 호출하거나 terminal을 변경하지 않고 routing 계획만 run history에 기록
-- condition: 현재 branch 결정이 없으면 live-run을 terminal dispatch 전에 차단하고 dry-run에서 `waiting` 경로를 표시
+- condition: branch가 고정되지 않았으면 선행 노드의 결과 요약을 같은 routing resolver로 선택한 evaluator session에 보내고, 허용된 outgoing label만 JSON 판정으로 수용해 후속 경로를 연다. dry-run은 자동 판정 예정과 아직 열리지 않은 경로를 `waiting`으로 표시
 - branch/join: 닫힌 branch는 `skipped`, 아직 결정되지 않은 dependency는 `waiting`으로 run history에 이유와 함께 구분
 - loop: 정적 분석과 dry-run 계획은 지원하지만 local bridge의 재진입 scheduler는 미지원이므로 live-run을 terminal dispatch 전에 차단
 - graph-call: root hop limit과 selected branch/AND·OR 의미로 전체 child tree를 먼저 검사한 뒤 parent/child run lineage, routing 결합, 실패 전파 정책을 기록
@@ -114,7 +114,7 @@ dry-run은 pure plan이 성공한 뒤 planned run lineage만 기록하며 여기
 
 새 Claude session은 model catalog의 `low|medium|high|xhigh|max`를 CLI `--effort`로 전달한다. 새 Codex session은 model별 `reasoningLevels`만 `model_reasoning_effort`로 전달하며 Sol/Terra는 `ultra`, Luna는 `max`까지만 허용한다. existing session에는 reasoning을 실제 적용하거나 current 값을 증명할 공개 surface가 없으므로 reasoning override를 pure plan에서 거절하고, 값을 비웠을 때만 session의 current effort를 유지한다.
 
-panel의 실행 modal과 bridge preflight는 같은 핵심 branch/loop/gate/idempotency/sensitive-network 계약을 각각의 신뢰 경계에서 검사합니다. `fixtures/graph-validation-matrix.json`의 stable code/severity fixture를 model unit과 bridge process suite가 함께 소비하므로 panel이 허용한 실행을 bridge가 즉시 같은 정책으로 거절하는 drift를 막습니다. panel 검사는 편집 피드백이고 bridge 검사는 UI를 우회한 요청에도 run 생성과 Orca 호출보다 먼저 적용되는 보안 경계이므로, 중복을 제거한다는 이유로 어느 한쪽을 생략하지 않습니다.
+panel의 실행 modal과 bridge preflight는 같은 핵심 branch label/loop/gate/idempotency/sensitive-network 계약을 각각의 신뢰 경계에서 검사합니다. 분기 미선택은 오류가 아니라 자동 evaluator 요청이며, 존재하지 않는 고정 분기만 오류입니다. 실행 대상 누락·세션/모델 불일치는 별도의 실행 설정 문제로 표시해 구조·안전 finding과 혼동하지 않습니다. `fixtures/graph-validation-matrix.json`의 stable code/severity fixture를 model unit과 bridge process suite가 함께 소비하므로 panel이 허용한 실행을 bridge가 즉시 같은 정책으로 거절하는 drift를 막습니다. panel 검사는 편집 피드백이고 bridge 검사는 UI를 우회한 요청에도 run 생성과 Orca 호출보다 먼저 적용되는 보안 경계이므로, 중복을 제거한다는 이유로 어느 한쪽을 생략하지 않습니다.
 
 ## 배포 surface
 
