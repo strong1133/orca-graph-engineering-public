@@ -1,0 +1,13 @@
+{
+  "refreshedAt": null,
+  "projects": [],
+  "sessions": [],
+  "models": [
+    { "id": "gpt-5.6-sol", "label": "GPT-5.6 Sol", "agent": "codex", "reasoningLevels": ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { "id": "gpt-5.6-terra", "label": "GPT-5.6 Terra", "agent": "codex", "reasoningLevels": ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { "id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "agent": "codex", "reasoningLevels": ["low", "medium", "high", "xhigh", "max"] },
+    { "id": "claude-opus-5", "label": "Claude Opus 5", "agent": "claude", "reasoningLevels": ["low", "medium", "high", "xhigh", "max"] },
+    { "id": "claude-fable-5", "label": "Claude Fable 5", "agent": "claude", "reasoningLevels": ["low", "medium", "high", "xhigh", "max"] },
+    { "id": "claude-sonnet-5", "label": "Claude Sonnet 5", "agent": "claude", "reasoningLevels": ["low", "medium", "high", "xhigh", "max"] }
+  ]
+}

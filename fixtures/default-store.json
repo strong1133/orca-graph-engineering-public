@@ -1,0 +1,169 @@
+{
+  "schemaVersion": 1,
+  "activeGraphId": "graph-orca-demo",
+  "lastBridgeMessage": "브리지를 연결하면 로컬 저장과 Orca 대상 검색을 사용할 수 있습니다.",
+  "domains": [],
+  "milestones": [],
+  "tasks": [],
+  "todos": [],
+  "graphs": [
+    {
+      "id": "graph-orca-demo",
+      "name": "Orca 그래프 엔지니어링",
+      "summary": "프로젝트·세션·모델을 그래프와 노드 수준에서 상속/override하는 예시",
+      "status": "draft",
+      "version": 1,
+      "pinned": true,
+      "routineEnabled": false,
+      "repeatMode": "none",
+      "maxRuns": 3,
+      "defaults": {
+        "model": "gpt-5.6-sol",
+        "reasoning": "high"
+      },
+      "runGuards": {
+        "claimLeaseSeconds": 21600,
+        "maxWallSeconds": 1800,
+        "stagnationRuns": 3,
+        "maxBudgetTokens": 100000
+      },
+      "nodes": [
+        {
+          "id": "node-design",
+          "kind": "task",
+          "label": "요구사항 설계",
+          "x": 48,
+          "y": 64,
+          "status": "pending",
+          "joinMode": "all",
+          "task": {
+            "id": "task-design",
+            "title": "요구사항 설계",
+            "prompt": "요구사항을 분석하고 구현 범위와 완료 조건을 명확히 정리한다."
+          },
+          "routing": {}
+        },
+        {
+          "id": "node-quality",
+          "kind": "condition",
+          "label": "설계 승인?",
+          "x": 340,
+          "y": 64,
+          "status": "pending",
+          "joinMode": "all",
+          "conditionExpr": "설계가 구현 가능한 수준으로 구체적인가?",
+          "branchTaken": "y"
+        },
+        {
+          "id": "node-implement",
+          "kind": "task",
+          "label": "구현 및 검증",
+          "x": 632,
+          "y": 64,
+          "status": "pending",
+          "joinMode": "all",
+          "task": {
+            "id": "task-implement",
+            "title": "구현 및 검증",
+            "prompt": "승인된 설계를 구현하고 테스트와 실제 화면 검증을 완료한다."
+          },
+          "routing": {
+            "reasoning": "xhigh"
+          }
+        },
+        {
+          "id": "node-quality-graph-call",
+          "kind": "graph_call",
+          "label": "품질 검증 그래프 호출",
+          "x": 924,
+          "y": 64,
+          "status": "pending",
+          "joinMode": "all",
+          "childGraphId": "graph-quality-check",
+          "graphCallRoutingMode": "inherit",
+          "graphCallFailureMode": "fail_parent"
+        }
+      ],
+      "edges": [
+        {
+          "id": "edge-1",
+          "from": "node-design",
+          "to": "node-quality",
+          "kind": "sequence"
+        },
+        {
+          "id": "edge-2",
+          "from": "node-quality",
+          "to": "node-implement",
+          "kind": "sequence",
+          "branch": "y"
+        },
+        {
+          "id": "edge-loop",
+          "from": "node-quality",
+          "to": "node-design",
+          "kind": "loop",
+          "branch": "n"
+        },
+        {
+          "id": "edge-3",
+          "from": "node-implement",
+          "to": "node-quality-graph-call",
+          "kind": "sequence"
+        }
+      ],
+      "runs": [],
+      "createdAt": "2026-08-08T00:00:00.000Z",
+      "updatedAt": "2026-08-08T00:00:00.000Z"
+    },
+    {
+      "id": "graph-quality-check",
+      "name": "품질 검증",
+      "summary": "부모 그래프에서 호출되는 재사용 가능한 검증 그래프",
+      "status": "active",
+      "version": 1,
+      "pinned": false,
+      "routineEnabled": false,
+      "repeatMode": "none",
+      "defaults": {},
+      "runGuards": {
+        "claimLeaseSeconds": 21600,
+        "stagnationRuns": 3
+      },
+      "engineering": {
+        "checkpointPolicy": "node",
+        "requireProvenance": true,
+        "humanGateForIrreversible": true,
+        "maturity": "experimental"
+      },
+      "nodes": [
+        {
+          "id": "node-verify-output",
+          "kind": "task",
+          "label": "결과 검증",
+          "x": 64,
+          "y": 64,
+          "status": "pending",
+          "joinMode": "all",
+          "task": {
+            "id": "task-verify-output",
+            "title": "결과 검증",
+            "prompt": "부모 그래프의 결과를 독립적으로 검증하고 근거를 기록한다."
+          },
+          "routing": {},
+          "engineering": {
+            "role": "verifier",
+            "contextMode": "fresh",
+            "maxAttempts": 1,
+            "permissions": ["read"],
+            "evidenceRequired": true
+          }
+        }
+      ],
+      "edges": [],
+      "runs": [],
+      "createdAt": "2026-08-08T00:00:00.000Z",
+      "updatedAt": "2026-08-08T00:00:00.000Z"
+    }
+  ]
+}

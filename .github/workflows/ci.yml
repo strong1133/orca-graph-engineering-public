@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: corepack enable
+      - run: corepack install
+      - name: Verify pinned package manager
+        run: test "$(corepack npm --version)" = "10.9.4"
+      - run: corepack npm ci
+      - run: corepack npm run check
+      - name: Build and verify no-install plugin bootstrap/save artifacts
+        run: |
+          mkdir -p release/source
+          corepack npm pack --pack-destination release/source --json
+          corepack npm run package:plugin
+          corepack npm run verify:plugin -- release/orca-graph-engineering-plugin-0.2.0.tgz
+      - name: Verify the extracted plugin's declared check contract
+        run: |
+          PLUGIN_CHECK_ROOT="$(mktemp -d)"
+          tar -xzf release/orca-graph-engineering-plugin-0.2.0.tgz -C "$PLUGIN_CHECK_ROOT"
+          cd "$PLUGIN_CHECK_ROOT/package"
+          corepack npm ci
+          corepack npm run check
+      - uses: actions/upload-artifact@v7
+        with:
+          name: orca-graph-engineering-plugin
+          path: release/orca-graph-engineering-plugin-0.2.0.tgz
+          if-no-files-found: error
+
+  reproducible-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: corepack enable
+      - name: Compare npm 10 and npm 11 clean-copy artifacts
+        run: |
+          NPM10_COPY="$(mktemp -d)"
+          NPM11_COPY="$(mktemp -d)"
+          git archive HEAD | tar -x -C "$NPM10_COPY"
+          git archive HEAD | tar -x -C "$NPM11_COPY"
+
+          cd "$NPM10_COPY"
+          corepack npm@10.9.4 ci
+          corepack npm@10.9.4 run package:plugin
+
+          cd "$NPM11_COPY"
+          corepack npm@11.6.2 ci
+          corepack npm@11.6.2 run package:plugin
+
+          NPM10_ARTIFACT="$NPM10_COPY/release/orca-graph-engineering-plugin-0.2.0.tgz"
+          NPM11_ARTIFACT="$NPM11_COPY/release/orca-graph-engineering-plugin-0.2.0.tgz"
+          sha256sum "$NPM10_ARTIFACT" "$NPM11_ARTIFACT"
+          cmp "$NPM10_ARTIFACT" "$NPM11_ARTIFACT"

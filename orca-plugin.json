@@ -1,0 +1,32 @@
+{
+  "manifestVersion": 1,
+  "id": "graph-engineering",
+  "publisher": "strong1133",
+  "name": "Graph Engineering",
+  "version": "0.2.0",
+  "description": "Design and execute nested task graphs across Orca projects, sessions, and models.",
+  "author": {
+    "name": "SEOKJIN JEONG",
+    "url": "https://github.com/strong1133"
+  },
+  "repository": "https://github.com/strong1133/orca-graph-engineering-public",
+  "engines": {
+    "orca": ">=1.4.176"
+  },
+  "pluginApi": 1,
+  "contributes": {
+    "panels": [
+      {
+        "id": "editor",
+        "title": "Graph Engineering",
+        "icon": "blocks",
+        "entry": "dist/panel.html"
+      }
+    ]
+  },
+  "capabilities": [
+    { "kind": "workspace:read" },
+    { "kind": "terminal:send" },
+    { "kind": "notifications:show" }
+  ]
+}

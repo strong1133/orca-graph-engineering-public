@@ -1,0 +1,56 @@
+{
+  "name": "orca-graph-engineering",
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Orca-native graph engineering editor and execution router",
+  "license": "MIT",
+  "repository": "github:strong1133/orca-graph-engineering-public",
+  "homepage": "https://github.com/strong1133/orca-graph-engineering-public#readme",
+  "bugs": "https://github.com/strong1133/orca-graph-engineering-public/issues",
+  "keywords": [
+    "orca",
+    "graph",
+    "workflow",
+    "plugin"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "npm@10.9.4",
+  "files": [
+    "bridge/",
+    "docs/architecture.md",
+    "docs/data-source-contract.md",
+    "docs/graph-engineering-reference.md",
+    "docs/upstream-proposal.md",
+    "fixtures/",
+    "scripts/",
+    "src/",
+    "tests/",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "orca-plugin.json",
+    "tsconfig.json"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test && npm run build",
+    "package:plugin": "node scripts/package-plugin.mjs",
+    "verify:plugin": "node scripts/verify-plugin-package.mjs",
+    "bridge": "node bridge/index.mjs",
+    "bridge:client": "node scripts/bridge-client.mjs",
+    "preview": "node scripts/serve.mjs"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^24.3.0",
+    "esbuild": "^0.25.9",
+    "jsdom": "^26.1.0",
+    "tar": "7.5.22",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
+    "zod": "4.4.3"
+  }
+}

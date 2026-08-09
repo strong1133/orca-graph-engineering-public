@@ -1,0 +1,208 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "duplicate-edge-id",
+      "bridgeMode": "dry",
+      "expected": { "code": "DUPLICATE_EDGE_ID", "severity": "error" },
+      "nodes": [{ "id": "start" }, { "id": "finish" }],
+      "edges": [
+        { "id": "edge-duplicate", "from": "start", "to": "finish", "kind": "sequence" },
+        { "id": "edge-duplicate", "from": "start", "to": "finish", "kind": "informs" }
+      ]
+    },
+    {
+      "id": "duplicate-condition-label",
+      "bridgeMode": "dry",
+      "expected": { "code": "CONDITION_BRANCH_LABEL_DUPLICATE", "severity": "error" },
+      "nodes": [
+        { "id": "decision", "kind": "condition", "branchTaken": "yes" },
+        { "id": "left" },
+        { "id": "right" }
+      ],
+      "edges": [
+        { "id": "edge-left", "from": "decision", "to": "left", "kind": "sequence", "branch": " yes " },
+        { "id": "edge-right", "from": "decision", "to": "right", "kind": "sequence", "branch": "yes" }
+      ]
+    },
+    {
+      "id": "whitespace-live-selection",
+      "bridgeMode": "live",
+      "expected": { "code": "CONDITION_BRANCH_SELECTION_REQUIRED", "severity": "error" },
+      "nodes": [
+        { "id": "decision", "kind": "condition", "branchTaken": "   " },
+        { "id": "yes" },
+        { "id": "no" }
+      ],
+      "edges": [
+        { "id": "edge-yes", "from": "decision", "to": "yes", "kind": "sequence", "branch": "y" },
+        { "id": "edge-no", "from": "decision", "to": "no", "kind": "sequence", "branch": "n" }
+      ]
+    },
+    {
+      "id": "loop-source-is-not-condition",
+      "bridgeMode": "dry",
+      "expected": { "code": "LOOP_SOURCE_CONDITION_REQUIRED", "severity": "error" },
+      "loopGuards": true,
+      "nodes": [{ "id": "start" }, { "id": "work" }],
+      "edges": [
+        { "id": "edge-work", "from": "start", "to": "work", "kind": "sequence" },
+        { "id": "edge-loop", "from": "work", "to": "start", "kind": "loop", "branch": "retry" }
+      ]
+    },
+    {
+      "id": "loop-label-is-whitespace",
+      "bridgeMode": "dry",
+      "expected": { "code": "LOOP_BRANCH_LABEL_REQUIRED", "severity": "error" },
+      "loopGuards": true,
+      "nodes": [{ "id": "start" }, { "id": "decision", "kind": "condition", "branchTaken": "done" }, { "id": "done" }],
+      "edges": [
+        { "id": "edge-decision", "from": "start", "to": "decision", "kind": "sequence" },
+        { "id": "edge-done", "from": "decision", "to": "done", "kind": "sequence", "branch": "done" },
+        { "id": "edge-loop", "from": "decision", "to": "start", "kind": "loop", "branch": "  " }
+      ]
+    },
+    {
+      "id": "loop-points-downstream",
+      "bridgeMode": "dry",
+      "expected": { "code": "LOOP_BACK_EDGE_REQUIRED", "severity": "error" },
+      "loopGuards": true,
+      "nodes": [{ "id": "decision", "kind": "condition", "branchTaken": "done" }, { "id": "work" }],
+      "edges": [
+        { "id": "edge-work", "from": "decision", "to": "work", "kind": "sequence", "branch": "done" },
+        { "id": "edge-loop", "from": "decision", "to": "work", "kind": "loop", "branch": "retry" }
+      ]
+    },
+    {
+      "id": "retry-without-idempotency-key",
+      "bridgeMode": "dry",
+      "expected": { "code": "IDEMPOTENCY_KEY_REQUIRED", "severity": "error" },
+      "nodes": [
+        { "id": "retrying", "engineering": { "maxAttempts": 2, "permissions": ["read"] } }
+      ],
+      "edges": []
+    },
+    {
+      "id": "retry-with-whitespace-idempotency-key",
+      "bridgeMode": "dry",
+      "expected": { "code": "IDEMPOTENCY_KEY_REQUIRED", "severity": "error" },
+      "nodes": [
+        { "id": "retrying-space", "engineering": { "maxAttempts": 2, "idempotencyKey": "   ", "permissions": ["read"] } }
+      ],
+      "edges": []
+    },
+    {
+      "id": "sensitive-network-without-policy-exception",
+      "bridgeMode": "dry",
+      "expected": { "code": "SENSITIVE_NETWORK_POLICY_REQUIRED", "severity": "error" },
+      "nodes": [
+        { "id": "networked", "engineering": { "dataClass": "sensitive", "permissions": ["read", "network"] } }
+      ],
+      "edges": []
+    },
+    {
+      "id": "approved-gate-is-unrelated",
+      "bridgeMode": "live",
+      "expected": { "code": "IRREVERSIBLE_GATE_DOMINATOR_REQUIRED", "severity": "error" },
+      "nodes": [
+        { "id": "start" },
+        { "id": "irreversible", "engineering": { "irreversible": true, "compensation": "restore" } },
+        { "id": "gate", "engineering": { "role": "human_gate", "approvalStatus": "approved" } }
+      ],
+      "edges": [{ "id": "edge-action", "from": "start", "to": "irreversible", "kind": "sequence" }]
+    },
+    {
+      "id": "approved-gate-is-downstream",
+      "bridgeMode": "live",
+      "expected": { "code": "IRREVERSIBLE_GATE_DOMINATOR_REQUIRED", "severity": "error" },
+      "nodes": [
+        { "id": "start" },
+        { "id": "irreversible", "engineering": { "irreversible": true, "compensation": "restore" } },
+        { "id": "gate", "engineering": { "role": "human_gate", "approvalStatus": "approved" } }
+      ],
+      "edges": [
+        { "id": "edge-action", "from": "start", "to": "irreversible", "kind": "sequence" },
+        { "id": "edge-gate", "from": "irreversible", "to": "gate", "kind": "sequence" }
+      ]
+    },
+    {
+      "id": "dominating-gate-is-pending",
+      "bridgeMode": "live",
+      "expected": { "code": "IRREVERSIBLE_GATE_DOMINATOR_REQUIRED", "severity": "error" },
+      "nodes": [
+        { "id": "start" },
+        { "id": "gate", "engineering": { "role": "human_gate", "approvalStatus": "pending" } },
+        { "id": "irreversible", "engineering": { "irreversible": true, "compensation": "restore" } }
+      ],
+      "edges": [
+        { "id": "edge-gate", "from": "start", "to": "gate", "kind": "sequence" },
+        { "id": "edge-action", "from": "gate", "to": "irreversible", "kind": "sequence" }
+      ]
+    },
+    {
+      "id": "approved-gate-covers-only-one-path",
+      "bridgeMode": "live",
+      "expected": { "code": "IRREVERSIBLE_GATE_DOMINATOR_REQUIRED", "severity": "error" },
+      "nodes": [
+        { "id": "start" },
+        { "id": "gate", "engineering": { "role": "human_gate", "approvalStatus": "approved" } },
+        { "id": "bypass" },
+        { "id": "irreversible", "joinMode": "any", "engineering": { "irreversible": true, "compensation": "restore" } }
+      ],
+      "edges": [
+        { "id": "edge-gate", "from": "start", "to": "gate", "kind": "sequence" },
+        { "id": "edge-gated-action", "from": "gate", "to": "irreversible", "kind": "sequence" },
+        { "id": "edge-bypass", "from": "start", "to": "bypass", "kind": "sequence" },
+        { "id": "edge-bypass-action", "from": "bypass", "to": "irreversible", "kind": "sequence" }
+      ]
+    },
+    {
+      "id": "approved-gate-dominates-action",
+      "bridgeMode": "live",
+      "expected": { "code": null, "severity": null },
+      "nodes": [
+        { "id": "start" },
+        { "id": "gate", "engineering": { "role": "human_gate", "approvalStatus": "approved" } },
+        { "id": "irreversible", "engineering": { "irreversible": true, "compensation": "restore" } }
+      ],
+      "edges": [
+        { "id": "edge-gate", "from": "start", "to": "gate", "kind": "sequence" },
+        { "id": "edge-action", "from": "gate", "to": "irreversible", "kind": "sequence" }
+      ]
+    },
+    {
+      "id": "selected-gated-branch-dominates-action",
+      "bridgeMode": "live",
+      "expected": { "code": null, "severity": null },
+      "nodes": [
+        { "id": "decision", "kind": "condition", "branchTaken": " y " },
+        { "id": "gate", "engineering": { "role": "human_gate", "approvalStatus": "approved" } },
+        { "id": "bypass" },
+        { "id": "irreversible", "joinMode": "any", "engineering": { "irreversible": true, "compensation": "restore" } }
+      ],
+      "edges": [
+        { "id": "edge-gated", "from": "decision", "to": "gate", "kind": "sequence", "branch": "y" },
+        { "id": "edge-bypass", "from": "decision", "to": "bypass", "kind": "sequence", "branch": "n" },
+        { "id": "edge-gated-action", "from": "gate", "to": "irreversible", "kind": "sequence" },
+        { "id": "edge-bypass-action", "from": "bypass", "to": "irreversible", "kind": "sequence" }
+      ]
+    },
+    {
+      "id": "selected-ungated-branch-rejects-action",
+      "bridgeMode": "live",
+      "expected": { "code": "IRREVERSIBLE_GATE_DOMINATOR_REQUIRED", "severity": "error" },
+      "nodes": [
+        { "id": "decision", "kind": "condition", "branchTaken": "n" },
+        { "id": "gate", "engineering": { "role": "human_gate", "approvalStatus": "approved" } },
+        { "id": "bypass" },
+        { "id": "irreversible", "joinMode": "any", "engineering": { "irreversible": true, "compensation": "restore" } }
+      ],
+      "edges": [
+        { "id": "edge-gated", "from": "decision", "to": "gate", "kind": "sequence", "branch": "y" },
+        { "id": "edge-bypass", "from": "decision", "to": "bypass", "kind": "sequence", "branch": "n" },
+        { "id": "edge-gated-action", "from": "gate", "to": "irreversible", "kind": "sequence" },
+        { "id": "edge-bypass-action", "from": "bypass", "to": "irreversible", "kind": "sequence" }
+      ]
+    }
+  ]
+}
