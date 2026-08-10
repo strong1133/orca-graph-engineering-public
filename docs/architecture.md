@@ -76,7 +76,9 @@ Orca plugin API v1의 panel contribution은 우측 activity bar의 sandboxed ifr
 
 상단의 고정 메뉴는 `그래프 목록`, `그래프 보기`, `Domain 관리`, `Milestone 관리`, `Task 관리`, `Todo 관리`를 명시적으로 전환한다. 목록 화면은 lifecycle status와 최신 run stage를 분리합니다. status는 badge, 실행 단계는 color dot와 별도 badge로 표시하며 이름·설명·ID 검색, 두 종류의 필터, 수정일·이름·상태 정렬을 클라이언트에서 수행합니다. Task/Todo 화면은 Draft·Meta·scope까지 통합 검색하고 상태·Domain·Milestone 필터, Domain/Milestone/상태/우선순위 그룹화, 우선순위·마감일·수정일 정렬을 제공한다. Task의 기본 그룹은 Domain→Milestone이고, Todo의 기본 그룹은 실행 scope와 독립적인 free-form `groupName`→`subgroupName` 계층이다. 활성 그룹화 모드의 각 그룹은 독립적으로 접고 펼칠 수 있으며, 현재 필터에 보이는 그룹 전체를 한 번에 접거나 펼칠 수도 있다. 그룹 항목 수와 접힘 상태는 유지한다. Todo의 기본 projection은 `open|in_progress`인 활성 항목이며, `done|cancelled` 이력은 삭제하지 않고 모든 상태 또는 개별 상태 필터로 노출한다. 헤더는 현재 표시 수·활성 수·전체 수를 분리해 원천 집계 의미를 보존한다.
 
-Task 상세의 고정 실행 버튼은 저장된 Task ID와 일회성 `projectId/sessionId/model/reasoning`만 브리지에 보낸다. 브리지는 현재 GraphStore나 구조화 원천 snapshot에서 Task와 유효 실행 Prompt를 다시 읽고 그래프 실행과 같은 target allow-list, agent family, reasoning, live worktree/session attestation을 적용한다. 단건 실행은 그래프 run·node claim·Task lifecycle을 만들지 않으며 새 terminal을 생성하거나 증명된 idle agent session에 Prompt를 보내 완료까지 기다린다.
+Task 상세의 고정 실행 버튼은 저장된 Task ID와 일회성 `environmentId/projectId/sessionId/model/reasoning`만 브리지에 보낸다. 대상 갱신은 현재 Orca와 `environment list`에 저장된 원격 Orca를 각각 조회하고 environment별 project/worktree/agent session을 한 snapshot에 합친다. UI는 환경을 먼저 고른 뒤 그 환경에 속한 project와 session만 보여 주며, 브리지는 선택된 원격 환경의 모든 CLI 호출에 공식 `--environment` selector를 적용한다. 브리지는 현재 GraphStore나 구조화 원천 snapshot에서 Task와 유효 실행 Prompt를 다시 읽고 그래프 실행과 같은 target allow-list, agent family, reasoning, live worktree/session attestation을 적용한다. 단건 실행은 그래프 run·node claim·Task lifecycle을 만들지 않으며 새 terminal을 생성하거나 증명된 idle agent session에 Prompt를 보내 완료까지 기다린다.
+
+Task 상세의 `Task 삭제`는 확인 modal을 거쳐 lifecycle을 `archived`로 바꾸는 보존형 삭제다. Prompt revision과 연결된 graph node를 제거하지 않으며 보관된 Task는 같은 상세 화면의 `Task 복원`으로 backlog에 되돌린다. 구조화 원천에서는 기존 Task CAS version으로 mutation하고 충돌 시 최신 snapshot을 다시 읽는다.
 
 ## Meta Prompt 생성 경계
 

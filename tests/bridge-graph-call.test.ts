@@ -70,14 +70,17 @@ async function installFakeOrca(runtimeDirectory: string): Promise<{ command: str
 import { appendFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const mode = process.env.ORCA_GRAPH_FAKE_MODE || "idle-agent";
+const remote = args.includes("--environment");
 appendFileSync(process.env.ORCA_GRAPH_FAKE_CALL_LOG, JSON.stringify(args) + "\\n");
 let result = {};
-if (args[0] === "worktree" && args[1] === "ps") {
+if (args[0] === "environment" && args[1] === "list") {
+  result = { environments: process.env.ORCA_GRAPH_FAKE_REMOTE === "1" ? [{ id: "env-jsj2", name: "jsj2" }] : [] };
+} else if (args[0] === "worktree" && args[1] === "ps") {
   const paneKey = mode === "stale" ? "new-tab:new-leaf" : "fake-tab:fake-leaf";
   const worktree = {
-    worktreeId: "fake-worktree",
-    repoId: "fake-repo",
-    path: "/portable/fake-project",
+    worktreeId: remote ? "remote-worktree" : "fake-worktree",
+    repoId: remote ? "remote-repo" : "fake-repo",
+    path: remote ? "/portable/remote-project" : "/portable/fake-project",
     isArchived: false,
     isActive: true,
     isMainWorktree: true,
@@ -91,11 +94,13 @@ if (args[0] === "worktree" && args[1] === "ps") {
   };
   result = { worktrees: mode === "missing-worktree" ? [] : [worktree] };
 } else if (args[0] === "project" && args[1] === "list") {
-  result = { projects: [{ id: "fake-project", displayName: "Fake project", sourceRepoIds: ["fake-repo"] }] };
+  result = { projects: [remote
+    ? { id: "remote-project", displayName: "Remote project", sourceRepoIds: ["remote-repo"] }
+    : { id: "fake-project", displayName: "Fake project", sourceRepoIds: ["fake-repo"] }] };
 } else if (args[0] === "terminal" && args[1] === "list") {
   result = { terminals: [{
-    handle: "fake-session",
-    worktreeId: "fake-worktree",
+    handle: remote ? "remote-session" : "fake-session",
+    worktreeId: remote ? "remote-worktree" : "fake-worktree",
     tabId: mode === "stale" ? "new-tab" : "fake-tab",
     leafId: mode === "stale" ? "new-leaf" : "fake-leaf",
     connected: true,
@@ -104,20 +109,22 @@ if (args[0] === "worktree" && args[1] === "ps") {
 } else if (args[0] === "terminal" && args[1] === "wait") {
   result = { wait: { satisfied: !["busy", "idle-timeout"].includes(mode) } };
 } else if (args[0] === "terminal" && args[1] === "create") {
-  result = { terminal: { handle: "fake-session" } };
+  result = { terminal: { handle: remote ? "remote-session" : "fake-session" } };
 } else if (args[0] === "terminal" && args[1] === "show") {
-  result = { terminal: { handle: "fake-session", worktreeId: "fake-worktree", tabId: "fake-tab", leafId: "fake-leaf" } };
+  result = { terminal: { handle: remote ? "remote-session" : "fake-session", worktreeId: remote ? "remote-worktree" : "fake-worktree", tabId: "fake-tab", leafId: "fake-leaf" } };
 } else if (args[0] === "terminal" && args[1] === "send") {
-  result = { terminal: { handle: "fake-session" } };
+  result = { terminal: { handle: remote ? "remote-session" : "fake-session" } };
 }
 process.stdout.write(JSON.stringify({ ok: true, result }));
 `, { mode: 0o755 });
   await writeFile(path.join(runtimeDirectory, "targets.json"), `${JSON.stringify({
     refreshedAt: "2026-08-09T00:00:00.000Z",
-    projects: [{ id: "fake-project", name: "Fake project", worktreeId: "fake-worktree", path: "/portable/fake-project" }],
+    environments: [{ id: "local", name: "jsj1", local: true, connected: true }],
+    projects: [{ id: "fake-project", name: "Fake project", environmentId: "local", worktreeId: "fake-worktree", path: "/portable/fake-project" }],
     sessions: [{
       id: "fake-session",
       title: "Fake session",
+      environmentId: "local",
       worktreeId: "fake-worktree",
       projectId: "fake-project",
       paneKey: "fake-tab:fake-leaf",
@@ -248,6 +255,38 @@ describe("bridge graph calls", () => {
     expect(send?.join("\n")).not.toContain("Graph:");
     const after = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
     expect(after.graphs.every((graph: { runs: unknown[] }) => graph.runs.length === 0)).toBe(true);
+  });
+
+  it("executes one Task through the selected remote Orca environment", async () => {
+    const root = process.cwd();
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const store = JSON.parse(await readFile(path.join(root, "fixtures/default-store.json"), "utf8"));
+    const now = "2026-08-10T00:00:00.000Z";
+    store.tasks = [{
+      id: "TASK-remote", title: "원격 단건 Task", prompt: "원격 실행", draft: "원격 실행",
+      promptRevisions: [], status: "ready", priority: "medium", tags: [], createdAt: now, updatedAt: now,
+    }];
+    await writeFile(path.join(runtimeDirectory, "store.json"), `${JSON.stringify(store)}\n`, "utf8");
+    const fake = await installFakeOrca(runtimeDirectory);
+    const targetsPath = path.join(runtimeDirectory, "targets.json");
+    const targets = JSON.parse(await readFile(targetsPath, "utf8"));
+    targets.environments.push({ id: "env-jsj2", name: "jsj2", local: false, connected: true });
+    targets.projects.push({ id: "remote-project", name: "Remote project", environmentId: "env-jsj2", worktreeId: "remote-worktree" });
+    await writeFile(targetsPath, `${JSON.stringify(targets)}\n`, "utf8");
+
+    await sendToBridge(
+      runtimeDirectory,
+      { type: "run-task", taskId: "TASK-remote", routing: { environmentId: "env-jsj2", projectId: "remote-project", model: "gpt-5.6-sol" }, dryRun: false },
+      "task TASK-remote executed",
+      { ORCA_CLI_COMMAND: fake.command, ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    for (const args of calls.filter((item) => item[0] === "terminal" || item[0] === "worktree")) {
+      expect(args).toEqual(expect.arrayContaining(["--environment", "env-jsj2"]));
+    }
+    expect(calls.some((args) => args[0] === "terminal" && args[1] === "create" && args.includes("id:remote-worktree"))).toBe(true);
   });
 
   it("plans a child graph recursively and records bidirectional run lineage", async () => {
@@ -854,6 +893,40 @@ describe("bridge graph calls", () => {
         });
       }
     });
+  });
+
+  it("discovers saved Orca environments and scopes their projects and sessions", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    await sendToBridge(
+      runtimeDirectory,
+      { type: "refresh" },
+      "Orca targets refreshed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_REMOTE: "1",
+        ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME: "jsj1",
+      },
+    );
+
+    const targets = JSON.parse(await readFile(path.join(runtimeDirectory, "targets.json"), "utf8"));
+    expect(targets.environments).toEqual([
+      { id: "local", name: "jsj1", local: true, connected: true },
+      { id: "env-jsj2", name: "jsj2", local: false, connected: true },
+    ]);
+    expect(targets.projects).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "fake-project", environmentId: "local" }),
+      expect.objectContaining({ id: "remote-project", environmentId: "env-jsj2" }),
+    ]));
+    expect(targets.sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "fake-session", environmentId: "local" }),
+      expect.objectContaining({ id: "remote-session", environmentId: "env-jsj2" }),
+    ]));
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    expect(calls.some((args) => args[0] === "project" && args[1] === "list" && args.includes("env-jsj2"))).toBe(true);
   });
 
   describe("shared graph validation matrix", () => {

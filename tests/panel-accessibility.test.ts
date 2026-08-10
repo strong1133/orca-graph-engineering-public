@@ -156,7 +156,19 @@ describe.each([
   it("opens a standalone Task run dialog with one-off Orca routing", async () => {
     const dom = await mountPanel(wide, ({ store, targets }) => {
       store.bridgeWorkspace = "current-project";
-      targets.projects = [{ id: "repo:current-project", name: "current-project", worktreeId: "worktree-current-project" }];
+      targets.environments = [
+        { id: "local", name: "jsj1", local: true, connected: true },
+        { id: "environment-jsj2", name: "jsj2", local: false, connected: true },
+      ];
+      targets.projects = [
+        { id: "repo:current-project", name: "current-project", environmentId: "local", worktreeId: "worktree-current-project" },
+        { id: "repo:remote-project", name: "remote-project", environmentId: "environment-jsj2", worktreeId: "worktree-remote-project" },
+      ];
+      targets.sessions = [{
+        id: "remote-session", title: "Remote Codex", environmentId: "environment-jsj2",
+        worktreeId: "worktree-remote-project", projectId: "repo:remote-project", paneKey: "tab:leaf",
+        agentType: "codex", agentState: "done", connected: true, writable: true,
+      }];
     });
     try {
       const { document, Event } = dom.window;
@@ -172,6 +184,9 @@ describe.each([
       expect(dialog?.textContent).toContain("Task 단건 실행");
       expect(dialog?.textContent).toContain("그래프 run이나 노드 claim을 만들지 않고");
       expect(dialog?.textContent).toContain("현재 브리지 작업공간 자동 선택");
+      const environment = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="environmentId"]');
+      expect(environment?.value).toBe("local");
+      expect([...(environment?.options ?? [])].map((option) => option.textContent)).toEqual(["jsj1 · 이 Orca", "jsj2"]);
       expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="projectId"]')?.value).toBe("repo:current-project");
       expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="model"]')?.value).toBe("gpt-5.6-sol");
       expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
@@ -185,6 +200,41 @@ describe.each([
       expect(dialog?.textContent).toContain("Claude Opus 5");
       expect([...dialog?.querySelectorAll<HTMLOptionElement>('[data-scope="task-run-routing"][data-field="reasoning"] option') ?? []]
         .map((option) => option.value)).toEqual(["", "low", "medium", "high", "xhigh", "max"]);
+
+      const rerenderedEnvironment = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="environmentId"]');
+      if (rerenderedEnvironment) {
+        rerenderedEnvironment.value = "environment-jsj2";
+        rerenderedEnvironment.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect([...dialog?.querySelectorAll<HTMLOptionElement>('[data-scope="task-run-routing"][data-field="projectId"] option') ?? []]
+        .map((option) => option.textContent)).toEqual(["프로젝트 미지정", "remote-project"]);
+      expect([...dialog?.querySelectorAll<HTMLOptionElement>('[data-scope="task-run-routing"][data-field="sessionId"] option') ?? []]
+        .map((option) => option.textContent)).toEqual(["세션 미지정 · 새 세션", "Remote Codex · remote-project"]);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("offers a confirmed Task delete action that preserves recoverable history", async () => {
+    const dom = await mountPanel(wide);
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
+      const deleteButton = document.querySelector<HTMLButtonElement>('[data-action="open-task-delete"]');
+      expect(deleteButton?.textContent).toBe("Task 삭제");
+      expect(deleteButton?.classList.contains("danger")).toBe(true);
+      deleteButton?.click();
+
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).toContain("영구 삭제하지 않고 보관 상태로 전환");
+      expect(dialog?.textContent).toContain("Prompt 이력");
+      dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-delete"]')?.click();
+
+      expect(document.querySelector<HTMLElement>('[role="dialog"]')).toBeNull();
+      expect(document.querySelector<HTMLButtonElement>('[data-action="archive-local-task"]')?.textContent).toBe("Task 복원");
+      expect(document.querySelector<HTMLSelectElement>('[data-scope="local-task"][data-field="status"]')?.value).toBe("archived");
     } finally {
       dom.window.close();
     }

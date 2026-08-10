@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -233,8 +234,9 @@ async function readWorkingStore(config = undefined) {
   return mergeBridgeRuntime(cache.store, localStore);
 }
 
-async function runOrca(args, timeout = 30_000, cwd = root) {
-  const { stdout } = await execFileAsync(orcaCommand, [...args, "--json"], {
+async function runOrca(args, timeout = 30_000, cwd = root, environmentSelector = null) {
+  const scopedArgs = environmentSelector ? [...args, "--environment", environmentSelector] : args;
+  const { stdout } = await execFileAsync(orcaCommand, [...scopedArgs, "--json"], {
     cwd,
     timeout,
     maxBuffer: 32 * 1024 * 1024,
@@ -328,9 +330,65 @@ async function openWideView() {
 
 async function refreshTargets() {
   const baseTargets = await readTargets();
+  let savedEnvironments = [];
+  try {
+    const result = await runOrca(["environment", "list"]);
+    savedEnvironments = Array.isArray(result.environments) ? result.environments : [];
+  } catch {
+    // 구버전 Orca는 local target만 계속 제공한다.
+  }
+  const environmentDefinitions = [
+    {
+      id: "local",
+      name: process.env.ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME || os.hostname().split(".")[0] || "local",
+      local: true,
+      selector: null,
+    },
+    ...savedEnvironments.map((environment) => ({
+      id: String(environment.id),
+      name: String(environment.name || environment.id),
+      local: false,
+      selector: String(environment.id),
+    })),
+  ];
+  const discovered = await Promise.all(environmentDefinitions.map(async (environment) => {
+    try {
+      const value = await refreshEnvironmentTargets(environment);
+      return { environment: { id: environment.id, name: environment.name, local: environment.local, connected: true }, ...value };
+    } catch (error) {
+      if (environment.local) throw error;
+      return {
+        environment: {
+          id: environment.id,
+          name: environment.name,
+          local: false,
+          connected: false,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        projects: [],
+        sessions: [],
+      };
+    }
+  }));
+  const projects = discovered.flatMap((item) => item.projects);
+  const sessions = discovered.flatMap((item) => item.sessions);
+  const targets = {
+    refreshedAt: new Date().toISOString(),
+    environments: discovered.map((item) => item.environment),
+    projects,
+    sessions,
+    models: baseTargets.models ?? [],
+  };
+  await atomicJson(targetsPath, targets);
+  const store = await readJson(storePath, defaultStorePath);
+  await saveStore(store, `Orca 대상을 갱신했습니다 · ${targets.environments.filter((item) => item.connected).length}/${targets.environments.length} environments · ${projects.length} projects · ${sessions.length} sessions`);
+  return targets;
+}
+
+async function refreshEnvironmentTargets(environment) {
   const [projectResult, worktreeResult] = await Promise.all([
-    runOrca(["project", "list"]),
-    runOrca(["worktree", "ps", "--limit", "300"]),
+    runOrca(["project", "list"], 30_000, root, environment.selector),
+    runOrca(["worktree", "ps", "--limit", "300"], 30_000, root, environment.selector),
   ]);
   const rawProjects = Array.isArray(projectResult.projects) ? projectResult.projects : [];
   const worktrees = Array.isArray(worktreeResult.worktrees) ? worktreeResult.worktrees : [];
@@ -345,6 +403,7 @@ async function refreshTargets() {
     return {
       id: project.id,
       name: project.displayName,
+      environmentId: environment.id,
       ...(repoId ? { repoId } : {}),
       ...(worktree?.worktreeId ? { worktreeId: worktree.worktreeId } : {}),
       ...(worktree?.path ? { path: worktree.path } : {}),
@@ -360,7 +419,7 @@ async function refreshTargets() {
   const liveWorktrees = worktrees.filter((worktree) => Number(worktree.liveTerminalCount ?? 0) > 0).slice(0, 40);
   const sessionResults = await Promise.allSettled(
     liveWorktrees.map((worktree) =>
-      runOrca(["terminal", "list", "--worktree", `id:${worktree.worktreeId}`, "--limit", "50"]),
+      runOrca(["terminal", "list", "--worktree", `id:${worktree.worktreeId}`, "--limit", "50"], 30_000, root, environment.selector),
     ),
   );
   const sessions = [];
@@ -373,6 +432,7 @@ async function refreshTargets() {
       sessions.push({
         id: terminal.handle,
         title: terminal.title || terminal.preview?.split("\n")[0] || terminal.handle,
+        environmentId: environment.id,
         worktreeId: terminal.worktreeId,
         ...(projectByRepo.get(String(terminal.worktreeId).split("::")[0])
           ? { projectId: projectByRepo.get(String(terminal.worktreeId).split("::")[0]) }
@@ -385,21 +445,12 @@ async function refreshTargets() {
       });
     }
   }
-  const targets = {
-    refreshedAt: new Date().toISOString(),
-    projects,
-    sessions,
-    models: baseTargets.models ?? [],
-  };
-  await atomicJson(targetsPath, targets);
-  const store = await readJson(storePath, defaultStorePath);
-  await saveStore(store, `Orca 대상을 갱신했습니다 · ${projects.length} projects · ${sessions.length} sessions`);
-  return targets;
+  return { projects, sessions };
 }
 
 function effectiveRouting(graph, node) {
   const routing = {};
-  for (const key of ["projectId", "sessionId", "model", "reasoning"]) {
+  for (const key of ["environmentId", "projectId", "sessionId", "model", "reasoning"]) {
     if (node.routing?.[key]) routing[key] = node.routing[key];
     else if (graph.defaults?.[key]) routing[key] = graph.defaults[key];
   }
@@ -520,11 +571,11 @@ function validateMetaPromptOutput(value) {
   return text;
 }
 
-async function terminalAgentMessage(handle) {
-  const shown = await runOrca(["terminal", "show", "--terminal", handle]);
+async function terminalAgentMessage(handle, environmentSelector = null) {
+  const shown = await runOrca(["terminal", "show", "--terminal", handle], 30_000, root, environmentSelector);
   const terminal = shown?.terminal;
   if (!terminal?.worktreeId || !terminal.tabId || !terminal.leafId) throw new Error("agent terminal identity is unavailable");
-  const processes = await runOrca(["worktree", "ps", "--limit", "300"]);
+  const processes = await runOrca(["worktree", "ps", "--limit", "300"], 30_000, root, environmentSelector);
   const worktree = (processes.worktrees ?? []).find((candidate) => candidate.worktreeId === terminal.worktreeId);
   const paneKey = `${terminal.tabId}:${terminal.leafId}`;
   const agent = (worktree?.agents ?? []).find((candidate) => candidate.paneKey === paneKey);
@@ -645,6 +696,7 @@ function buildPrompt(graph, node, runId) {
     node.task?.prompt || node.label || "Execute this graph node.",
     "",
     "Execution contract:",
+    `- environment: ${routing.environmentId || "local"}`,
     `- project: ${routing.projectId || "current"}`,
     `- session: ${routing.sessionId || "new"}`,
     `- model: ${routing.model || "agent default"}`,
@@ -671,7 +723,7 @@ function standaloneRouting(value) {
   if (value === undefined || value === null) return {};
   if (typeof value !== "object" || Array.isArray(value)) throw new Error("standalone task routing must be an object");
   const routing = {};
-  for (const key of ["projectId", "sessionId", "model", "reasoning"]) {
+  for (const key of ["environmentId", "projectId", "sessionId", "model", "reasoning"]) {
     const candidate = value[key];
     if (candidate === undefined || candidate === null || candidate === "") continue;
     if (typeof candidate !== "string") throw new Error(`standalone task routing ${key} must be a string`);
@@ -693,6 +745,7 @@ function buildStandaloneTaskPrompt(task, routing, scope) {
     task.prompt,
     "",
     "Execution target:",
+    `- environment: ${routing.environmentId || "local"}`,
     `- project: ${routing.projectId || "current"}`,
     `- session: ${routing.sessionId || "new"}`,
     `- model: ${routing.model || "agent default"}`,
@@ -723,11 +776,39 @@ function assertModelReasoning(model, reasoning) {
   }
 }
 
+function targetEnvironmentId(target) {
+  return target?.environmentId || "local";
+}
+
+function resolveRoutingEnvironment(targets, routing) {
+  let environmentId = routing.environmentId;
+  if (!environmentId && routing.sessionId) {
+    const matches = targets.sessions.filter((item) => item.id === routing.sessionId);
+    environmentId = matches.find((item) => targetEnvironmentId(item) === "local")?.environmentId
+      || (matches.length === 1 ? matches[0]?.environmentId : undefined);
+  }
+  if (!environmentId && routing.projectId) {
+    const matches = targets.projects.filter((item) => item.id === routing.projectId);
+    environmentId = matches.find((item) => targetEnvironmentId(item) === "local")?.environmentId
+      || (matches.length === 1 ? matches[0]?.environmentId : undefined);
+  }
+  environmentId ||= targets.environments?.find((item) => item.local)?.id || "local";
+  const environment = targets.environments?.find((item) => item.id === environmentId);
+  if (!environment && environmentId !== "local") throw new Error(`Orca environment is not allowed: ${environmentId}`);
+  if (environment && !environment.connected) throw new Error(`Orca environment is unavailable: ${environment.name}`);
+  return {
+    environmentId,
+    environmentSelector: environment?.local === false ? environment.id : null,
+  };
+}
+
 function resolveTaskRoute(graph, node, targets) {
   const routing = effectiveRouting(graph, node);
+  const environment = resolveRoutingEnvironment(targets, routing);
+  routing.environmentId = environment.environmentId;
   const freshContext = node.engineering?.contextMode === "fresh";
   const referencedSession = routing.sessionId
-    ? targets.sessions.find((item) => item.id === routing.sessionId)
+    ? targets.sessions.find((item) => item.id === routing.sessionId && targetEnvironmentId(item) === environment.environmentId)
     : null;
   if (!freshContext && routing.sessionId) {
     if (!referencedSession?.connected || !referencedSession.writable) {
@@ -743,26 +824,26 @@ function resolveTaskRoute(graph, node, targets) {
     if (routing.reasoning) {
       throw new Error(`existing session reasoning override is unsupported: ${routing.sessionId}; clear reasoning to keep the session's current effort`);
     }
-    return { mode: "existing-session", routing, session: referencedSession, model };
+    return { mode: "existing-session", routing, session: referencedSession, model, ...environment };
   }
   const projectId = routing.projectId || referencedSession?.projectId;
-  const project = targets.projects.find((item) => item.id === projectId);
+  const project = targets.projects.find((item) => item.id === projectId && targetEnvironmentId(item) === environment.environmentId);
   if (!project?.worktreeId) {
     const target = routing.projectId || (routing.sessionId ? `session fallback ${routing.sessionId}` : "unset");
     throw new Error(`project has no available worktree: ${target}`);
   }
   const model = resolveModel(targets, routing.model, { required: true });
   assertModelReasoning(model, routing.reasoning);
-  return { mode: "new-session", routing, project, model };
+  return { mode: "new-session", routing, project, model, ...environment };
 }
 
-async function loadLiveRoutingEvidence(worktreeIds, terminalWorktreeIds = []) {
+async function loadLiveRoutingEvidence(worktreeIds, terminalWorktreeIds = [], environmentSelector = null) {
   if (!worktreeIds.length) return { worktrees: [], terminalsByWorktree: new Map() };
-  const worktreeResult = await runOrca(["worktree", "ps", "--limit", "300"]);
+  const worktreeResult = await runOrca(["worktree", "ps", "--limit", "300"], 30_000, root, environmentSelector);
   const worktrees = Array.isArray(worktreeResult.worktrees) ? worktreeResult.worktrees : [];
   const terminalsByWorktree = new Map();
   await Promise.all([...new Set(terminalWorktreeIds)].map(async (worktreeId) => {
-    const result = await runOrca(["terminal", "list", "--worktree", `id:${worktreeId}`, "--limit", "50"]);
+    const result = await runOrca(["terminal", "list", "--worktree", `id:${worktreeId}`, "--limit", "50"], 30_000, root, environmentSelector);
     terminalsByWorktree.set(worktreeId, Array.isArray(result.terminals) ? result.terminals : []);
   }));
   return { worktrees, terminalsByWorktree };
@@ -795,7 +876,7 @@ async function waitForExistingSessionIdle(route, evidence) {
   const result = await runOrca([
     "terminal", "wait", "--terminal", route.session.id,
     "--for", "tui-idle", "--timeout-ms", String(timeoutMs),
-  ], timeoutMs + 10_000);
+  ], timeoutMs + 10_000, root, route.environmentSelector);
   if (result.wait?.satisfied !== true) throw new Error(`session agent did not reach tui-idle: ${route.session.id}`);
 }
 
@@ -803,24 +884,29 @@ async function attestExecutionPlan(plan) {
   if (plan.dryRun) return;
   const existingRoutes = [...new Map(
     plan.tasks.filter((item) => item.route.mode === "existing-session")
-      .map((item) => [item.route.session.id, item.route]),
+      .map((item) => [`${item.route.environmentId}:${item.route.session.id}`, item.route]),
   ).values()];
   const projectRoutes = plan.tasks.filter((item) => item.route.mode === "new-session");
-  const worktreeIds = [
-    ...existingRoutes.map((route) => route.session.worktreeId),
-    ...projectRoutes.map((item) => item.route.project.worktreeId),
-  ];
-  const evidence = await loadLiveRoutingEvidence(
-    worktreeIds,
-    existingRoutes.map((route) => route.session.worktreeId),
-  );
-  for (const item of projectRoutes) {
-    const worktree = evidence.worktrees.find((candidate) => candidate.worktreeId === item.route.project.worktreeId);
-    if (!worktree || worktree.isArchived) {
-      throw new Error(`project worktree is unavailable: ${item.route.project.id}`);
+  const environmentIds = new Set([
+    ...existingRoutes.map((route) => route.environmentId),
+    ...projectRoutes.map((item) => item.route.environmentId),
+  ]);
+  for (const environmentId of environmentIds) {
+    const environmentExisting = existingRoutes.filter((route) => route.environmentId === environmentId);
+    const environmentProjects = projectRoutes.filter((item) => item.route.environmentId === environmentId);
+    const selector = environmentExisting[0]?.environmentSelector ?? environmentProjects[0]?.route.environmentSelector ?? null;
+    const evidence = await loadLiveRoutingEvidence([
+      ...environmentExisting.map((route) => route.session.worktreeId),
+      ...environmentProjects.map((item) => item.route.project.worktreeId),
+    ], environmentExisting.map((route) => route.session.worktreeId), selector);
+    for (const item of environmentProjects) {
+      const worktree = evidence.worktrees.find((candidate) => candidate.worktreeId === item.route.project.worktreeId);
+      if (!worktree || worktree.isArchived) {
+        throw new Error(`project worktree is unavailable: ${item.route.project.id}`);
+      }
     }
+    for (const route of environmentExisting) await waitForExistingSessionIdle(route, evidence);
   }
-  for (const route of existingRoutes) await waitForExistingSessionIdle(route, evidence);
 }
 
 async function dispatchTask(graph, node, targets, runId, options = {}) {
@@ -828,7 +914,7 @@ async function dispatchTask(graph, node, targets, runId, options = {}) {
   const route = resolveTaskRoute(graph, node, targets);
   let handle = null;
   if (route.mode === "existing-session") {
-    const evidence = await loadLiveRoutingEvidence([route.session.worktreeId], [route.session.worktreeId]);
+    const evidence = await loadLiveRoutingEvidence([route.session.worktreeId], [route.session.worktreeId], route.environmentSelector);
     await waitForExistingSessionIdle(route, evidence);
     handle = route.session.id;
   } else {
@@ -837,17 +923,17 @@ async function dispatchTask(graph, node, targets, runId, options = {}) {
       "--worktree", `id:${route.project.worktreeId}`,
       "--title", options.title || `${graph.name} · ${node.label || node.id}`,
       "--command", commandForModel(route.model, route.routing.reasoning),
-    ]);
+    ], 30_000, root, route.environmentSelector);
     handle = findTerminalHandle(created);
     if (!handle) throw new Error("Orca did not return a terminal handle");
-    await runOrca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "90000"], 100_000);
+    await runOrca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "90000"], 100_000, root, route.environmentSelector);
   }
-  await runOrca(["terminal", "send", "--terminal", handle, "--text", prompt, "--enter"]);
+  await runOrca(["terminal", "send", "--terminal", handle, "--text", prompt, "--enter"], 30_000, root, route.environmentSelector);
   const timeoutMs = Math.max(5_000, Number(node.engineering?.timeoutSeconds || 900) * 1000);
-  await runOrca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", String(timeoutMs)], timeoutMs + 10_000);
+  await runOrca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", String(timeoutMs)], timeoutMs + 10_000, root, route.environmentSelector);
   let resultSummary = "";
   try {
-    resultSummary = String(await terminalAgentMessage(handle) || "").trim().slice(0, 20_000);
+    resultSummary = String(await terminalAgentMessage(handle, route.environmentSelector) || "").trim().slice(0, 20_000);
   } catch {
     // 실행 성공의 정본은 idle 도달이다. 공개 Orca surface가 결과 메시지를 주지 않는
     // 구버전에서도 일반 task를 실패시키지 않고, 자동 조건 판정만 명시적으로 막는다.
@@ -1589,8 +1675,8 @@ async function runStandaloneTask(taskId, requestedRouting, dryRun) {
   const plan = { dryRun, tasks: [{ route }] };
   await attestExecutionPlan(plan);
   const target = route.mode === "existing-session"
-    ? { mode: route.mode, sessionId: route.session.id, model: route.model?.id ?? null }
-    : { mode: route.mode, projectId: route.project.id, model: route.model.id };
+    ? { mode: route.mode, environmentId: route.environmentId, sessionId: route.session.id, model: route.model?.id ?? null }
+    : { mode: route.mode, environmentId: route.environmentId, projectId: route.project.id, model: route.model.id };
   if (dryRun) return { taskId, planned: true, target };
 
   const dispatched = await dispatchTask(graph, node, targets, `task-${crypto.randomUUID().slice(0, 8)}`, {
@@ -1609,9 +1695,11 @@ async function handleMessage(message) {
         return result;
       }
     case "refresh":
-      await refreshTargets();
-      console.log("[bridge] Orca targets refreshed");
-      return;
+      {
+        const result = await refreshTargets();
+        console.log("[bridge] Orca targets refreshed");
+        return result;
+      }
     case "configure-source": {
       const result = await configureDataSource(message.config, message.store);
       console.log(`[bridge] data source configured (${result.mode})`);

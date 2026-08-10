@@ -36,6 +36,7 @@ import {
   type LocalTodoStatus,
   type MilestoneStatus,
   type NodeKind,
+  type OrcaTargets,
   type PromptRevision,
   type RoutingTarget,
   type TopologyKind,
@@ -78,6 +79,7 @@ type ModalState =
   | { kind: "data-source"; error?: string }
   | RunModalState
   | TaskRunModalState
+  | { kind: "task-delete"; taskId: string }
   | { kind: "history" }
   | { kind: "templates" }
   | { kind: "shortcuts" }
@@ -719,14 +721,25 @@ function option(value: string, label: string, selected: string | undefined): str
   return `<option value="${esc(value)}"${value === (selected ?? "") ? " selected" : ""}>${esc(label)}</option>`;
 }
 
-function projectName(id: string | undefined): string {
-  if (!id) return "프로젝트 없음";
-  return targets.projects.find((item) => item.id === id)?.name ?? id;
+function routeEnvironmentId(value: string | undefined): string {
+  return value || targets.environments?.find((item) => item.local)?.id || "local";
 }
 
-function sessionName(id: string | undefined): string {
+function environmentName(id: string | undefined): string {
+  const environmentId = routeEnvironmentId(id);
+  return targets.environments?.find((item) => item.id === environmentId)?.name ?? (environmentId === "local" ? "local" : environmentId);
+}
+
+function projectName(id: string | undefined, environmentId?: string): string {
+  if (!id) return "프로젝트 없음";
+  const targetEnvironmentId = routeEnvironmentId(environmentId);
+  return targets.projects.find((item) => item.id === id && routeEnvironmentId(item.environmentId) === targetEnvironmentId)?.name ?? id;
+}
+
+function sessionName(id: string | undefined, environmentId?: string): string {
   if (!id) return "세션 없음";
-  return targets.sessions.find((item) => item.id === id)?.title ?? id;
+  const targetEnvironmentId = routeEnvironmentId(environmentId);
+  return targets.sessions.find((item) => item.id === id && routeEnvironmentId(item.environmentId) === targetEnvironmentId)?.title ?? id;
 }
 
 function modelName(id: string | undefined): string {
@@ -736,6 +749,7 @@ function modelName(id: string | undefined): string {
 
 function routingValue(value: RoutingTarget | undefined): RoutingTarget {
   return {
+    ...(value?.environmentId ? { environmentId: value.environmentId } : {}),
     ...(value?.projectId ? { projectId: value.projectId } : {}),
     ...(value?.sessionId ? { sessionId: value.sessionId } : {}),
     ...(value?.model ? { model: value.model } : {}),
@@ -775,14 +789,15 @@ function createRunModal(live: boolean): RunModalState {
 }
 
 function createTaskRunModal(task: LocalTask): TaskRunModalState {
-  const routing: RoutingTarget = {};
+  const routing: RoutingTarget = { environmentId: routeEnvironmentId(undefined) };
   let suggestedProjectId: string | undefined;
   if (store.bridgeWorkspace) {
     const workspace = store.bridgeWorkspace.trim().toLocaleLowerCase("en-US");
     const matches = targets.projects.filter((item) => {
       const id = item.id.toLocaleLowerCase("en-US");
       const name = item.name.toLocaleLowerCase("en-US");
-      return id === workspace || name === workspace || id.endsWith(`/${workspace}`);
+      return routeEnvironmentId(item.environmentId) === routing.environmentId
+        && (id === workspace || name === workspace || id.endsWith(`/${workspace}`));
     });
     if (matches.length === 1) {
       suggestedProjectId = matches[0]!.id;
@@ -844,17 +859,33 @@ function graphOptions(selected: string): string {
     .join("");
 }
 
-function projectOptions(selected: string | undefined, inherit = false): string {
+function environmentOptions(selected: string | undefined, inherit = false): string {
+  const environments = targets.environments?.length
+    ? targets.environments
+    : [{ id: "local", name: "local", local: true, connected: true }];
   return [
-    option("", inherit ? "그래프 기본값 상속" : "프로젝트 미지정", selected),
-    ...targets.projects.map((item) => option(item.id, item.name, selected)),
+    ...(inherit ? [option("", "그래프 기본값 상속", selected)] : []),
+    ...environments.map((item) => option(item.id, `${item.name}${item.local ? " · 이 Orca" : item.connected ? "" : " · 연결 안 됨"}`, selected ?? routeEnvironmentId(undefined))),
   ].join("");
 }
 
-function sessionOptions(selected: string | undefined, inherit = false): string {
+function projectOptions(selected: string | undefined, inherit = false, environmentId?: string): string {
+  const targetEnvironmentId = routeEnvironmentId(environmentId);
+  return [
+    option("", inherit ? "그래프 기본값 상속" : "프로젝트 미지정", selected),
+    ...targets.projects
+      .filter((item) => routeEnvironmentId(item.environmentId) === targetEnvironmentId)
+      .map((item) => option(item.id, item.name, selected)),
+  ].join("");
+}
+
+function sessionOptions(selected: string | undefined, inherit = false, environmentId?: string): string {
+  const targetEnvironmentId = routeEnvironmentId(environmentId);
   return [
     option("", inherit ? "그래프 기본값 상속" : "세션 미지정 · 새 세션", selected),
-    ...targets.sessions.map((item) => option(item.id, `${item.title} · ${projectName(item.projectId)}`, selected)),
+    ...targets.sessions
+      .filter((item) => routeEnvironmentId(item.environmentId) === targetEnvironmentId)
+      .map((item) => option(item.id, `${item.title} · ${projectName(item.projectId, item.environmentId)}`, selected)),
   ].join("");
 }
 
@@ -1741,15 +1772,21 @@ function renderInspector(graph: GraphDefinition): string {
 
 function routingProblemMessages(label: string, route: RoutingTarget, existingSession = Boolean(route.sessionId)): string[] {
   const problems: string[] = [];
+  const environmentId = routeEnvironmentId(route.environmentId);
+  const environment = targets.environments?.find((item) => item.id === environmentId);
+  if (targets.environments?.length && !environment) return [`${label}: 선택한 Orca 환경을 사용할 수 없습니다.`];
+  if (environment && !environment.connected) {
+    return [`${label}: Orca 환경 ${environment.name}에 연결할 수 없습니다.${environment.error ? ` ${environment.error}` : ""}`];
+  }
   if (route.sessionId) {
-    const session = targets.sessions.find((item) => item.id === route.sessionId);
+    const session = targets.sessions.find((item) => item.id === route.sessionId && routeEnvironmentId(item.environmentId) === environmentId);
     if (!session?.connected || !session.writable) return [`${label}: 선택한 세션을 사용할 수 없습니다.`];
     const selectedModel = route.model ? targets.models.find((item) => item.id === route.model) : undefined;
     if (selectedModel && selectedModel.agent !== session.agentType) {
       problems.push(`${label}: 세션은 ${session.agentType}, 모델은 ${selectedModel.agent} 계열입니다.`);
     }
   } else {
-    const project = targets.projects.find((item) => item.id === route.projectId);
+    const project = targets.projects.find((item) => item.id === route.projectId && routeEnvironmentId(item.environmentId) === environmentId);
     if (!project?.worktreeId) problems.push(`${label}: 새 세션을 만들 프로젝트를 선택하십시오.`);
     const modelId = route.model || "gpt-5.6-sol";
     if (!targets.models.some((item) => item.id === modelId)) {
@@ -1880,8 +1917,8 @@ function renderModal(): string {
     }
     const route = routingValue(modal.routing);
     const target = route.sessionId
-      ? `기존 세션 · ${sessionName(route.sessionId)}`
-      : route.projectId ? `새 세션 · ${projectName(route.projectId)}` : "실행 대상 미지정";
+      ? `기존 세션 · ${sessionName(route.sessionId, route.environmentId)}`
+      : route.projectId ? `새 세션 · ${projectName(route.projectId, route.environmentId)}` : "실행 대상 미지정";
     const problems = [
       ...(task.status === "archived" ? [`${task.title}: 보관된 Task는 실행할 수 없습니다.`] : []),
       ...(!task.prompt.trim() ? [`${task.title}: 실행할 Prompt가 없습니다.`] : []),
@@ -1896,17 +1933,38 @@ function renderModal(): string {
         <section class="section run-defaults">
           <div class="section-title">실행 대상 ${modal.suggestedProjectId && route.projectId === modal.suggestedProjectId ? '<span class="badge">현재 브리지 작업공간 자동 선택</span>' : ""}</div>
           <div class="run-routing-grid">
-            <label class="field"><span>프로젝트</span><select data-scope="task-run-routing" data-field="projectId">${projectOptions(route.projectId)}</select></label>
-            <label class="field"><span>기존 세션</span><select data-scope="task-run-routing" data-field="sessionId">${sessionOptions(route.sessionId)}</select></label>
+            <label class="field"><span>Orca 환경</span><select data-scope="task-run-routing" data-field="environmentId">${environmentOptions(route.environmentId)}</select></label>
+            <label class="field"><span>프로젝트</span><select data-scope="task-run-routing" data-field="projectId">${projectOptions(route.projectId, false, route.environmentId)}</select></label>
+            <label class="field"><span>기존 세션</span><select data-scope="task-run-routing" data-field="sessionId">${sessionOptions(route.sessionId, false, route.environmentId)}</select></label>
             <label class="field"><span>AI 모델</span><select data-scope="task-run-routing" data-field="model">${modelOptions(route.model)}</select></label>
             <label class="field"><span>Reasoning</span><select data-scope="task-run-routing" data-field="reasoning">${reasoningOptions(route.reasoning, route.model, { existingSession: Boolean(route.sessionId) })}</select></label>
           </div>
-          <div class="run-route-effective"><strong>${esc(target)}</strong><span>AI · ${esc(modelName(route.model))}${route.reasoning ? ` · ${esc(route.reasoning)}` : ""}</span></div>
+          <div class="run-route-effective"><strong>${esc(environmentName(route.environmentId))} · ${esc(target)}</strong><span>AI · ${esc(modelName(route.model))}${route.reasoning ? ` · ${esc(route.reasoning)}` : ""}</span></div>
         </section>
         ${problems.length ? `<div class="run-configuration-errors"><strong>실행 설정 확인</strong><ul class="finding-list">${problems.map((message) => `<li class="error"><b>대상</b> ${esc(message)}</li>`).join("")}</ul></div>` : '<p class="status-pill good">Task와 실행 대상이 준비되었습니다.</p>'}
         <p class="warning-list">실행하면 Orca 터미널/에이전트 세션이 실제로 생성되거나 선택한 기존 세션에 Prompt가 전송됩니다.</p>
       </div>
       <div class="modal-actions"><button data-action="close-modal">취소</button><button class="primary" data-action="confirm-task-run" ${problems.length ? "disabled" : ""}>이 Task 실행</button></div>
+    </section></div>`;
+  }
+  if (view.modal.kind === "task-delete") {
+    const modal = view.modal;
+    const task = store.tasks.find((item) => item.id === modal.taskId);
+    if (!task) {
+      return `<div class="modal-backdrop"><section class="modal" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="modal-title">
+        <div class="modal-head"><strong id="modal-title">Task 삭제</strong><button class="icon ghost" data-action="close-modal" data-modal-initial-focus aria-label="닫기">×</button></div>
+        <div class="modal-body"><p class="warning-list">선택한 Task를 찾을 수 없습니다.</p></div>
+        <div class="modal-actions"><button data-action="close-modal">닫기</button></div>
+      </section></div>`;
+    }
+    const links = taskGraphLinks(task.id);
+    return `<div class="modal-backdrop"><section class="modal" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-head"><strong id="modal-title">Task 삭제</strong><button class="icon ghost" data-action="close-modal" data-modal-initial-focus aria-label="닫기">×</button></div>
+      <div class="modal-body">
+        <p><strong>${esc(task.title)}</strong>을 삭제하시겠습니까?</p>
+        <p class="help">데이터 보존을 위해 영구 삭제하지 않고 보관 상태로 전환합니다. ${links.length ? `Prompt 이력과 연결된 그래프 노드 ${links.length}개를 그대로 유지합니다.` : "Prompt 이력을 그대로 유지합니다."} 언제든 복원할 수 있습니다.</p>
+      </div>
+      <div class="modal-actions"><button data-action="close-modal">취소</button><button class="danger" data-action="confirm-task-delete">Task 삭제</button></div>
     </section></div>`;
   }
   if (view.modal.kind === "run") {
@@ -2157,8 +2215,10 @@ function taskInspector(task: LocalTask): string {
         ${links.length ? `<ul class="work-link-list">${links.map(({ graph, node }) => `<li><button data-action="open-task-node" data-graph-id="${esc(graph.id)}" data-id="${esc(node.id)}"><strong>${esc(graph.name)}</strong><span>${esc(node.label)}</span></button></li>`).join("")}</ul>` : '<p class="help">아직 어떤 그래프에도 연결되지 않았습니다.</p>'}
       </section>
       <button class="primary" data-action="add-local-task-node" data-id="${esc(task.id)}">현재 그래프에 노드 추가</button>
-      <button data-action="archive-local-task" data-id="${esc(task.id)}">${task.status === "archived" ? "백로그로 복원" : "Task 보관"}</button>
-      <p class="help">Task를 보관해도 기존 그래프 노드와 Prompt 이력은 삭제되지 않습니다.</p>
+      ${task.status === "archived"
+        ? `<button data-action="archive-local-task" data-id="${esc(task.id)}">Task 복원</button>`
+        : `<button class="danger" data-action="open-task-delete" data-id="${esc(task.id)}">Task 삭제</button>`}
+      <p class="help">Task 삭제는 영구 삭제 대신 보관 처리하며 기존 그래프 노드와 Prompt 이력을 유지합니다.</p>
     </div>
   </section>`;
 }
@@ -2464,7 +2524,7 @@ function render(): void {
       <span class="status-pill ${bridgeReady ? "good" : "warn"}">${bridgeReady ? "● bridge" : "○ bridge off"}</span>
       <span class="message">${esc(store.lastBridgeMessage ?? "그래프를 편집한 뒤 저장하십시오.")}</span>
       <span class="status-pill ${dataSource.status === "ready" ? "good" : dataSource.status === "error" ? "bad" : "warn"}">${esc(dataSource.config.mode)} · ${esc(dataSource.status)}</span>
-      <span>${targets.projects.length} projects · ${targets.sessions.length} sessions · built ${new Date(bootstrap.builtAt).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}</span>
+      <span>${targets.environments?.length ?? 1} environments · ${targets.projects.length} projects · ${targets.sessions.length} sessions · built ${new Date(bootstrap.builtAt).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}</span>
     </footer>
     ${renderModal()}
     ${isWideMode && view.mode !== "canvas" ? '<button class="graph-fab" data-action="set-view" data-id="canvas" title="그래프 보기"><strong>그래프 보기</strong></button>' : ""}
@@ -2795,7 +2855,10 @@ async function sendBridge<T = unknown>(payload: unknown): Promise<T | undefined>
   const frames = encodeBridgeFrames(payload);
   if (frames.length > 128) throw new Error("Graph·Domain·Milestone·Task·Todo 데이터가 현재 패널 전송 한도를 넘었습니다. Graph 또는 업무 목록을 나누어 주십시오.");
   for (const frame of frames) {
-    await hostCall("terminal.sendText", { terminalId: store.bridgeTerminalId, text: frame, enter: false });
+    // Some Orca terminal backends expose a line-buffered PTY even though the
+    // bridge requests raw mode. Enter commits the frame in both modes; the
+    // bridge strips the trailing control character before parsing it.
+    await hostCall("terminal.sendText", { terminalId: store.bridgeTerminalId, text: frame, enter: true });
   }
   return undefined;
 }
@@ -3252,14 +3315,34 @@ app.addEventListener("click", (event) => {
       render();
       break;
     }
+    case "open-task-delete": {
+      const task = store.tasks.find((item) => item.id === target.dataset.id && item.status !== "archived");
+      if (!task || !localWorkMutable()) return;
+      openModal({ kind: "task-delete", taskId: task.id });
+      break;
+    }
+    case "confirm-task-delete": {
+      if (view.modal?.kind !== "task-delete") return;
+      const taskId = view.modal.taskId;
+      const task = store.tasks.find((item) => item.id === taskId);
+      if (!task || !localWorkMutable()) return;
+      const expectedVersion = Number(task.version ?? 0);
+      task.status = "archived";
+      touchWorkItem(task);
+      closeModal();
+      toast("Task를 보관했습니다. 필요하면 Task 복원으로 되돌릴 수 있습니다.");
+      persistStructuredItem("task", task, expectedVersion, "Task를 원천에서 보관했습니다.");
+      break;
+    }
     case "archive-local-task": {
       const task = store.tasks.find((item) => item.id === target.dataset.id);
       if (!task || !localWorkMutable()) return;
       const expectedVersion = Number(task.version ?? 0);
-      task.status = task.status === "archived" ? "backlog" : "archived";
+      if (task.status !== "archived") return;
+      task.status = "backlog";
       touchWorkItem(task);
       render();
-      persistStructuredItem("task", task, expectedVersion);
+      persistStructuredItem("task", task, expectedVersion, "Task를 원천에서 복원했습니다.");
       break;
     }
     case "promote-todo": {
@@ -3659,7 +3742,11 @@ app.addEventListener("click", (event) => {
     }
     case "save": void saveStore().catch((error) => toast(error instanceof Error ? error.message : String(error))); break;
     case "refresh-targets":
-      void sendBridge({ type: "refresh" }).then(() => toast("Orca 대상 갱신을 요청했습니다.")).catch((error) => toast(error instanceof Error ? error.message : String(error)));
+      void sendBridge<OrcaTargets>({ type: "refresh" }).then((result) => {
+        if (result) targets = result;
+        render();
+        toast(isWideMode ? "Orca 환경·프로젝트·세션을 갱신했습니다." : "Orca 대상 갱신을 요청했습니다.");
+      }).catch((error) => toast(error instanceof Error ? error.message : String(error)));
       break;
     case "open-task-run": {
       const task = store.tasks.find((item) => item.id === target.dataset.id);
@@ -3735,8 +3822,13 @@ app.addEventListener("change", (event) => {
   if (scope === "task-run-routing" && view.modal?.kind === "task-run") {
     if (raw) (view.modal.routing as Record<string, unknown>)[field] = raw;
     else delete (view.modal.routing as Record<string, unknown>)[field];
-    if (field === "sessionId" && typeof raw === "string" && raw) {
-      const session = targets.sessions.find((item) => item.id === raw);
+    if (field === "environmentId") {
+      delete view.modal.routing.projectId;
+      delete view.modal.routing.sessionId;
+      delete view.modal.routing.reasoning;
+    } else if (field === "sessionId" && typeof raw === "string" && raw) {
+      const environmentId = routeEnvironmentId(view.modal.routing.environmentId);
+      const session = targets.sessions.find((item) => item.id === raw && routeEnvironmentId(item.environmentId) === environmentId);
       const matchingModel = targets.models.find((item) => item.agent === session?.agentType);
       if (matchingModel) view.modal.routing.model = matchingModel.id;
       delete view.modal.routing.reasoning;

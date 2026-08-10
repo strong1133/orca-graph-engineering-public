@@ -53,6 +53,7 @@ export interface GraphEngineeringPolicy {
 }
 
 export interface RoutingTarget {
+  environmentId?: string;
   projectId?: string;
   sessionId?: string;
   model?: string;
@@ -301,6 +302,7 @@ export interface GraphDefinition {
 export interface ProjectTarget {
   id: string;
   name: string;
+  environmentId?: string;
   repoId?: string;
   worktreeId?: string;
   path?: string;
@@ -309,6 +311,7 @@ export interface ProjectTarget {
 export interface SessionTarget {
   id: string;
   title: string;
+  environmentId?: string;
   worktreeId: string;
   projectId?: string;
   paneKey?: string;
@@ -326,8 +329,17 @@ export interface ModelTarget {
   command?: string;
 }
 
+export interface EnvironmentTarget {
+  id: string;
+  name: string;
+  local: boolean;
+  connected: boolean;
+  error?: string;
+}
+
 export interface OrcaTargets {
   refreshedAt: string | null;
+  environments?: EnvironmentTarget[];
   projects: ProjectTarget[];
   sessions: SessionTarget[];
   models: ModelTarget[];
@@ -358,6 +370,7 @@ export interface Bootstrap {
 
 function normalizeRouting(value: RoutingTarget | undefined): RoutingTarget {
   return {
+    ...(value?.environmentId ? { environmentId: value.environmentId } : {}),
     ...(value?.projectId ? { projectId: value.projectId } : {}),
     ...(value?.sessionId ? { sessionId: value.sessionId } : {}),
     ...(value?.model ? { model: value.model } : {}),
@@ -778,7 +791,7 @@ export const TOPOLOGY_TEMPLATES: Array<{ id: TopologyKind; label: string; help: 
   { id: "tool_bipartite", label: "도구 이분", help: "agent와 외부 tool 경계를 분리" },
 ];
 
-const ROUTING_KEYS: Array<keyof RoutingTarget> = ["projectId", "sessionId", "model", "reasoning"];
+const ROUTING_KEYS: Array<keyof RoutingTarget> = ["environmentId", "projectId", "sessionId", "model", "reasoning"];
 
 export function effectiveRouting(graph: GraphDefinition, node: GraphNode): EffectiveRouting {
   const result: EffectiveRouting = { sources: {} };

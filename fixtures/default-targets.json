@@ -1,5 +1,8 @@
 {
   "refreshedAt": null,
+  "environments": [
+    { "id": "local", "name": "local", "local": true, "connected": true }
+  ],
   "projects": [],
   "sessions": [],
   "models": [

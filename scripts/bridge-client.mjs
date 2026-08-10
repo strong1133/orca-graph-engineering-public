@@ -35,7 +35,7 @@ function framesFor(payload, chunkSize = 2800) {
 
 for (const frame of framesFor(await payloadFor(operation))) {
   await execFileAsync("orca", [
-    "terminal", "send", "--terminal", terminalId, "--text", frame, "--json",
+    "terminal", "send", "--terminal", terminalId, "--text", frame, "--enter", "--json",
   ], { cwd: root, timeout: 30_000, maxBuffer: 8 * 1024 * 1024 });
 }
 
