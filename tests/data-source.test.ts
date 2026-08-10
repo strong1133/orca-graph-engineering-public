@@ -6,7 +6,7 @@ import path from "node:path";
 // The runtime bridge deliberately stays dependency-free JavaScript so an
 // extracted plugin can run without installing packages.
 // @ts-expect-error JavaScript runtime module has no declaration file.
-import { commitFolderStore, commitStructuredGraph, commitStructuredMutation, folderSourceStorePath, initializeFolderDataSource, normalizeDataSourceConfig, projectUnstructuredJson, refreshDataSource } from "../bridge/data-source.mjs";
+import { commitFolderStore, commitStructuredGraph, commitStructuredMutation, folderSourceStorePath, initializeFolderDataSource, normalizeDataSourceConfig, projectUnstructuredJson, refreshDataSource, requestDataSource } from "../bridge/data-source.mjs";
 
 const envKeys: string[] = [];
 const cleanupDirectories: string[] = [];
@@ -112,6 +112,53 @@ describe("unstructured JSON catalog", () => {
 });
 
 describe("structured workspace contract", () => {
+  it("recovers the Orca session token from the configured origin after a bridge restart", async () => {
+    const authEnv = "ORCA_GRAPH_SOURCE_TOKEN";
+    envKeys.push(authEnv);
+    delete process.env[authEnv];
+    const requests: Array<{ url: string; authorization: string | null }> = [];
+    const token = "session-token-from-origin-12345";
+    const fetchImpl = async (url: URL, init: RequestInit) => {
+      requests.push({ url: url.toString(), authorization: new Headers(init.headers).get("authorization") });
+      if (url.pathname === "/") {
+        return new Response(`<script>window.__HERMES_SESSION_TOKEN__="${token}"</script>`, {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    await expect(requestDataSource(
+      { schemaVersion: 1, mode: "structured", url: "https://hermes.example/api/plugins/workspace", authEnv },
+      "snapshot",
+      {},
+      { fetchImpl },
+    )).resolves.toEqual({ ok: true });
+    expect(requests).toEqual([
+      { url: "https://hermes.example/", authorization: null },
+      { url: "https://hermes.example/api/plugins/workspace/snapshot", authorization: `Bearer ${token}` },
+    ]);
+    expect(process.env[authEnv]).toBe(token);
+  });
+
+  it("does not bootstrap arbitrary authentication environment variables", async () => {
+    const authEnv = "PRIVATE_SOURCE_TOKEN";
+    envKeys.push(authEnv);
+    delete process.env[authEnv];
+    let fetched = false;
+    await expect(requestDataSource(
+      { schemaVersion: 1, mode: "structured", url: "https://example.test/api", authEnv },
+      "snapshot",
+      {},
+      { fetchImpl: async () => { fetched = true; return new Response("{}"); } },
+    )).rejects.toThrow(`authentication environment variable is missing: ${authEnv}`);
+    expect(fetched).toBe(false);
+  });
+
   it("loads a versioned snapshot and sends graph CAS commits with bearer auth", async () => {
     const authEnv = "GRAPH_SOURCE_TEST_TOKEN";
     envKeys.push(authEnv);

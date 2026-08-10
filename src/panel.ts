@@ -40,6 +40,7 @@ import {
   type PromptRevision,
   type RoutingTarget,
   type RuntimeExecution,
+  type RuntimeExecutionTarget,
   type ExecutionMode,
   type TopologyKind,
   type WorkPriority,
@@ -878,6 +879,7 @@ function createRunModal(live: boolean): RunModalState {
   const graph = activeGraph();
   const defaults = routingValue(graph.defaults);
   defaults.environmentId = routeEnvironmentId(defaults.environmentId);
+  if (defaults.sessionId) delete defaults.reasoning;
   let suggestedProjectId: string | undefined;
   const hasTaskTarget = graph.nodes.some((node) => Boolean(taskTargetForGraphNode(node)));
   if (!defaults.projectId && !defaults.sessionId && !hasTaskTarget && store.bridgeWorkspace) {
@@ -900,7 +902,9 @@ function createRunModal(live: boolean): RunModalState {
       && routeEnvironmentId(item.environmentId) === routeEnvironmentId(defaults.environmentId))?.branch;
     if (branch) defaults.branch = shortBranch(branch);
   }
-  const activeRun = [...graph.runs].reverse().find((run) => run.status === "running");
+  const activeRun = dataSource.config.mode === "structured"
+    ? [...graph.runs].reverse().find((run) => run.status === "running")
+    : undefined;
   const inferredProjectNodeIds: string[] = [];
   const nodeRouting = Object.fromEntries(graph.nodes.map((node) => {
     const inferred = inferredTaskNodeRouting(graph, node);
@@ -912,7 +916,7 @@ function createRunModal(live: boolean): RunModalState {
     const node = graph.nodes.find((candidate) => taskTargetForGraphNode(candidate)?.locator === target.locator);
     const route = node ? effectiveRouting({ ...graph, defaults } as GraphDefinition, { ...node, routing: routingValue(nodeRouting[node.id]) }) : defaults;
     const project = projectForTaskLocator(target.locator, routeEnvironmentId(route.environmentId));
-    projectRoutings[target.locator] = {
+    const projectRouting: RoutingTarget = {
       environmentId: routeEnvironmentId(route.environmentId),
       ...(project ? { projectId: project.id } : route.projectId ? { projectId: route.projectId } : {}),
       ...(target.branch ? { branch: shortBranch(target.branch) } : route.branch ? { branch: shortBranch(route.branch) } : project?.branch ? { branch: shortBranch(project.branch) } : {}),
@@ -920,6 +924,8 @@ function createRunModal(live: boolean): RunModalState {
       ...(route.model ? { model: route.model } : defaults.model ? { model: defaults.model } : {}),
       ...(route.reasoning ? { reasoning: route.reasoning } : defaults.reasoning ? { reasoning: defaults.reasoning } : {}),
     };
+    if (projectRouting.sessionId) delete projectRouting.reasoning;
+    projectRoutings[target.locator] = projectRouting;
   }
   return {
     kind: "run",
@@ -2151,41 +2157,6 @@ function runRoutingProblems(graph: GraphDefinition): Array<{ nodeId: string; mes
     });
 }
 
-function runNodeRoutingRows(graph: GraphDefinition, modal: RunModalState): string {
-  return graph.nodes.filter((node) => node.kind === "task" || (node.kind === "condition" && !node.branchTaken?.trim())).map((node) => {
-    const route = effectiveRouting(graph, node);
-    const existingSession = Boolean(route.sessionId && node.engineering?.contextMode !== "fresh");
-    const target = route.sessionId
-      ? `기존 세션 · ${sessionName(route.sessionId)}`
-      : route.projectId ? `새 세션 · ${projectName(route.projectId)}` : "실행 대상 미지정";
-    const inferred = modal.inferredProjectNodeIds?.includes(node.id);
-    return `<article class="run-route-row ${!route.sessionId && !route.projectId ? "missing" : ""}" data-run-node-id="${esc(node.id)}">
-      <header><strong>${esc(node.label || node.id)}</strong><span class="badge">${esc(target)}</span><span class="badge">AI · ${esc(modelName(route.model))}</span>${inferred ? '<span class="badge good">Task 대상 자동 선택</span>' : ""}</header>
-      <div class="run-node-route-grid">
-        <label class="field"><span>프로젝트</span><select data-scope="run-node-routing" data-node-id="${esc(node.id)}" data-field="projectId">${projectOptions(modal.nodeRouting[node.id]?.projectId, true)}</select></label>
-        <label class="field"><span>작업 브랜치</span><select data-scope="run-node-routing" data-node-id="${esc(node.id)}" data-field="branch">${branchOptions(route.projectId, modal.nodeRouting[node.id]?.branch, true, route.environmentId)}</select></label>
-        <label class="field"><span>세션</span><select data-scope="run-node-routing" data-node-id="${esc(node.id)}" data-field="sessionId">${sessionOptions(modal.nodeRouting[node.id]?.sessionId, true)}</select></label>
-        <label class="field"><span>AI 모델</span><select data-scope="run-node-routing" data-node-id="${esc(node.id)}" data-field="model">${modelOptions(modal.nodeRouting[node.id]?.model, true)}</select></label>
-        <label class="field"><span>Reasoning</span><select data-scope="run-node-routing" data-node-id="${esc(node.id)}" data-field="reasoning">${reasoningOptions(modal.nodeRouting[node.id]?.reasoning, route.model, { inherit: true, existingSession })}</select></label>
-      </div>
-    </article>`;
-  }).join("");
-}
-
-function runConditionRows(graph: GraphDefinition, modal: RunModalState): string {
-  return graph.nodes.filter((node) => node.kind === "condition").map((node) => {
-    const branches = [...new Set(graph.edges.filter((edge) => edge.from === node.id).map((edge) => edge.branch?.trim()).filter(Boolean))] as string[];
-    const selected = modal.conditionBranches[node.id] ?? "";
-    return `<article class="run-condition-row">
-      <div><strong>${esc(node.label || node.id)}</strong><span>${esc(node.conditionExpr ?? "조건 정의 없음")}</span></div>
-      <label class="field"><span>판정 방식</span><select data-scope="run-condition" data-node-id="${esc(node.id)}" data-field="branchTaken">
-        ${option("", "실행 중 AI가 선행 결과로 자동 판정", selected)}
-        ${branches.map((branch) => option(branch, `분기 고정 · ${branch}`, selected)).join("")}
-      </select></label>
-    </article>`;
-  }).join("");
-}
-
 function renderModal(): string {
   if (!view.modal) return "";
   if (view.modal.kind === "bridge") {
@@ -2353,15 +2324,14 @@ function renderModal(): string {
               && routeEnvironmentId(targetProject.environmentId) === routeEnvironmentId(projectRoute.environmentId));
             const available = routeProject && projectMatchesTaskLocator(routeProject.id, routeProject.path, project.locator, routeEnvironmentId(projectRoute.environmentId));
             const targetMode = routingTargetMode(projectRoute);
-            return `<article class="task-project-run-card ${available ? "" : "missing"}"><header><strong>${esc(project.label ?? project.locator.split("/").filter(Boolean).at(-1) ?? project.locator)}</strong><span class="badge">${esc(available && routeProject ? routeProject.name : "프로젝트 없음")}</span></header><code title="${esc(project.locator)}">${esc(project.locator)}</code><div class="run-card-grid"><label class="field"><span>실행 위치</span><select data-scope="task-run-project-routing" data-field="targetMode" data-locator="${esc(project.locator)}">${option("worktree", "워크트리에서 새 Orca 세션", targetMode)}${option("session", "기존 Orca 세션", targetMode)}</select></label>${targetMode === "session" ? `<label class="field"><span>Orca 세션</span><select data-scope="task-run-project-routing" data-field="sessionId" data-locator="${esc(project.locator)}">${sessionOptions(projectRoute.sessionId, false, projectRoute.environmentId, projectRoute.projectId)}</select></label>` : `<label class="field"><span>작업 브랜치</span><select data-scope="task-run-project-routing" data-field="branch" data-locator="${esc(project.locator)}">${branchOptions(projectRoute.projectId, projectRoute.branch, false, projectRoute.environmentId)}</select></label>`}<label class="field"><span>AI 모델</span><select data-scope="task-run-project-routing" data-field="model" data-locator="${esc(project.locator)}">${modelOptions(projectRoute.model)}</select></label><label class="field"><span>Reasoning</span><select data-scope="task-run-project-routing" data-field="reasoning" data-locator="${esc(project.locator)}">${reasoningOptions(projectRoute.reasoning, projectRoute.model, { existingSession: targetMode === "session" })}</select></label></div></article>`;
+            return `<article class="task-project-run-card ${available ? "" : "missing"}"><header><strong>${esc(project.label ?? project.locator.split("/").filter(Boolean).at(-1) ?? project.locator)}</strong><span class="badge">${esc(available && routeProject ? routeProject.name : "프로젝트 없음")}</span></header><code title="${esc(project.locator)}">${esc(project.locator)}</code><div class="run-card-grid"><label class="field"><span>실행 위치</span><select data-scope="task-run-project-routing" data-field="targetMode" data-locator="${esc(project.locator)}">${option("worktree", "워크트리에서 새 Orca 세션", targetMode)}${option("session", "기존 Orca 세션", targetMode)}</select></label>${targetMode === "session" ? `<label class="field"><span>Orca 세션</span><select data-scope="task-run-project-routing" data-field="sessionId" data-locator="${esc(project.locator)}">${sessionOptions(projectRoute.sessionId, false, projectRoute.environmentId, projectRoute.projectId)}</select></label>` : `<label class="field"><span>작업 브랜치</span><select data-scope="task-run-project-routing" data-field="branch" data-locator="${esc(project.locator)}">${branchOptions(projectRoute.projectId, projectRoute.branch, false, projectRoute.environmentId)}</select></label>`}<label class="field"><span>AI 모델</span><select data-scope="task-run-project-routing" data-field="model" data-locator="${esc(project.locator)}">${modelOptions(projectRoute.model)}</select></label></div></article>`;
           }).join("")}</div>` : `<div class="run-routing-grid">
             <label class="field"><span>프로젝트</span><select data-scope="task-run-routing" data-field="projectId">${projectOptions(route.projectId, false, route.environmentId)}</select></label>
             <label class="field"><span>실행 위치</span><select data-scope="task-run-routing" data-field="targetMode">${option("worktree", "워크트리에서 새 Orca 세션", routingTargetMode(route))}${option("session", "기존 Orca 세션", routingTargetMode(route))}</select></label>
             ${route.sessionId ? `<label class="field"><span>Orca 세션</span><select data-scope="task-run-routing" data-field="sessionId">${sessionOptions(route.sessionId, false, route.environmentId, route.projectId)}</select></label>` : `<label class="field"><span>작업 브랜치</span><select data-scope="task-run-routing" data-field="branch">${branchOptions(route.projectId, route.branch, false, route.environmentId)}</select></label>`}
             <label class="field"><span>AI 모델</span><select data-scope="task-run-routing" data-field="model">${modelOptions(route.model)}</select></label>
-            <label class="field"><span>Reasoning</span><select data-scope="task-run-routing" data-field="reasoning">${reasoningOptions(route.reasoning, route.model, { existingSession: Boolean(route.sessionId) })}</select></label>
           </div>
-          <div class="run-route-effective"><strong>${esc(environmentName(route.environmentId))} · ${esc(target)}${route.branch ? ` · ${esc(shortBranch(route.branch))}` : ""}</strong><span>AI · ${esc(modelName(route.model))}${route.reasoning ? ` · ${esc(route.reasoning)}` : ""}</span></div>`}
+          <div class="run-route-effective"><strong>${esc(environmentName(route.environmentId))} · ${esc(target)}${route.branch ? ` · ${esc(shortBranch(route.branch))}` : ""}</strong><span>AI · ${esc(modelName(route.model))}</span></div>`}
         </section>
         ${problems.length ? `<div class="run-configuration-errors" role="alert"><strong>실행 전에 ${problems.length}개 설정을 확인하십시오.</strong><ul>${problems.map((message) => `<li>${esc(message)}</li>`).join("")}</ul></div>` : `<p class="status-pill good">${esc(assignmentLabel)} 준비 완료</p>`}
       </div>
@@ -2424,7 +2394,9 @@ function renderModal(): string {
         ? [`${project.label ?? project.locator}: 실행 머신에서 일치하는 Orca 프로젝트를 찾을 수 없습니다.`]
         : [];
     }) : [];
-    const activeProcessRun = [...sourceGraph.runs].reverse().find((run) => run.status === "running");
+    const activeProcessRun = dataSource.config.mode === "structured"
+      ? [...sourceGraph.runs].reverse().find((run) => run.status === "running")
+      : undefined;
     const processInputMissing = graph.processEnabled && view.modal.startNewRun && !view.modal.inputPrompt.trim();
     const problems = [...blockers, ...projectProblems, ...routingProblems.map((problem) => problem.message)];
     const blocked = problems.length > 0 || processInputMissing;
@@ -2451,8 +2423,8 @@ function renderModal(): string {
             const route = routingValue(modal.projectRoutings[project.locator]);
             const selected = targets.projects.find((item) => item.id === route.projectId && routeEnvironmentId(item.environmentId) === routeEnvironmentId(route.environmentId));
             const targetMode = routingTargetMode(route);
-            return `<article class="task-project-run-card ${selected ? "" : "missing"}"><header><strong>${esc(project.label ?? project.locator.split("/").filter(Boolean).at(-1) ?? project.locator)}</strong><span class="badge">${esc(selected?.name ?? "프로젝트 없음")}</span></header><code title="${esc(project.locator)}">${esc(project.locator)}</code><div class="run-card-grid"><label class="field"><span>실행 위치</span><select data-scope="run-project-routing" data-field="targetMode" data-locator="${esc(project.locator)}">${option("worktree", "워크트리에서 새 Orca 세션", targetMode)}${option("session", "기존 Orca 세션", targetMode)}</select></label>${targetMode === "session" ? `<label class="field"><span>Orca 세션</span><select data-scope="run-project-routing" data-field="sessionId" data-locator="${esc(project.locator)}">${sessionOptions(route.sessionId, false, route.environmentId, route.projectId)}</select></label>` : `<label class="field"><span>작업 브랜치</span><select data-scope="run-project-routing" data-field="branch" data-locator="${esc(project.locator)}">${branchOptions(route.projectId, route.branch, false, route.environmentId)}</select></label>`}<label class="field"><span>AI 모델</span><select data-scope="run-project-routing" data-field="model" data-locator="${esc(project.locator)}">${modelOptions(route.model)}</select></label><label class="field"><span>Reasoning</span><select data-scope="run-project-routing" data-field="reasoning" data-locator="${esc(project.locator)}">${reasoningOptions(route.reasoning, route.model, { existingSession: targetMode === "session" })}</select></label></div></article>`;
-          }).join("")}</div>` : `<div class="run-routing-grid"><label class="field"><span>프로젝트</span><select data-scope="run-routing" data-field="projectId">${projectOptions(view.modal.defaults.projectId, false, view.modal.defaults.environmentId)}</select></label><label class="field"><span>실행 위치</span><select data-scope="run-routing" data-field="targetMode">${option("worktree", "워크트리에서 새 Orca 세션", routingTargetMode(graph.defaults))}${option("session", "기존 Orca 세션", routingTargetMode(graph.defaults))}</select></label>${graph.defaults.sessionId ? `<label class="field"><span>Orca 세션</span><select data-scope="run-routing" data-field="sessionId">${sessionOptions(view.modal.defaults.sessionId, false, view.modal.defaults.environmentId, view.modal.defaults.projectId)}</select></label>` : `<label class="field"><span>작업 브랜치</span><select data-scope="run-routing" data-field="branch">${branchOptions(view.modal.defaults.projectId, view.modal.defaults.branch, false, view.modal.defaults.environmentId)}</select></label>`}<label class="field"><span>AI 모델</span><select data-scope="run-routing" data-field="model">${modelOptions(view.modal.defaults.model)}</select></label><label class="field"><span>Reasoning</span><select data-scope="run-routing" data-field="reasoning">${reasoningOptions(view.modal.defaults.reasoning, graph.defaults.model, { existingSession: Boolean(graph.defaults.sessionId) })}</select></label></div><div class="run-route-effective"><strong>${esc(environmentName(graph.defaults.environmentId))} · ${esc(defaultRoute)}${graph.defaults.branch ? ` · ${esc(shortBranch(graph.defaults.branch))}` : ""}</strong><span>AI · ${esc(modelName(graph.defaults.model))}${graph.defaults.reasoning ? ` · ${esc(graph.defaults.reasoning)}` : ""}</span></div>`}
+            return `<article class="task-project-run-card ${selected ? "" : "missing"}"><header><strong>${esc(project.label ?? project.locator.split("/").filter(Boolean).at(-1) ?? project.locator)}</strong><span class="badge">${esc(selected?.name ?? "프로젝트 없음")}</span></header><code title="${esc(project.locator)}">${esc(project.locator)}</code><div class="run-card-grid"><label class="field"><span>실행 위치</span><select data-scope="run-project-routing" data-field="targetMode" data-locator="${esc(project.locator)}">${option("worktree", "워크트리에서 새 Orca 세션", targetMode)}${option("session", "기존 Orca 세션", targetMode)}</select></label>${targetMode === "session" ? `<label class="field"><span>Orca 세션</span><select data-scope="run-project-routing" data-field="sessionId" data-locator="${esc(project.locator)}">${sessionOptions(route.sessionId, false, route.environmentId, route.projectId)}</select></label>` : `<label class="field"><span>작업 브랜치</span><select data-scope="run-project-routing" data-field="branch" data-locator="${esc(project.locator)}">${branchOptions(route.projectId, route.branch, false, route.environmentId)}</select></label>`}<label class="field"><span>AI 모델</span><select data-scope="run-project-routing" data-field="model" data-locator="${esc(project.locator)}">${modelOptions(route.model)}</select></label></div></article>`;
+          }).join("")}</div>` : `<div class="run-routing-grid"><label class="field"><span>프로젝트</span><select data-scope="run-routing" data-field="projectId">${projectOptions(view.modal.defaults.projectId, false, view.modal.defaults.environmentId)}</select></label><label class="field"><span>실행 위치</span><select data-scope="run-routing" data-field="targetMode">${option("worktree", "워크트리에서 새 Orca 세션", routingTargetMode(graph.defaults))}${option("session", "기존 Orca 세션", routingTargetMode(graph.defaults))}</select></label>${graph.defaults.sessionId ? `<label class="field"><span>Orca 세션</span><select data-scope="run-routing" data-field="sessionId">${sessionOptions(view.modal.defaults.sessionId, false, view.modal.defaults.environmentId, view.modal.defaults.projectId)}</select></label>` : `<label class="field"><span>작업 브랜치</span><select data-scope="run-routing" data-field="branch">${branchOptions(view.modal.defaults.projectId, view.modal.defaults.branch, false, view.modal.defaults.environmentId)}</select></label>`}<label class="field"><span>AI 모델</span><select data-scope="run-routing" data-field="model">${modelOptions(view.modal.defaults.model)}</select></label></div><div class="run-route-effective"><strong>${esc(environmentName(graph.defaults.environmentId))} · ${esc(defaultRoute)}${graph.defaults.branch ? ` · ${esc(shortBranch(graph.defaults.branch))}` : ""}</strong><span>AI · ${esc(modelName(graph.defaults.model))}</span></div>`}
         </section>
         ${problems.length ? `<div class="run-configuration-errors" role="alert"><strong>실행 전에 ${problems.length}개 설정을 확인하십시오.</strong><ul>${problems.slice(0, 5).map((message) => `<li>${esc(message)}</li>`).join("")}</ul>${problems.length > 5 ? `<small>외 ${problems.length - 5}개</small>` : ""}</div>` : `<p class="status-pill good">${esc(assignmentLabel)} 준비 완료 · 조건 분기는 실행 중 자동 판정</p>`}
       </div>
@@ -2473,7 +2445,7 @@ function renderModal(): string {
           <small>${new Date(run.startedAt).toLocaleString("ko-KR")}${run.endedAt ? ` → ${new Date(run.endedAt).toLocaleString("ko-KR")}` : ""}</small>
           ${run.stats ? `<div class="run-metrics"><span>완료 <b>${run.stats.completed ?? 0}</b></span><span>실패 <b>${run.stats.failed ?? 0}</b></span><span>시도 <b>${run.stats.attempts ?? 0}</b></span><span>${Math.round((run.stats.durationMs ?? 0) / 1000)}s</span></div>` : ""}
           ${run.nodeResults?.length ? `<details><summary>노드 결과 ${run.nodeResults.length}</summary><ul class="finding-list">${run.nodeResults.map((result) => `<li class="${result.status === "failed" ? "error" : "info"}"><b>${esc(graph.nodes.find((node) => node.id === result.nodeId)?.label ?? result.nodeId)}</b> · ${result.status} · attempt ${result.attempt ?? 1}${result.durationMs ? ` · ${Math.round(result.durationMs / 1000)}s` : ""}${result.childGraphId ? `<br>child ${esc(result.childGraphId)}${result.childRunId ? ` · ${esc(result.childRunId)}` : ""}` : ""}${result.message ? `<br>${esc(result.message)}` : ""}</li>`).join("")}</ul></details>` : ""}
-        </article>`).join("") : '<div class="graph-list-empty"><strong>실행 이력이 없습니다.</strong><span>실행 계획 또는 실제 실행 후 이곳에 기록됩니다.</span></div>'}
+        </article>`).join("") : '<div class="graph-list-empty"><strong>실행 이력이 없습니다.</strong><span>그래프를 실행하면 이곳에 기록됩니다.</span></div>'}
       </div>
       <div class="modal-actions"><button data-action="close-modal">닫기</button></div>
     </section></div>`;
@@ -3073,6 +3045,12 @@ function executionBanner(execution: RuntimeExecution | undefined): string {
   return `<section class="execution-banner status-${execution.status}" aria-label="현재 실행 상태"><div><span class="execution-pulse"></span><strong>${esc(executionStatusLabel[execution.status])}</strong><span>${execution.progress.completed}/${execution.progress.total} 완료${execution.progress.failed ? ` · ${execution.progress.failed} 실패` : ""}</span></div><div class="execution-progress"><span style="width:${percent}%"></span></div><button data-action="set-view" data-id="executions">실행 현황 보기</button></section>`;
 }
 
+function executionTargetSession(target: RuntimeExecutionTarget): string {
+  if (target.sessionTitle) return `Orca 세션 · ${target.sessionTitle}`;
+  if (target.sessionId) return `Orca 세션 · ${target.sessionId.slice(0, 12)}`;
+  return target.status === "queued" ? "세션 생성 대기" : "새 Orca 세션";
+}
+
 function renderExecutionCard(execution: RuntimeExecution): string {
   const percent = executionPercent(execution);
   const kindLabel = execution.itemKind === "graph" ? "Graph" : execution.itemKind === "task" ? "Task" : "Todo";
@@ -3080,7 +3058,7 @@ function renderExecutionCard(execution: RuntimeExecution): string {
     <header><span class="execution-kind">${kindLabel}</span><div><strong>${esc(execution.title)}</strong><small>${esc(execution.itemId)} · ${execution.executionMode === "per_project" ? "프로젝트별 배정" : "통합 배정"}</small></div>${executionInline(execution)}</header>
     <div class="execution-progress-copy"><span>${execution.progress.completed}/${execution.progress.total} 완료${execution.progress.failed ? ` · ${execution.progress.failed} 실패` : ""}</span><time>${new Date(execution.updatedAt).toLocaleString("ko-KR")}</time></div>
     <div class="execution-progress" role="progressbar" aria-label="${esc(execution.title)} 실행 진행률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span style="width:${percent}%"></span></div>
-    <div class="execution-targets">${execution.targets.map((target) => `<div class="execution-target status-${target.status}"><span class="execution-pulse"></span><strong>${esc(target.projectName || target.label)}</strong><span>${esc(target.branch || "기본 브랜치")}</span><span>${target.sessionId ? `Orca 세션 · ${esc(target.sessionId)}` : "새 Orca 세션"}</span><span>${esc(modelName(target.model))}</span></div>`).join("")}</div>
+    <div class="execution-targets">${execution.targets.map((target) => `<div class="execution-target status-${target.status}"><span class="execution-pulse"></span><strong>${esc(target.projectName || target.label)}</strong><span>${esc(target.branch || "기본 브랜치")}</span><span title="${esc(target.sessionId ?? "")}">${esc(executionTargetSession(target))}</span><span>${esc(modelName(target.model))}</span>${target.error ? `<small class="execution-target-error">${esc(target.error)}</small>` : ""}</div>`).join("")}</div>
     ${execution.error ? `<p class="execution-error" role="alert">${esc(execution.error)}</p>` : ""}
     <footer><button data-action="open-execution-item" data-kind="${execution.itemKind}" data-id="${esc(execution.itemId)}">${kindLabel} 열기</button></footer>
   </article>`;
@@ -3154,7 +3132,7 @@ function render(): void {
             <span class="toolbar-group"><button data-action="add-task">＋ Task</button><button data-action="open-batch-tasks">＋ Task 묶음</button><button data-action="add-condition">＋ ◇ 조건</button><button data-action="add-graph-call">＋ ▦ 호출</button></span>
             <span class="toolbar-group"><button data-action="undo" ${view.historyUndo.length ? "" : "disabled"}>↶</button><button data-action="redo" ${view.historyRedo.length ? "" : "disabled"}>↷</button><button data-action="open-templates">Topology</button><button data-action="auto-layout">자동 정렬 미리보기 ${view.layoutDirection}</button><button data-action="toggle-layout">${view.layoutDirection === "LR" ? "가로 → 세로" : "세로 → 가로"}</button></span>
             <span class="toolbar-group"><label class="node-search"><span>⌕</span><input data-action="node-search" value="${esc(view.nodeQuery)}" placeholder="노드 검색 ⌘K" aria-label="노드 검색"></label><select data-action="group-mode" aria-label="캔버스 그룹">${option("none", "그룹 없음", graphGroupMode(graph))}${option("domain", "Domain", graphGroupMode(graph))}${option("milestone", "Milestone", graphGroupMode(graph))}${option("superstep", "Superstep", graphGroupMode(graph))}${option("loop", "Loop", graphGroupMode(graph))}</select></span>
-            <span class="toolbar-group"><button data-action="refresh-targets">Orca 대상 갱신</button><button data-action="open-plan">실행 계획</button></span>
+            <span class="toolbar-group"><button data-action="refresh-targets">Orca 대상 갱신</button></span>
             <span class="toolbar-group"><button data-action="show-analysis">그래프 설정</button><button data-action="toggle-problems">Problems</button><button data-action="open-history">실행 이력</button><button data-action="export-json">JSON</button><button data-action="import-json">가져오기</button><button data-action="open-shortcuts">?</button><span class="badge">run ${runCount}</span></span>
           </span>
           <span class="toolbar-compact">
@@ -3176,7 +3154,6 @@ function render(): void {
                 <button data-action="toggle-problems">Problems</button>
                 <button data-action="open-data-source">데이터 원천</button>
                 <button data-action="refresh-targets">Orca 대상 갱신</button>
-                <button data-action="open-plan">실행 계획</button>
                 <button data-action="open-history">실행 이력</button>
                 <button data-action="export-json">JSON 내보내기</button>
                 <button data-action="import-json">JSON 가져오기</button>
@@ -3983,6 +3960,7 @@ app.addEventListener("click", (event) => {
       }
       render();
       if (mode === "canvas") window.setTimeout(fitGraph, 0);
+      if (mode === "executions") void refreshExecutionStatus();
       break;
     }
     case "refresh-executions":
@@ -4879,7 +4857,6 @@ app.addEventListener("click", (event) => {
         .catch((error) => toast(error instanceof Error ? error.message : String(error)));
       break;
     }
-    case "open-plan": openModal(createRunModal(false)); break;
     case "open-run": openModal(createRunModal(true)); break;
     case "confirm-run": {
       if (view.modal?.kind !== "run") return;
@@ -5099,30 +5076,6 @@ app.addEventListener("change", (event) => {
     }
     render();
     return;
-  } else if (scope === "run-node-routing" && view.modal?.kind === "run") {
-    const nodeId = input.dataset.nodeId;
-    if (!nodeId || !graph.nodes.some((item) => item.id === nodeId)) return;
-    const routing = view.modal.nodeRouting[nodeId] ??= {};
-    if (["projectId", "branch", "sessionId"].includes(field)) {
-      const remaining = view.modal.inferredProjectNodeIds?.filter((id) => id !== nodeId) ?? [];
-      if (remaining.length) view.modal.inferredProjectNodeIds = remaining;
-      else delete view.modal.inferredProjectNodeIds;
-    }
-    if (raw) (routing as Record<string, unknown>)[field] = raw;
-    else delete (routing as Record<string, unknown>)[field];
-    if (field === "sessionId" && typeof raw === "string" && raw) {
-      const session = targets.sessions.find((item) => item.id === raw);
-      const matchingModel = targets.models.find((item) => item.agent === session?.agentType);
-      if (matchingModel) routing.model = matchingModel.id;
-      if (session?.branch) routing.branch = session.branch;
-      delete routing.reasoning;
-    } else if (field === "projectId" && typeof raw === "string" && raw) {
-      const project = targets.projects.find((item) => item.id === raw);
-      if (project?.branch) routing.branch = project.branch;
-      else delete routing.branch;
-    }
-    render();
-    return;
   } else if (scope === "task-project-branch") {
     const taskId = input.dataset.taskId;
     const locator = input.dataset.locator;
@@ -5138,12 +5091,6 @@ app.addEventListener("change", (event) => {
       if (!sourcePath) return;
       selectedTaskProjectBundles.set(sourcePath, input.value ? shortBranch(input.value) : "");
     }
-    render();
-    return;
-  } else if (scope === "run-condition" && view.modal?.kind === "run") {
-    const nodeId = input.dataset.nodeId;
-    if (!nodeId) return;
-    view.modal.conditionBranches[nodeId] = typeof raw === "string" ? raw : "";
     render();
     return;
   } else if (scope === "local-task") {

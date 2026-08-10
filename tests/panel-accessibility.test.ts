@@ -257,8 +257,8 @@ describe.each([
       }
       dialog = document.querySelector<HTMLElement>('[role="dialog"]');
       expect(dialog?.textContent).toContain("Claude Opus 5");
-      expect([...dialog?.querySelectorAll<HTMLOptionElement>('[data-scope="task-run-routing"][data-field="reasoning"] option') ?? []]
-        .map((option) => option.value)).toEqual(["", "low", "medium", "high", "xhigh", "max"]);
+      expect(dialog?.querySelector('[data-scope="task-run-routing"][data-field="reasoning"]')).toBeNull();
+      expect(dialog?.textContent).not.toContain("Reasoning");
 
       const rerenderedEnvironment = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="environmentId"]');
       if (rerenderedEnvironment) {
@@ -351,6 +351,45 @@ describe.each([
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
       expect(document.querySelector(".execution-manager")?.textContent).toContain("요구사항 설계");
       expect(document.querySelector(".execution-card .execution-progress")?.getAttribute("aria-valuenow")).toBe("0");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("refreshes cross-surface execution state immediately when the status view opens", async () => {
+    const requests: any[] = [];
+    const execution = {
+      id: "exec-cross-surface", itemKind: "graph", itemId: "graph-orca-demo", title: "다른 Orca 표면 실행", status: "running",
+      executionMode: "single_session", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:01:00.000Z",
+      progress: { completed: 1, failed: 0, total: 3 },
+      targets: [{
+        id: "target-1", label: "API", status: "running", environmentId: "local", projectId: "project-api",
+        branch: "feature/review", model: "gpt-5.6-sol", sessionId: "session-sensitive-id", sessionTitle: "Review Agent",
+      }],
+    };
+    const dom = await mountPanel(wide, (bootstrap) => {
+      const liveBootstrap = bootstrap as typeof bootstrap & { bridgeApiUrl: string; executions: unknown[] };
+      liveBootstrap.bridgeApiUrl = "/test/api";
+      liveBootstrap.executions = [];
+    }, (window) => {
+      Object.defineProperty(window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          requests.push(JSON.parse(String(init.body)));
+          return Response.json({ ok: true, value: { executions: [execution] } });
+        }),
+      });
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(requests).toContainEqual({ type: "execution-status" });
+      expect(document.querySelector(".execution-manager")?.textContent).toContain("다른 Orca 표면 실행");
+      expect(document.querySelector(".execution-target")?.textContent).toContain("Orca 세션 · Review Agent");
+      expect(document.querySelector(".execution-target")?.textContent).not.toContain("session-sensitive-id");
     } finally {
       dom.window.close();
     }
@@ -692,7 +731,7 @@ describe.each([
         folderMode.dispatchEvent(new Event("change", { bubbles: true }));
       }
       document.querySelector<HTMLElement>('[role="dialog"]')?.querySelector<HTMLButtonElement>('[data-action="close-modal"]')?.click();
-      document.querySelector<HTMLButtonElement>('[data-action="open-plan"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
       const runDialog = document.querySelector<HTMLElement>('[role="dialog"]');
       expect(runDialog?.textContent).toContain("데이터 원천이 Orca 원격 실행을 지원하지 않습니다");
       expect(runDialog?.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.disabled).toBe(true);
@@ -801,7 +840,7 @@ describe.each([
     }
   });
 
-  it("exposes and blocks existing-session reasoning overrides", async () => {
+  it("sanitizes hidden existing-session reasoning overrides before execution", async () => {
     const dom = await mountPanel(wide, ({ store, targets }) => {
       targets.sessions = [{
         id: "claude-session",
@@ -827,10 +866,11 @@ describe.each([
       const select = document.querySelector<HTMLSelectElement>('[data-scope="graph-routing"][data-field="reasoning"]');
       expect([...select?.options ?? []].map((option) => option.value)).toEqual(["", "ultra"]);
       expect(select?.selectedOptions[0]?.textContent).toContain("적용 불가");
-      document.querySelector<HTMLButtonElement>('[data-action="open-plan"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
       const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      expect(dialog?.textContent).toContain("기존 세션에는 reasoning override를 적용할 수 없습니다");
-      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.disabled).toBe(true);
+      expect(dialog?.textContent).not.toContain("기존 세션에는 reasoning override를 적용할 수 없습니다");
+      expect(dialog?.textContent).not.toContain("Reasoning");
+      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.disabled).toBe(false);
     } finally {
       dom.window.close();
     }
@@ -934,15 +974,7 @@ describe.each([
       const restoredRunOpeners = [...document.querySelectorAll<HTMLButtonElement>('[data-action="open-run"]')];
       expect(document.activeElement).toBe(restoredRunOpeners[wide ? 0 : 1] ?? restoredRunOpeners[0]);
 
-      const selectedClose = document.querySelector<HTMLButtonElement>('[data-action="clear-selection"]');
-      selectedClose?.click();
-      const planOpeners = [...document.querySelectorAll<HTMLButtonElement>('[data-action="open-plan"]')];
-      const planOpener = planOpeners[wide ? 0 : 1] ?? planOpeners[0];
-      planOpener?.focus();
-      planOpener?.click();
-      document.querySelector<HTMLButtonElement>('[role="dialog"] [data-action="close-modal"]')?.click();
-      const restoredPlanOpeners = [...document.querySelectorAll<HTMLButtonElement>('[data-action="open-plan"]')];
-      expect(document.activeElement).toBe(restoredPlanOpeners[wide ? 0 : 1] ?? restoredPlanOpeners[0]);
+      expect(document.querySelector('[data-action="open-plan"]')).toBeNull();
 
       document.querySelector<HTMLButtonElement>('[data-action="show-analysis"]')?.click();
       document.querySelector<HTMLButtonElement>('[data-action="copy-graph-id"]')?.click();
@@ -1204,6 +1236,10 @@ describe("work process and branch execution surface", () => {
 
   it("shows the process badge, saved run input, and Orca worktree branches", async () => {
     const dom = await mountPanel(true, (bootstrap) => {
+      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
+        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
+        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
+      };
       const graph = bootstrap.store.graphs[0];
       graph.processEnabled = true;
       graph.status = "running";
@@ -1240,6 +1276,28 @@ describe("work process and branch execution surface", () => {
       document.querySelector<HTMLButtonElement>('[data-action="close-modal"]')?.click();
       document.querySelector<HTMLButtonElement>('[data-action="open-history"]')?.click();
       expect(document.querySelector(".run-input")?.textContent).toBe("  고객 A\n계약서 검토  ");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("does not offer an unsupported resume path for a local process graph", async () => {
+    const dom = await mountPanel(true, ({ store }) => {
+      const graph = store.graphs[0];
+      graph.processEnabled = true;
+      graph.defaults = { projectId: "project", model: "gpt-5.6-sol" };
+      graph.runs = [{
+        id: "run-local-active", runNo: 2, status: "running", startedAt: "2026-08-10T00:00:00Z",
+        inputPrompt: "이전 로컬 입력",
+      }];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
+      expect(document.querySelector('[data-scope="run-process"][data-field="startNewRun"]')).toBeNull();
+      expect(document.querySelector<HTMLTextAreaElement>('[data-scope="run-process"][data-field="inputPrompt"]')?.readOnly).toBe(false);
+      expect(document.querySelector<HTMLTextAreaElement>('[data-scope="run-process"][data-field="inputPrompt"]')?.value).toBe("");
+      expect(document.querySelector(".process-run-input")?.textContent).toContain("업무 입력을 입력하십시오");
     } finally {
       dom.window.close();
     }

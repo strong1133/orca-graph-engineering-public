@@ -391,6 +391,7 @@ export interface RuntimeExecutionTarget {
   locator?: string;
   branch?: string;
   sessionId?: string;
+  sessionTitle?: string;
   model?: string;
   startedAt?: string;
   endedAt?: string;

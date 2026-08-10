@@ -98,7 +98,7 @@ Orca의 Settings → Plugins에서 Plugin system을 켜고 Development plugin �
 - `구조화 Workspace`: [Data Source contract v1](docs/data-source-contract.md)을 구현한 서버의 Graph·Domain·Milestone·Task·Todo·Prompt lineage와 CAS 버전을 원격 정본으로 사용합니다. Graph aggregate와 플러그인 지원 업무 필드는 모두 양방향이며 stale version은 409로 거절되고 자동 재시도하지 않습니다.
 - `구조 없음`: 임의 JSON의 레코드 배열을 자동 탐색하거나 필드 경로를 지정해 읽기 전용 Task 후보로 사용합니다. 쓰기/CAS 계약이 없으므로 Graph 정본은 로컬에 남습니다.
 
-인증 토큰 값은 저장하지 않습니다. 브리지를 시작할 terminal에 토큰을 환경변수로 설정하고 UI에는 그 환경변수 이름만 입력합니다. 연결 snapshot은 교체 가능한 `runtime/source-cache.json`에 저장되며 Git과 배포 package에서 제외됩니다. 폴더 모드는 단일 사용자 파일 저장 방식이라 분산 CAS를 제공하지 않으며, 같은 파일을 여러 프로세스가 동시에 수정하지 않는 것을 전제로 합니다.
+인증 토큰 값은 저장하지 않습니다. 브리지를 시작할 terminal에 토큰을 환경변수로 설정하고 UI에는 그 환경변수 이름만 입력합니다. Orca/Hermes 연동의 전용 `ORCA_GRAPH_SOURCE_TOKEN`이 브리지 재시작 뒤 비어 있으면 설정된 동일 origin의 세션 bootstrap에서 자동으로 다시 가져오며, 값은 현재 브리지 프로세스에만 유지하고 로그·설정·패키지에는 기록하지 않습니다. 다른 인증 환경변수는 기존처럼 값이 없으면 즉시 실패합니다. 연결 snapshot은 교체 가능한 `runtime/source-cache.json`에 저장되며 Git과 배포 package에서 제외됩니다. 폴더 모드는 단일 사용자 파일 저장 방식이라 분산 CAS를 제공하지 않으며, 같은 파일을 여러 프로세스가 동시에 수정하지 않는 것을 전제로 합니다.
 
 ### 호환 Workspace aggregate API
 
@@ -131,7 +131,7 @@ artifact를 만들지 않고 내용 계약만 검사하려면 `corepack npm run 
 
 ## 안전한 실행
 
-그래프 보기 상단의 고정 `실행` 버튼도 같은 세 단계 실행 창을 사용합니다. 통합 session/model을 고르면 모든 Task와 자동 condition evaluator가 한 routing을 상속하고, 프로젝트별 배정을 고르면 Task target folder별 Orca worktree/session/model이 적용됩니다. 노드별 저수준 override와 조건 강제 선택은 실행 창에 노출하지 않으며 조건은 선행 결과로 자동 판정합니다. `실행 계획`과 실제 `실행`은 AND/OR join과 graph-call routing 결합을 따라 전체 execution plan을 먼저 계산하고, 선택된 모든 descendant Task와 자동 condition evaluator의 pure route를 같은 resolver로 검사합니다. graph-call 순환·누락·보관·root hop limit, session/project/worktree, model allow-list/agent family/reasoning capability를 어떤 run record나 Orca call보다 먼저 검사하므로 invalid dry-run도 run history를 남기지 않습니다.
+그래프 보기 상단의 고정 `실행` 버튼도 같은 세 단계 실행 창을 사용합니다. 통합 session/model을 고르면 모든 Task와 자동 condition evaluator가 한 routing을 상속하고, 프로젝트별 배정을 고르면 Task target folder별 Orca worktree/session/model이 적용됩니다. 실행 창에는 머신·배정 방식·프로젝트·브랜치 또는 기존 세션·모델만 노출합니다. reasoning, 노드별 저수준 override, 조건 강제 선택, 별도 실행 계획 버튼은 노출하지 않으며 저장된 정책을 적용하고 조건은 선행 결과로 자동 판정합니다. 실제 실행을 시작하기 전에 bridge가 AND/OR join과 graph-call routing 결합을 따라 전체 execution plan을 내부 계산하고, 선택된 모든 descendant Task와 자동 condition evaluator의 pure route를 같은 resolver로 검사합니다. graph-call 순환·누락·보관·root hop limit, session/project/worktree, model allow-list/agent family/reasoning capability를 어떤 run record나 Orca call보다 먼저 검사하므로 잘못된 실행은 이력이나 Orca 호출을 남기지 않습니다.
 
 `실행 현황` 메뉴는 시작 요청과 동시에 만들어지는 머신 로컬 실행 레코드를 보여 줍니다. queued/running/completed/failed 상태, 프로젝트별 session·branch·model과 진행률을 표시하며 Task 목록·상세, 그래프 목록·캔버스에도 같은 컴포넌트를 사용합니다. 실행 중에는 loopback bridge를 짧게 polling하고 완료되면 자동으로 멈춥니다. 레코드는 `runtime/executions.json`에만 저장되고 portable GraphStore나 외부 데이터 원천에는 섞이지 않으며, 브리지 재시작 시 끝나지 않은 레코드는 실패로 닫아 유령 실행 상태를 남기지 않습니다.
 

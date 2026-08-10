@@ -4,9 +4,12 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+const MAX_SESSION_BOOTSTRAP_BYTES = 1024 * 1024;
 const MAX_FOLDER_STORE_BYTES = 10 * 1024 * 1024;
 const MAX_CATALOG_ITEMS = 500;
 const DEFAULT_TIMEOUT_MS = 8_000;
+const ORCA_SESSION_TOKEN_ENV = "ORCA_GRAPH_SOURCE_TOKEN";
+const HERMES_SESSION_TOKEN_PATTERN = /window\.__HERMES_SESSION_TOKEN__\s*=\s*"([A-Za-z0-9._~-]{20,4096})"/u;
 export const FOLDER_SOURCE_DIRECTORY = ".orca-graph-engineering";
 export const FOLDER_SOURCE_FILENAME = "store.json";
 
@@ -98,6 +101,75 @@ async function responseJson(response) {
   }
 }
 
+async function boundedResponseText(response, maxBytes) {
+  const declared = Number(response.headers.get("content-length") ?? 0);
+  if (Number.isFinite(declared) && declared > maxBytes) throw new Error("session bootstrap response is too large");
+  const chunks = [];
+  let total = 0;
+  const reader = response.body?.getReader();
+  if (reader) {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new Error("session bootstrap response is too large");
+      }
+      chunks.push(value);
+    }
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+async function bootstrapOrcaSessionToken(config, options) {
+  const origin = new URL(config.url);
+  origin.pathname = "/";
+  origin.search = "";
+  origin.hash = "";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  try {
+    const response = await (options.fetchImpl ?? fetch)(origin, {
+      method: "GET",
+      headers: { accept: "text/html" },
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const html = await boundedResponseText(response, MAX_SESSION_BOOTSTRAP_BYTES);
+    const token = HERMES_SESSION_TOKEN_PATTERN.exec(html)?.[1];
+    if (!token) throw new Error("session token was not advertised by the configured origin");
+    process.env[ORCA_SESSION_TOKEN_ENV] = token;
+    return token;
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("session bootstrap timed out");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveBearerToken(config, options) {
+  const configured = config.authEnv ? process.env[config.authEnv]?.trim() : "";
+  if (configured) return configured;
+  if (config.authEnv !== ORCA_SESSION_TOKEN_ENV) {
+    throw new Error(`authentication environment variable is missing: ${config.authEnv}`);
+  }
+  try {
+    return await bootstrapOrcaSessionToken(config, options);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`authentication environment variable is missing: ${config.authEnv} (automatic session bootstrap failed: ${reason})`);
+  }
+}
+
 export async function requestDataSource(configValue, suffix = "", init = {}, options = {}) {
   const config = normalizeDataSourceConfig(configValue);
   if (["local", "folder"].includes(config.mode)) throw new Error(`${config.mode} mode has no remote endpoint`);
@@ -106,9 +178,8 @@ export async function requestDataSource(configValue, suffix = "", init = {}, opt
   headers.set("accept", "application/json");
   if (init.body !== undefined) headers.set("content-type", "application/json");
   if (config.authEnv) {
-    const token = process.env[config.authEnv];
-    if (!token?.trim()) throw new Error(`authentication environment variable is missing: ${config.authEnv}`);
-    headers.set("authorization", `Bearer ${token.trim()}`);
+    const token = await resolveBearerToken(config, options);
+    headers.set("authorization", `Bearer ${token}`);
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);

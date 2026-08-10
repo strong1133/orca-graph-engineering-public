@@ -2375,6 +2375,7 @@ function runtimeExecutionTarget(routingValue, targets, { id, label, locator } = 
     ...(locator ? { locator } : {}),
     ...(routing.branch || session?.branch ? { branch: normalizeWorkBranch(routing.branch || session.branch) } : {}),
     ...(routing.sessionId ? { sessionId: routing.sessionId } : {}),
+    ...(session?.title ? { sessionTitle: session.title } : {}),
     ...(routing.model ? { model: routing.model } : {}),
   };
 }
@@ -2657,7 +2658,7 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
     targets: executions.map((execution) => ({ locator: execution.project?.locator ?? null, target: targetFor(execution.route) })),
   };
 
-  const dispatched = await Promise.all(executions.map(async (execution, index) => {
+  const settled = await Promise.allSettled(executions.map(async (execution, index) => {
     await onProgress?.({ index, status: "running" });
     try {
       const result = await dispatchTask(
@@ -2690,6 +2691,14 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
       throw error;
     }
   }));
+  const failed = settled.filter((result) => result.status === "rejected");
+  if (failed.length) {
+    const messages = failed.map((result) => result.status === "rejected"
+      ? result.reason instanceof Error ? result.reason.message : String(result.reason)
+      : "");
+    throw new Error(`${failed.length}/${settled.length} project executions failed: ${messages.join("; ")}`);
+  }
+  const dispatched = settled.map((result) => result.status === "fulfilled" ? result.value : null);
   return {
     itemKind, itemId, completed: true, executionMode,
     sessionId: dispatched[0]?.sessionId,
