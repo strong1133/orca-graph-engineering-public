@@ -103,11 +103,25 @@ if (args[0] === "environment" && args[1] === "list") {
     liveTerminalCount: 0,
     agents: [],
   };
-  result = { worktrees: mode === "missing-worktree" ? [] : [worktree, ...(process.env.ORCA_GRAPH_FAKE_BRANCH === "1" && !remote ? [branchWorktree] : [])] };
+  const secondWorktree = {
+    ...worktree,
+    worktreeId: "second-worktree",
+    repoId: "second-repo",
+    path: "/portable/second-project",
+    branch: "refs/heads/release",
+    isActive: false,
+    isMainWorktree: true,
+    liveTerminalCount: 0,
+    agents: [],
+  };
+  result = { worktrees: mode === "missing-worktree" ? [] : [worktree, ...(process.env.ORCA_GRAPH_FAKE_BRANCH === "1" && !remote ? [branchWorktree] : []), ...(process.env.ORCA_GRAPH_FAKE_SECOND_PROJECT === "1" && !remote ? [secondWorktree] : [])] };
 } else if (args[0] === "project" && args[1] === "list") {
   result = { projects: [remote
     ? { id: "remote-project", displayName: "Remote project", sourceRepoIds: ["remote-repo"] }
-    : { id: "fake-project", displayName: "Fake project", sourceRepoIds: ["fake-repo"] }] };
+    : { id: "fake-project", displayName: "Fake project", sourceRepoIds: ["fake-repo"] },
+    ...(process.env.ORCA_GRAPH_FAKE_SECOND_PROJECT === "1" && !remote
+      ? [{ id: "second-project", displayName: "Second project", sourceRepoIds: ["second-repo"] }]
+      : [])] };
 } else if (args[0] === "terminal" && args[1] === "list") {
   result = { terminals: [{
     handle: remote ? "remote-session" : "fake-session",
@@ -278,6 +292,65 @@ describe("bridge graph calls", () => {
     expect(send?.join("\n")).not.toContain("Graph:");
     const after = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
     expect(after.graphs.every((graph: { runs: unknown[] }) => graph.runs.length === 0)).toBe(true);
+  });
+
+  it("attests all targets and executes one independent session per Task project with its own model", async () => {
+    const root = process.cwd();
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const store = JSON.parse(await readFile(path.join(root, "fixtures/default-store.json"), "utf8"));
+    const now = "2026-08-10T00:00:00.000Z";
+    store.tasks = [{
+      id: "TASK-multi-project", title: "다중 프로젝트 Task", prompt: "각 프로젝트 작업", draft: "각 프로젝트 작업",
+      promptRevisions: [], status: "ready", priority: "medium", tags: [],
+      projects: [
+        { id: "target-a", role: "target", locatorKind: "folder", locator: "/portable/fake-project", label: "API", branch: "main", position: 0 },
+        { id: "target-b", role: "target", locatorKind: "folder", locator: "/portable/second-project", label: "Web", branch: "release", position: 1 },
+      ],
+      createdAt: now, updatedAt: now,
+    }];
+    await writeFile(path.join(runtimeDirectory, "store.json"), `${JSON.stringify(store)}\n`, "utf8");
+    const fake = await installFakeOrca(runtimeDirectory);
+    const targetsPath = path.join(runtimeDirectory, "targets.json");
+    const targets = JSON.parse(await readFile(targetsPath, "utf8"));
+    targets.projects.push({
+      id: "second-project", name: "Second project", environmentId: "local", repoId: "second-repo",
+      worktreeId: "second-worktree", path: "/portable/second-project", branch: "refs/heads/release",
+    });
+    targets.branches.push({
+      id: "release", branch: "refs/heads/release", environmentId: "local", projectId: "second-project",
+      repoId: "second-repo", worktreeId: "second-worktree", path: "/portable/second-project",
+    });
+    await writeFile(targetsPath, `${JSON.stringify(targets)}\n`, "utf8");
+
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "run-task", taskId: "TASK-multi-project", executionMode: "per_project", dryRun: false,
+        projectSessions: [
+          { locator: "/portable/fake-project", routing: { environmentId: "local", projectId: "fake-project", branch: "main", model: "gpt-5.6-sol", reasoning: "high" } },
+          { locator: "/portable/second-project", routing: { environmentId: "local", projectId: "second-project", branch: "release", model: "gpt-5.6-luna", reasoning: "medium" } },
+        ],
+      },
+      "task TASK-multi-project executed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_SECOND_PROJECT: "1",
+      },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    const creates = calls.filter((args) => args[0] === "terminal" && args[1] === "create");
+    expect(creates).toHaveLength(2);
+    expect(creates.some((args) => args.includes("id:fake-worktree") && args.join(" ").includes("gpt-5.6-sol"))).toBe(true);
+    expect(creates.some((args) => args.includes("id:second-worktree") && args.join(" ").includes("gpt-5.6-luna"))).toBe(true);
+    const sends = calls.filter((args) => args[0] === "terminal" && args[1] === "send");
+    expect(sends).toHaveLength(2);
+    const apiPrompt = sends.find((args) => args.join("\n").includes("target · folder: /portable/fake-project"))?.join("\n") ?? "";
+    const webPrompt = sends.find((args) => args.join("\n").includes("target · folder: /portable/second-project"))?.join("\n") ?? "";
+    expect(apiPrompt).not.toContain("/portable/second-project");
+    expect(webPrompt).not.toContain("/portable/fake-project");
   });
 
   it("executes one Todo directly in the selected Orca worktree", async () => {

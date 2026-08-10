@@ -84,6 +84,7 @@ describe("Orca project registry mapping", () => {
     expect(workTasksEnvironment(undefined, "jsj-mac-1.local")).toBe("정석맥1");
     expect(workTasksEnvironment(undefined, "jsj2-local")).toBe("정석맥2");
     expect(workTasksEnvironment(undefined, "jsj-mac-2.local")).toBe("정석맥2");
+    expect(workTasksEnvironment(undefined, "jsj-air.local")).toBe("jsj-air");
     expect(workTasksEnvironment(undefined, "Hermes")).toBe("Hermes");
     expect(taskProjectInput({
       id: "TP-1", role: "target", locatorKind: "folder", locator: "/workspace/work",
@@ -93,8 +94,11 @@ describe("Orca project registry mapping", () => {
       label: "work", branch: "feature/task-42", position: 2,
     });
     expect(normalizeWorkBranch("refs/heads/feature/task-42")).toBe("feature/task-42");
-    expect(() => normalizeWorkBranch("feature/bad branch")).toThrow("whitespace or control");
-    expect(() => normalizeWorkBranch("feature/bad\u0000branch")).toThrow("whitespace or control");
+    expect(() => normalizeWorkBranch("feature/bad branch")).toThrow("safe Git branch");
+    expect(() => normalizeWorkBranch("feature/bad\u0000branch")).toThrow("safe Git branch");
+    for (const unsafe of ["-bad", "feature..bad", "feature@{bad", "feature//bad", "feature/bad.", "feature/bad/"]) {
+      expect(() => normalizeWorkBranch(unsafe)).toThrow("safe Git branch");
+    }
   });
 
   it("maps a Todo to the atomic quick-Task contract without changing its source bytes", () => {

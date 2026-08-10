@@ -1,6 +1,6 @@
 const SESSION_RE = /window\.__HERMES_SESSION_TOKEN__="(?<value>[A-Za-z0-9._~-]{20,})"/u;
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
-const VALID_ENVIRONMENTS = new Set(["정석맥1", "정석맥2", "Hermes"]);
+const VALID_ENVIRONMENTS = new Set(["정석맥1", "정석맥2", "jsj-air", "Hermes"]);
 const SENSITIVE_KEYS = new Set(["authorization", "body", "content", "draft", "input", "input_prompt", "meta_prompt", "password", "prompt", "secret", "token"]);
 const SOURCE_NAME = ["under", "joy"].join("");
 const API_PATH = process.env.ORCA_GRAPH_WORKSPACE_API_PATH || `/api/plugins/${SOURCE_NAME}-workspace`;
@@ -52,6 +52,7 @@ export function workTasksEnvironment(value, localName = "") {
   const normalized = String(localName).trim().toLocaleLowerCase("ko-KR");
   if (["jsj1", "jsj-mac-1", "정석맥1"].some((name) => normalized.includes(name))) return "정석맥1";
   if (["jsj2", "jsj-mac-2", "정석맥2"].some((name) => normalized.includes(name))) return "정석맥2";
+  if (["jsj-air", "jsj air"].some((name) => normalized.includes(name))) return "jsj-air";
   if (normalized.includes("hermes")) return "Hermes";
   return null;
 }
@@ -116,8 +117,13 @@ export function normalizeWorkBranch(value) {
   const branch = value.trim().replace(/^refs\/heads\//u, "");
   if (!branch) return undefined;
   if (branch.length > 255) throw new WorkTasksClientError("Task project branch exceeds 255 characters");
-  if (/[\s\u0000-\u001f\u007f]/u.test(branch)) {
-    throw new WorkTasksClientError("Task project branch must not contain whitespace or control characters");
+  if (branch.startsWith("-")
+    || /[\s\u0000-\u001f\u007f]/u.test(branch)
+    || /\.\.|@\{|[~^:?*\[\\]/u.test(branch)
+    || branch.endsWith(".")
+    || branch.endsWith("/")
+    || branch.includes("//")) {
+    throw new WorkTasksClientError("Task project branch must be a safe Git branch name");
   }
   return branch;
 }
@@ -156,8 +162,12 @@ export class WorkTasksClient {
     });
   }
 
-  async request(method, path, payload) {
+  async request(method, path, payload, options = {}) {
     if (!String(path).startsWith("/") || String(path).startsWith("//")) throw new WorkTasksClientError("API path must be a single absolute path");
+    const timeoutMs = Number(options.timeoutMs ?? this.timeoutMs);
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 900_000) {
+      throw new WorkTasksClientError("Work Tasks request timeout must be between 1 and 900 seconds");
+    }
     for (let attempt = 0; attempt < 2; attempt += 1) {
       if (!this.session || attempt === 1) await this.bootstrap();
       let response;
@@ -165,7 +175,7 @@ export class WorkTasksClient {
         response = await this.fetchImpl(`${this.apiBase}${path}`, {
           method,
           redirect: "error",
-          signal: AbortSignal.timeout(this.timeoutMs),
+          signal: AbortSignal.timeout(timeoutMs),
           headers: {
             "X-Hermes-Session-Token": this.session,
             [CLIENT_HEADER]: this.clientId,
@@ -189,10 +199,10 @@ export class WorkTasksClient {
     throw new WorkTasksClientError("Work Tasks authentication failed");
   }
 
-  get(path) { return this.request("GET", path); }
-  post(path, payload) { return this.request("POST", path, payload); }
-  patch(path, payload) { return this.request("PATCH", path, payload); }
-  put(path, payload) { return this.request("PUT", path, payload); }
+  get(path, options) { return this.request("GET", path, undefined, options); }
+  post(path, payload, options) { return this.request("POST", path, payload, options); }
+  patch(path, payload, options) { return this.request("PATCH", path, payload, options); }
+  put(path, payload, options) { return this.request("PUT", path, payload, options); }
 }
 
 export function workTasksClientFromEnvironment(environment = process.env) {

@@ -16,12 +16,13 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 �
 - 사람 Draft와 Meta Draft의 분리 저장, revision lineage, stale 감지, 자체 포함형 Meta Prompt 생성
 - 독립적인 Task/Todo 상태·우선순위·마감일·태그 관리와 Todo→Task 전환
 - 하나의 Task를 여러 그래프 노드에 연결하고 관리 화면에서 연결 위치로 이동
+- Task 상세에서 현재 Task를 1번으로 고정하고 같은 Domain·Milestone Task를 선택 순서대로 잇는 빠른 그래프 구성
 - sequence, blocks, informs, loop 엣지와 조건 분기, AND/OR join
 - 그래프 목록 검색, lifecycle·실행 단계 필터, 정렬, color dot, 상태 badge, 진행률
 - 그래프 생성, 복제, 보관, 초기화, pin, routine 메타데이터, JSON import/export
 - 🧭 업무프로세스 그래프, 실행별 원문 업무 입력과 회차별 입력 이력
 - 그래프와 노드의 project, Orca worktree branch, session, model, reasoning 라우팅
-- 장치의 Orca repo/worktree registry 게시, Task 대상 folder 프로젝트 감지·단일 선택 연결과 실제 워크트리 브랜치 선택
+- 장치의 Orca repo/worktree registry 게시, Task 대상 folder 프로젝트·실제 워크트리 브랜치 다중 선택, 다른 장치의 Git 프로젝트/worktree 준비
 - path, diamond, router, star, cycle, tree, tool-bipartite topology template
 - superstep, critical path, 병렬 writer/reducer, loop guard, 예산, 권한, provenance 검사
 - retry, timeout, idempotency, compensation, human gate, 실행 이력
@@ -37,7 +38,8 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 �
 - Task/Todo 검색은 제목·ID·태그·사람 Draft·Meta Draft를 함께 찾고, Task는 Domain/Milestone, Todo는 그룹/하위그룹 이름까지 검색합니다. Task는 기본적으로 Domain→Milestone, Todo는 원천의 그룹→하위그룹별로 묶이며 상태와 우선순위 그룹으로 바꿀 수 있습니다. Todo 그룹 계층은 실행 scope인 Domain/Milestone과 독립적입니다. Todo는 원천 화면과 같은 활성 상태(할 일·진행 중)를 기본으로 표시하며, 완료·취소 이력은 `모든 상태` 또는 개별 상태 필터에서 확인할 수 있습니다.
 - 사람 Draft를 고치면 새 immutable revision을 추가하고 이전 Meta Draft는 삭제하지 않은 채 stale로 표시합니다. `Meta Prompt 만들기`는 선택된 Orca bridge worktree에 새 Codex 세션을 만들고 플러그인에 내장된 공개 prompt 계약으로 결과를 생성합니다. Task의 project 관계도 정렬된 context로 전달하며 target locator가 빠진 결과는 9개 H1 구조를 유지한 채 `작업 컨텍스트` 안에 결정적으로 보강합니다. 결과가 고정 9개 섹션 계약을 통과하고 실행 중 사람 Draft revision이 바뀌지 않았을 때만 Meta Draft로 저장합니다.
 - 하나의 Task를 여러 Graph의 Task 노드에 재사용할 수 있습니다. 최신 Meta Draft가 있으면 실행 payload로 사용하고, 없거나 stale이면 현재 사람 Draft를 사용합니다. 제목이나 유효 실행 지시문이 바뀌면 연결된 모든 노드도 함께 갱신됩니다.
-- Task·Todo 목록의 ⚡ 버튼과 상세의 `워크트리 빠른 실행`은 그래프를 만들지 않고 현재 Meta Draft 또는 사람 Draft를 단건으로 보냅니다. 실행 전에 연결된 Orca 환경, 그 환경의 project·실제 Orca worktree branch·기존 session, AI model, reasoning을 고르며 그래프 run·node claim이나 lifecycle 상태 변경은 만들지 않습니다. 현재 활성 Orca worktree를 먼저 감지하며 구조화 Workspace Task에 target folder가 없으면 사용자가 확인한 프로젝트 하나와 브랜치를 실행 직전에 기존 Task project 관계에 CAS로 추가합니다. 연결된 Task target folder와 branch는 단건 실행과 해당 Task를 쓰는 그래프 노드의 기본 추천이 되며, 정확한 기존 Orca worktree가 없으면 실행 전에 차단합니다. 로컬 환경 이름은 `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME`으로 지정할 수 있고 저장된 원격 Orca 환경은 대상 갱신 때 자동으로 합쳐집니다.
+- Task 상세의 `빠른 그래프 구성`은 현재 Task를 시작점으로 고정하고 같은 Domain·Milestone의 활성 Task만 고르게 합니다. 선택 순서는 그대로 Task 노드와 sequence edge 순서가 되며, 구조화 원천에서는 마지막으로 읽은 Task version과 전체 순서를 한 번의 원자적 요청으로 전달합니다.
+- Task·Todo 목록의 ⚡ 버튼과 상세의 `워크트리 빠른 실행`은 그래프를 만들지 않고 현재 Meta Draft 또는 사람 Draft를 단건으로 보냅니다. 실행 전에 연결된 Orca 환경, 그 환경의 project·실제 Orca worktree branch·기존 session, AI model, reasoning을 고르며 그래프 run·node claim이나 lifecycle 상태 변경은 만들지 않습니다. 현재 활성 Orca worktree를 먼저 감지하며 구조화 Workspace Task에 target folder가 없으면 사용자가 확인한 프로젝트·브랜치 묶음을 실행 직전에 기존 Task project 관계에 한 번의 CAS로 추가합니다. 대상이 여러 개면 모든 프로젝트 context를 한 세션에 보내거나, 프로젝트마다 실제 worktree branch와 모델/reasoning이 다른 새 세션을 동시에 실행할 수 있습니다. 연결된 Task target folder와 branch는 단건 실행과 해당 Task를 쓰는 그래프 노드의 기본 추천이 되며, 정확한 기존 Orca worktree가 없으면 실행 전에 차단합니다. 로컬 환경 이름은 `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME`으로 지정할 수 있고 저장된 원격 Orca 환경은 대상 갱신 때 자동으로 합쳐집니다.
 - Todo 빠른 실행은 이미 연결된 Task를 재사용하고, 연결이 없으면 원천의 원자적 `POST /todos/{id}/task` 계약과 재시도 가능한 idempotency key로 Task를 먼저 생성·연결한 뒤 그 Task를 실행합니다. Todo의 완료 상태는 바꾸지 않습니다. 로컬/폴더 원천에서도 같은 의미로 Task를 만들며 원래 Todo, Domain·Milestone, Prompt revision lineage를 보존합니다.
 - hard delete 대신 Domain/Milestone 보관, 확인 창이 있는 `Task 삭제`(복원 가능한 보관), Todo 취소를 사용합니다. 활성 하위 Milestone·Task·Todo가 남은 Domain이나 Milestone은 보관할 수 없습니다.
 
@@ -104,11 +106,11 @@ Orca의 Settings → Plugins에서 Plugin system을 켜고 Development plugin �
 
 ```bash
 export ORCA_GRAPH_WORKSPACE_BASE_URL="https://your-workspace.ts.net"
-export ORCA_GRAPH_WORKSPACE_ENVIRONMENT="정석맥1" # 정석맥1 | 정석맥2 | Hermes
+export ORCA_GRAPH_WORKSPACE_ENVIRONMENT="정석맥1" # 정석맥1 | 정석맥2 | jsj-air | Hermes
 export ORCA_GRAPH_WORKSPACE_CLIENT_ID="orca-graph-engineering"
 ```
 
-기본 API prefix가 다른 호환 서버는 `ORCA_GRAPH_WORKSPACE_API_PATH`로 바꿀 수 있습니다. 브리지는 base page에서 짧은 session bootstrap을 얻고 값을 파일·Graph·로그에 남기지 않습니다. 기동 시 `orca repo list --json`의 repo ID, 표시 이름, 로컬 경로, kind, canonical remote를 `PUT /orca-projects/{environment}`에 전체 교체 게시합니다. 이후에는 사용자가 `대상 새로고침`을 실행한 변경 이벤트에서만 다시 비교하며 같은 payload는 보내지 않아 주기 polling을 만들지 않습니다.
+기본 API prefix가 다른 호환 서버는 `ORCA_GRAPH_WORKSPACE_API_PATH`로 바꿀 수 있습니다. 브리지는 base page에서 짧은 session bootstrap을 얻고 값을 파일·Graph·로그에 남기지 않습니다. 기동 시 `orca repo list --json`의 repo ID, 표시 이름, 로컬 경로, kind, canonical remote를 `PUT /orca-projects/{environment}`에 전체 교체 게시합니다. 이후에는 사용자가 `대상 새로고침`을 실행한 변경 이벤트에서만 다시 비교하며 같은 payload는 보내지 않아 주기 polling을 만들지 않습니다. Task 상세에서 다른 실행 장치를 고르면 그 장치 registry와 기준 장치의 canonical remote를 대조하고, 프로젝트나 선택 branch worktree가 없을 때만 `POST /orca-projects/{environment}/provision`을 호출합니다. 반환된 실제 target path를 Task에 저장하며 source registry version이 충돌하면 최신 목록을 보여 주고 자동 재시도하지 않습니다.
 
 구조화 snapshot이 업무프로세스 확장을 아직 직접 투영하지 않더라도 aggregate Graph 조회의 `process_enabled`, `current_run.input_prompt`, `recent_runs[].input_prompt`를 같은 CAS 정본에서 보강합니다. 새 업무프로세스 run은 입력이 비어 있으면 시작할 수 없고, 재개는 저장된 입력을 읽기 전용으로 표시합니다. 클라이언트는 입력 문자열을 trim하거나 줄바꿈을 바꾸지 않고 요청 JSON에 그대로 넣습니다.
 

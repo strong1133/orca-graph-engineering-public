@@ -58,6 +58,7 @@ const localWorkTasksEnvironment = workTasksEnvironment(
   process.env.ORCA_GRAPH_WORKSPACE_ENVIRONMENT || process.env[workTasksEnvironmentKey],
   process.env.ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME || os.hostname(),
 );
+const primaryProjectEnvironment = "정석맥1";
 let publishedProjectSignature = null;
 let publishedProjects = [];
 
@@ -91,7 +92,7 @@ async function readTargets() {
 function requireWorkTasks() {
   if (!workTasksClient) throw new Error("the workspace API base URL is not configured in the bridge terminal");
   if (!localWorkTasksEnvironment) {
-    throw new Error("the workspace execution environment must be 정석맥1, 정석맥2, or Hermes");
+    throw new Error("the workspace execution environment must be 정석맥1, 정석맥2, jsj-air, or Hermes");
   }
   return workTasksClient;
 }
@@ -178,7 +179,12 @@ async function taskProjectContext(taskId, workspaceHint = "") {
   const taskProjects = Array.isArray(taskPayload.projects) ? taskPayload.projects.map(projectRelation) : [];
   const registryItems = Array.isArray(registryPayload.items) ? registryPayload.items : [];
   const registry = registryItems.flatMap((entry) => Array.isArray(entry?.projects)
-    ? entry.projects.map((project) => ({ ...project, environment: entry.environment, updatedAt: entry.updated_at }))
+    ? entry.projects.map((project) => ({
+        ...project,
+        environment: entry.environment,
+        registryVersion: Number(entry.version || 0),
+        updatedAt: entry.updated_at,
+      }))
     : []);
   const localRegistry = registry.filter((project) => project.environment === localWorkTasksEnvironment);
   const normalizedHint = String(workspaceHint || "").trim().toLocaleLowerCase("ko-KR");
@@ -198,33 +204,55 @@ async function taskProjectContext(taskId, workspaceHint = "") {
     taskVersion: Number(taskPayload.item?.version || 0),
     projects: taskProjects,
     registry,
+    registryVersions: Object.fromEntries(registryItems.map((entry) => [entry.environment, Number(entry.version || 0)])),
     recommended,
     environment: localWorkTasksEnvironment,
     current,
   };
 }
 
-async function linkTaskProjects(taskId, paths, branchValue) {
+function taskProjectBundles(values) {
+  if (!Array.isArray(values) || !values.length || values.length > 100) {
+    throw new Error("연결할 프로젝트·브랜치를 1개 이상 100개 이하로 선택하십시오.");
+  }
+  const seen = new Set();
+  return values.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("프로젝트·브랜치 묶음이 올바르지 않습니다.");
+    const pathValue = String(value.path || "").trim();
+    if (!pathValue || pathValue.length > 4096 || seen.has(pathValue)) throw new Error("프로젝트 경로는 비어 있지 않고 서로 달라야 합니다.");
+    seen.add(pathValue);
+    const branch = normalizeWorkBranch(value.branch);
+    const label = typeof value.label === "string" ? value.label.trim().slice(0, 200) : "";
+    return { path: pathValue, ...(branch ? { branch } : {}), ...(label ? { label } : {}) };
+  });
+}
+
+async function applyTaskProjectBundles(taskId, rawBundles, options = {}) {
   const client = requireWorkTasks();
-  const requested = [...new Set((Array.isArray(paths) ? paths : []).filter((value) => typeof value === "string" && value.trim()))];
-  if (!requested.length) throw new Error("연결할 프로젝트를 하나 이상 선택하십시오.");
+  const bundles = taskProjectBundles(rawBundles);
   const context = await taskProjectContext(taskId);
-  const branch = normalizeWorkBranch(branchValue || context.current?.branch || "");
   const registryByPath = new Map(context.registry.map((project) => [project.path, project]));
-  for (const locator of requested) if (!registryByPath.has(locator)) throw new Error(`게시된 Orca 프로젝트가 아닙니다: ${locator}`);
+  const existingPaths = new Set(context.projects.map((project) => project.locator));
+  const allowedUnpublished = options.allowedUnpublishedPaths ?? new Set();
+  for (const bundle of bundles) {
+    if (!registryByPath.has(bundle.path) && !existingPaths.has(bundle.path) && !allowedUnpublished.has(bundle.path)) {
+      throw new Error(`게시된 Orca 프로젝트가 아닙니다: ${bundle.path}`);
+    }
+  }
   const existingInputs = context.projects.map(taskProjectInput);
   let position = Math.max(-1, ...existingInputs.map((item) => Number(item.position) || 0)) + 1;
-  for (const locator of requested) {
-    const existing = existingInputs.find((item) => item.role === "target" && item.locator_kind === "folder" && item.locator === locator);
+  for (const bundle of bundles) {
+    const existing = existingInputs.find((item) => item.role === "target" && item.locator_kind === "folder" && item.locator === bundle.path);
     if (existing) {
-      if (branch) existing.branch = branch;
+      if (bundle.branch) existing.branch = bundle.branch;
+      else delete existing.branch;
       continue;
     }
-    const project = registryByPath.get(locator);
+    const project = registryByPath.get(bundle.path);
     existingInputs.push({
-      role: "target", locator_kind: "folder", locator,
-      ...(project?.name ? { label: project.name } : {}),
-      ...(branch ? { branch } : {}), position: position++,
+      role: "target", locator_kind: "folder", locator: bundle.path,
+      ...(bundle.label || project?.name ? { label: bundle.label || project.name } : {}),
+      ...(bundle.branch ? { branch: bundle.branch } : {}), position: position++,
     });
   }
   try {
@@ -238,6 +266,86 @@ async function linkTaskProjects(taskId, paths, branchValue) {
   }
   const refreshed = await refreshConfiguredDataSource(undefined);
   return { context: await taskProjectContext(taskId), store: refreshed.store };
+}
+
+async function linkTaskProjects(taskId, paths, branchValue) {
+  const branch = normalizeWorkBranch(branchValue);
+  return applyTaskProjectBundles(taskId, [...new Set(Array.isArray(paths) ? paths : [])]
+    .filter((value) => typeof value === "string" && value.trim())
+    .map((pathValue) => ({ path: pathValue, ...(branch ? { branch } : {}) })));
+}
+
+function projectIdentity(project) {
+  const remote = String(project?.remote || "").trim().toLocaleLowerCase("en-US");
+  return remote || `${project?.kind || "folder"}:${String(project?.name || "").trim().toLocaleLowerCase("ko-KR")}`;
+}
+
+function registryHasBranch(project, branch) {
+  if (!branch) return true;
+  return (project?.worktrees ?? []).some((worktree) => normalizeWorkBranch(worktree?.branch) === branch);
+}
+
+async function connectTaskProjectBundles(taskId, targetEnvironment, rawSelections) {
+  if (![primaryProjectEnvironment, "정석맥2", "jsj-air", "Hermes"].includes(targetEnvironment)) {
+    throw new Error(`지원하지 않는 프로젝트 실행 장치입니다: ${targetEnvironment}`);
+  }
+  const client = requireWorkTasks();
+  if (!Array.isArray(rawSelections) || !rawSelections.length || rawSelections.length > 100) {
+    throw new Error("연결할 프로젝트·브랜치를 1개 이상 100개 이하로 선택하십시오.");
+  }
+  const selectionKeys = new Set();
+  const selections = rawSelections.map((selection) => {
+    if (!selection || typeof selection !== "object" || Array.isArray(selection)) throw new Error("프로젝트·브랜치 묶음이 올바르지 않습니다.");
+    const sourcePath = String(selection.sourcePath || "").trim();
+    const targetPath = String(selection.targetPath || "").trim();
+    const key = `${sourcePath}\n${targetPath}`;
+    if ((!sourcePath && !targetPath) || selectionKeys.has(key)) throw new Error("선택한 프로젝트 경로는 비어 있지 않고 서로 달라야 합니다.");
+    selectionKeys.add(key);
+    const branch = normalizeWorkBranch(selection.branch);
+    const label = typeof selection.label === "string" ? selection.label.trim().slice(0, 200) : "";
+    return { sourcePath, targetPath, ...(branch ? { branch } : {}), ...(label ? { label } : {}) };
+  });
+  const context = await taskProjectContext(taskId);
+  const sourceProjects = context.registry.filter((project) => project.environment === primaryProjectEnvironment);
+  const targetProjects = context.registry.filter((project) => project.environment === targetEnvironment);
+  const sourceVersion = Number(context.registryVersions?.[primaryProjectEnvironment] || 0);
+  const targetByIdentity = new Map(targetProjects.map((project) => [projectIdentity(project), project]));
+  const resolved = [];
+  const provisionedPaths = new Set();
+  let provisioned = 0;
+  for (const selection of selections) {
+    const source = sourceProjects.find((project) => project.path === selection.sourcePath);
+    if (source && selection.branch && !registryHasBranch(source, selection.branch)) {
+      throw new Error(`${source.name}: 기준 장치에 실제로 존재하지 않는 워크트리 브랜치입니다: ${selection.branch}`);
+    }
+    let target = targetProjects.find((project) => selection.targetPath && project.path === selection.targetPath)
+      ?? (source ? targetByIdentity.get(projectIdentity(source)) : undefined);
+    let locator = target?.path;
+    if (!target || !registryHasBranch(target, selection.branch)) {
+      if (targetEnvironment === primaryProjectEnvironment) {
+        throw new Error(`${source?.name || selection.label || selection.sourcePath}: 선택한 작업 브랜치의 Orca 워크트리를 찾을 수 없습니다.`);
+      }
+      if (!source) throw new Error(`기준 장치의 Orca 프로젝트를 찾을 수 없습니다: ${selection.sourcePath || selection.targetPath}`);
+      if (!sourceVersion) throw new Error("기준 장치의 Orca 프로젝트 목록 버전을 읽지 못했습니다.");
+      if (source.kind !== "git" || !String(source.remote || "").trim()) {
+        throw new Error(`${source.name}: Git remote가 있는 프로젝트만 다른 장치에 자동 준비할 수 있습니다.`);
+      }
+      const response = await client.post(`/orca-projects/${encodeURIComponent(targetEnvironment)}/provision`, {
+        source_environment: primaryProjectEnvironment,
+        expected_source_version: sourceVersion,
+        source_path: source.path,
+        branch: selection.branch || null,
+      }, { timeoutMs: 900_000 });
+      locator = String(response.item?.target_path || "").trim();
+      if (!locator) throw new Error(`${source.name}: 프로젝트 준비 결과에 대상 경로가 없습니다.`);
+      provisionedPaths.add(locator);
+      provisioned += 1;
+    }
+    resolved.push({ path: locator, label: selection.label || source?.name || target?.name, ...(selection.branch ? { branch: selection.branch } : {}) });
+  }
+  const linked = await applyTaskProjectBundles(taskId, resolved, { allowedUnpublishedPaths: provisionedPaths });
+  if (provisioned) await refreshTargets();
+  return { ...linked, provisioned, environment: targetEnvironment };
 }
 
 async function setTaskProjectBranch(taskId, projectId, locator, branchValue) {
@@ -346,6 +454,37 @@ async function setGraphProcess(graphId, expectedVersion, enabled) {
     throw error;
   }
   return refreshConfiguredDataSource(undefined, graphId);
+}
+
+async function createQuickGraph(sourceTaskId, expectedTaskVersion, nameValue, taskIdsValue) {
+  const config = await readDataSourceConfig();
+  if (config.mode !== "structured") throw new Error("quick graph creation requires a structured data source");
+  const client = requireWorkTasks();
+  const name = String(nameValue || "").trim();
+  const taskIds = Array.isArray(taskIdsValue) ? taskIdsValue.map((value) => String(value || "").trim()) : [];
+  if (!sourceTaskId || sourceTaskId.length > 127) throw new Error("source Task ID is required");
+  if (!Number.isInteger(expectedTaskVersion) || expectedTaskVersion <= 0) throw new Error("source Task CAS version is required");
+  if (!name || name.length > 200) throw new Error("quick graph name must be 1 to 200 characters");
+  if (taskIds.length < 2 || taskIds.length > 100 || taskIds[0] !== sourceTaskId
+    || taskIds.some((taskId) => !taskId || taskId.length > 127) || new Set(taskIds).size !== taskIds.length) {
+    throw new Error("quick graph tasks must be unique, contain 2 to 100 items, and start with the source Task");
+  }
+  let response;
+  try {
+    response = await client.post("/graphs/quick", {
+      source_task_id: sourceTaskId,
+      expected_task_version: expectedTaskVersion,
+      name,
+      task_ids: taskIds,
+    });
+  } catch (error) {
+    if (error?.status === 409) await client.get(`/tasks/${encodeURIComponent(sourceTaskId)}`);
+    throw error;
+  }
+  const graphId = String(response.item?.id || "").trim();
+  if (!graphId) throw new Error("quick graph response did not include a graph ID");
+  const refreshed = await refreshConfiguredDataSource(config, graphId);
+  return { graphId, store: refreshed.store };
 }
 
 async function atomicJson(filePath, value) {
@@ -1100,9 +1239,11 @@ function standaloneRouting(value) {
   return routing;
 }
 
-function buildStandaloneWorkItemPrompt(itemKind, item, prompt, routing, scope) {
+function buildStandaloneWorkItemPrompt(itemKind, item, prompt, routing, scope, projectContext) {
   const label = itemKind === "todo" ? "Todo" : "Task";
-  const projects = itemKind === "task" ? orderedTaskProjects(item) : [];
+  const projects = itemKind === "task"
+    ? (Array.isArray(projectContext) ? projectContext : orderedTaskProjects(item))
+    : [];
   return [
     `Execute this ${label} as a standalone assignment in the selected Orca worktree/session.`,
     `${label}: ${item.title} (${item.id})`,
@@ -1167,10 +1308,17 @@ function workBranch(value) {
   return String(value || "").trim().replace(/^refs\/heads\//u, "");
 }
 
-function taskProjectExecutionNode(store, graph, node, targets) {
+function projectMatchesTaskTarget(project, target, targets, environmentId) {
+  if (project?.path === target.locator) return true;
+  return (targets.branches ?? []).some((branch) => branch.projectId === project?.id
+    && targetEnvironmentId(branch) === environmentId
+    && branch.path === target.locator);
+}
+
+function taskProjectExecutionNode(store, graph, node, targets, targetOverride = null) {
   if (!node?.task?.id) return node;
   const task = (store.tasks ?? []).find((item) => item.id === node.task.id) ?? node.task;
-  const projects = orderedTaskProjects(task);
+  const projects = targetOverride ? [targetOverride] : orderedTaskProjects(task);
   if (!projects.length) return node;
   const enriched = { ...node, task: { ...node.task, projects } };
   const target = projects.find((project) => project.role === "target" && project.locatorKind === "folder");
@@ -1184,13 +1332,14 @@ function taskProjectExecutionNode(store, graph, node, targets) {
     ? targets.projects.find((item) => item.id === routing.projectId && targetEnvironmentId(item) === environmentId)
     : null;
   if (selectedProject) {
-    if (selectedProject.path === target.locator && !routing.branch && target.branch) {
+    if (projectMatchesTaskTarget(selectedProject, target, targets, environmentId) && !routing.branch && target.branch) {
       enriched.routing = { ...(node.routing || {}), branch: target.branch };
     }
     return enriched;
   }
   if (routing.projectId) return enriched;
-  const project = targets.projects.find((item) => targetEnvironmentId(item) === environmentId && item.path === target.locator);
+  const project = targets.projects.find((item) => targetEnvironmentId(item) === environmentId
+    && projectMatchesTaskTarget(item, target, targets, environmentId));
   if (!project) {
     enriched.targetProjectError = `Task target project is unavailable in Orca environment ${environmentId}: ${target.locator}`;
     return enriched;
@@ -2140,8 +2289,25 @@ async function runGraph(graphId, dryRun, inputPrompt, startNewRun = true) {
   });
 }
 
-async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun) {
+function standaloneProjectSessions(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.length > 100) throw new Error("standalone project sessions must be an array of at most 100 items");
+  const seen = new Set();
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("standalone project session must be an object");
+    const locator = String(entry.locator || "").trim();
+    if (!locator || seen.has(locator)) throw new Error("standalone project session locators must be non-empty and unique");
+    seen.add(locator);
+    const routing = standaloneRouting(entry.routing);
+    if (routing.sessionId) throw new Error("per-project execution creates a new Orca session for every project");
+    return { locator, routing };
+  });
+}
+
+async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun, executionMode = "single_session", requestedProjectSessions = []) {
   if (!["task", "todo"].includes(itemKind)) throw new Error(`unsupported standalone work item kind: ${itemKind}`);
+  if (!["single_session", "per_project"].includes(executionMode)) throw new Error(`unsupported standalone execution mode: ${executionMode}`);
+  if (itemKind !== "task" && executionMode !== "single_session") throw new Error("per-project execution is only available for Tasks");
   const dataSourceConfig = await readDataSourceConfig();
   const [store, targets] = await Promise.all([
     readWorkingStore(dataSourceConfig),
@@ -2170,24 +2336,88 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun)
     routing: {},
     engineering: { contextMode: "inherit", timeoutSeconds: 900 },
   };
-  const executionNode = itemKind === "task" ? taskProjectExecutionNode(store, graph, node, targets) : node;
-  const route = resolveTaskRoute(graph, executionNode, targets);
-  const plan = { dryRun, tasks: [{ route }] };
+  const targetProjects = itemKind === "task"
+    ? orderedTaskProjects(item).filter((project) => project.role === "target" && project.locatorKind === "folder")
+    : [];
+  const perProject = executionMode === "per_project";
+  let executions;
+  if (perProject) {
+    if (targetProjects.length < 2) throw new Error("per-project execution requires at least two Task target projects");
+    const sessions = standaloneProjectSessions(requestedProjectSessions);
+    const sessionByLocator = new Map(sessions.map((session) => [session.locator, session]));
+    if (sessions.length !== targetProjects.length || targetProjects.some((project) => !sessionByLocator.has(project.locator))) {
+      throw new Error("project sessions must match the Task target projects exactly");
+    }
+    executions = targetProjects.map((project, index) => {
+      const projectRouting = sessionByLocator.get(project.locator).routing;
+      const environmentId = projectRouting.environmentId
+        || targets.environments?.find((environment) => environment.local)?.id
+        || "local";
+      const selectedProject = targets.projects.find((target) => target.id === projectRouting.projectId
+        && targetEnvironmentId(target) === environmentId);
+      if (!selectedProject || !projectMatchesTaskTarget(selectedProject, project, targets, environmentId)) {
+        throw new Error(`project session does not match the Task target path: ${project.locator}`);
+      }
+      const projectGraph = { ...graph, id: `${graph.id}:${index + 1}`, defaults: projectRouting };
+      const projectNode = {
+        ...node,
+        id: `${node.id}:${index + 1}`,
+        task: { ...node.task, projects: [project] },
+      };
+      const executionNode = taskProjectExecutionNode(store, projectGraph, projectNode, targets, project);
+      return { project, graph: projectGraph, node: executionNode, route: resolveTaskRoute(projectGraph, executionNode, targets) };
+    });
+  } else {
+    const executionNode = itemKind === "task" ? taskProjectExecutionNode(store, graph, node, targets) : node;
+    executions = [{ project: null, graph, node: executionNode, route: resolveTaskRoute(graph, executionNode, targets) }];
+  }
+  const plan = { dryRun, tasks: executions.map((execution) => ({ route: execution.route })) };
   await attestExecutionPlan(plan);
-  const target = route.mode === "existing-session"
+  const targetFor = (route) => route.mode === "existing-session"
     ? { mode: route.mode, environmentId: route.environmentId, sessionId: route.session.id, model: route.model?.id ?? null }
     : { mode: route.mode, environmentId: route.environmentId, projectId: route.project.id, model: route.model.id };
-  if (dryRun) return { itemKind, itemId, planned: true, target };
+  if (dryRun) return {
+    itemKind, itemId, planned: true, executionMode,
+    target: targetFor(executions[0].route),
+    targets: executions.map((execution) => ({ locator: execution.project?.locator ?? null, target: targetFor(execution.route) })),
+  };
 
-  const dispatched = await dispatchTask(graph, executionNode, targets, `task-${crypto.randomUUID().slice(0, 8)}`, {
-    prompt: buildStandaloneWorkItemPrompt(itemKind, item, prompt, route.routing, scopeContext(store, item)),
-    title: `${itemKind === "task" ? "Task" : "Todo"} · ${item.title}`,
-  });
-  return { itemKind, itemId, completed: true, sessionId: dispatched.sessionId, target };
+  const dispatched = await Promise.all(executions.map(async (execution, index) => {
+    const result = await dispatchTask(
+      execution.graph,
+      execution.node,
+      targets,
+      `task-${crypto.randomUUID().slice(0, 8)}`,
+      {
+        prompt: buildStandaloneWorkItemPrompt(
+          itemKind,
+          item,
+          prompt,
+          execution.route.routing,
+          scopeContext(store, item),
+          execution.project ? [execution.project] : undefined,
+        ),
+        title: `${itemKind === "task" ? "Task" : "Todo"} · ${item.title}${execution.project ? ` · ${execution.project.label || path.basename(execution.project.locator)}` : ""}`,
+      },
+    );
+    return {
+      locator: execution.project?.locator ?? null,
+      sessionId: result.sessionId,
+      resultSummary: result.resultSummary,
+      target: targetFor(execution.route),
+      position: index,
+    };
+  }));
+  return {
+    itemKind, itemId, completed: true, executionMode,
+    sessionId: dispatched[0]?.sessionId,
+    sessions: dispatched,
+    target: dispatched[0]?.target,
+  };
 }
 
-async function runStandaloneTask(taskId, requestedRouting, dryRun) {
-  return runStandaloneWorkItem("task", taskId, requestedRouting, dryRun);
+async function runStandaloneTask(taskId, requestedRouting, dryRun, executionMode, projectSessions) {
+  return runStandaloneWorkItem("task", taskId, requestedRouting, dryRun, executionMode, projectSessions);
 }
 
 async function runTodoThroughQuickTask(todoId, requestedRouting, dryRun, idempotencyKey) {
@@ -2237,6 +2467,14 @@ async function handleMessage(message) {
       return currentOrcaProject();
     case "link-task-projects":
       return linkTaskProjects(String(message.taskId || ""), message.paths, message.branch);
+    case "link-task-project-bundles":
+      return applyTaskProjectBundles(String(message.taskId || ""), message.bundles);
+    case "connect-task-project-bundles":
+      return connectTaskProjectBundles(
+        String(message.taskId || ""),
+        String(message.environment || ""),
+        message.selections,
+      );
     case "set-task-project-branch":
       return setTaskProjectBranch(
         String(message.taskId || ""),
@@ -2246,6 +2484,16 @@ async function handleMessage(message) {
       );
     case "set-graph-process":
       return setGraphProcess(String(message.graphId || ""), Number(message.expectedVersion), Boolean(message.enabled));
+    case "create-quick-graph": {
+      const result = await createQuickGraph(
+        String(message.sourceTaskId || ""),
+        Number(message.expectedTaskVersion),
+        message.name,
+        message.taskIds,
+      );
+      console.log(`[bridge] quick graph ${result.graphId} created`);
+      return result;
+    }
     case "configure-source": {
       const result = await configureDataSource(message.config, message.store);
       console.log(`[bridge] data source configured (${result.mode})`);
@@ -2276,7 +2524,13 @@ async function handleMessage(message) {
       return;
     case "run-task": {
       const taskId = String(message.taskId || "");
-      const result = await runStandaloneTask(taskId, message.routing, Boolean(message.dryRun));
+      const result = await runStandaloneTask(
+        taskId,
+        message.routing,
+        Boolean(message.dryRun),
+        message.executionMode,
+        message.projectSessions,
+      );
       console.log(`[bridge] task ${taskId} ${message.dryRun ? "planned" : "executed"}`);
       return result;
     }

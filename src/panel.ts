@@ -75,6 +75,8 @@ type TaskRunModalState = {
   itemKind: "task" | "todo";
   itemId: string;
   routing: RoutingTarget;
+  executionMode: "single_session" | "per_project";
+  projectRoutings: Record<string, RoutingTarget>;
   suggestedProjectId?: string;
 };
 
@@ -85,6 +87,7 @@ type RegistryProject = {
   kind?: string;
   repo_id?: string;
   remote?: string;
+  registryVersion?: number;
   worktrees?: Array<{
     id: string;
     path: string;
@@ -99,6 +102,7 @@ type TaskProjectContext = {
   taskVersion: number;
   projects: Array<{ id?: string; role: "related" | "target"; locatorKind: "folder" | "git"; locator: string; label?: string; branch?: string; position: number }>;
   registry: RegistryProject[];
+  registryVersions?: Record<string, number>;
   recommended: RegistryProject[];
   environment: string;
   current: { repoId?: string; path?: string; projectId?: string; branch?: string; worktreeId?: string } | null;
@@ -109,6 +113,7 @@ type ModalState =
   | { kind: "data-source"; error?: string }
   | RunModalState
   | TaskRunModalState
+  | { kind: "quick-graph"; sourceTaskId: string; name: string; query: string; selectedIds: string[]; busy: boolean; error?: string }
   | { kind: "task-delete"; taskId: string }
   | { kind: "history" }
   | { kind: "templates" }
@@ -213,8 +218,9 @@ let taskProjectContextState: TaskProjectContext | null = null;
 let taskProjectContextLoading = false;
 let taskProjectContextError = "";
 let currentOrcaProjectState: TaskProjectContext["current"] = null;
-let selectedTaskProjectPath = "";
-let selectedTaskProjectBranch = "";
+let taskProjectPickerEnvironment = "";
+let taskProjectPickerQuery = "";
+const selectedTaskProjectBundles = new Map<string, string>();
 const todoQuickRunKeys = new Map<string, { signature: string; key: string }>();
 const preparingTodoRuns = new Set<string>();
 if (!store.graphs.length) {
@@ -820,6 +826,18 @@ function taskTargetForGraphNode(node: GraphNode): NonNullable<LocalTask["project
     .sort((left, right) => left.position - right.position)[0];
 }
 
+function projectMatchesTaskLocator(projectId: string | undefined, projectPath: string | undefined, locator: string, environmentId: string): boolean {
+  if (projectPath === locator) return true;
+  return Boolean(projectId && targets.branches?.some((branch) => branch.projectId === projectId
+    && routeEnvironmentId(branch.environmentId) === environmentId
+    && branch.path === locator));
+}
+
+function projectForTaskLocator(locator: string, environmentId: string) {
+  return targets.projects.find((project) => routeEnvironmentId(project.environmentId) === environmentId
+    && projectMatchesTaskLocator(project.id, project.path, locator, environmentId));
+}
+
 function inferredTaskNodeRouting(graph: GraphDefinition, node: GraphNode): RoutingTarget {
   const target = taskTargetForGraphNode(node);
   if (!target) return {};
@@ -829,12 +847,11 @@ function inferredTaskNodeRouting(graph: GraphDefinition, node: GraphNode): Routi
   if (route.projectId) {
     const project = targets.projects.find((item) => item.id === route.projectId
       && routeEnvironmentId(item.environmentId) === environmentId);
-    return project?.path === target.locator && !route.branch && target.branch
+    return project && projectMatchesTaskLocator(project.id, project.path, target.locator, environmentId) && !route.branch && target.branch
       ? { branch: shortBranch(target.branch) }
       : {};
   }
-  const project = targets.projects.find((item) => routeEnvironmentId(item.environmentId) === environmentId
-    && item.path === target.locator);
+  const project = projectForTaskLocator(target.locator, environmentId);
   if (!project) return {};
   return {
     projectId: project.id,
@@ -892,6 +909,7 @@ function createRunModal(live: boolean): RunModalState {
 
 function createWorkItemRunModal(itemKind: "task" | "todo", item: LocalTask | LocalTodo): TaskRunModalState {
   const routing: RoutingTarget = { environmentId: routeEnvironmentId(undefined) };
+  const projectRoutings: Record<string, RoutingTarget> = {};
   let suggestedProjectId: string | undefined;
   const current = itemKind === "task" && taskProjectContextState?.taskId === item.id
     ? taskProjectContextState.current ?? currentOrcaProjectState
@@ -935,12 +953,16 @@ function createWorkItemRunModal(itemKind: "task" | "todo", item: LocalTask | Loc
     }
   }
   const task = itemKind === "task" ? item as LocalTask : undefined;
-  const targetFolder = task && taskProjectContextState?.taskId === task.id
-    ? taskProjectContextState.projects.find((project) => project.role === "target" && project.locatorKind === "folder")
-    : task?.projects?.find((project) => project.role === "target" && project.locatorKind === "folder");
+  const targetFolders = task && taskProjectContextState?.taskId === task.id
+    ? taskProjectContextState.projects.filter((project) => project.role === "target" && project.locatorKind === "folder")
+    : task?.projects?.filter((project) => project.role === "target" && project.locatorKind === "folder") ?? [];
+  const targetFolder = targetFolders[0];
   if (targetFolder) {
-    const project = targets.projects.find((item) => routeEnvironmentId(item.environmentId) === routing.environmentId
-      && item.path === targetFolder.locator);
+    delete routing.projectId;
+    delete routing.branch;
+    delete routing.sessionId;
+    suggestedProjectId = undefined;
+    const project = projectForTaskLocator(targetFolder.locator, routeEnvironmentId(routing.environmentId));
     if (project) {
       suggestedProjectId = project.id;
       routing.projectId = project.id;
@@ -948,12 +970,25 @@ function createWorkItemRunModal(itemKind: "task" | "todo", item: LocalTask | Loc
       else if (project.branch) routing.branch = shortBranch(project.branch);
     }
   }
-  if (targets.models.some((item) => item.id === "gpt-5.6-sol")) routing.model = "gpt-5.6-sol";
+  const defaultModel = targets.models.some((target) => target.id === "gpt-5.6-sol") ? "gpt-5.6-sol" : targets.models[0]?.id;
+  if (defaultModel) routing.model = defaultModel;
+  for (const targetFolder of targetFolders) {
+    const project = projectForTaskLocator(targetFolder.locator, routeEnvironmentId(routing.environmentId));
+    projectRoutings[targetFolder.locator] = {
+      environmentId: routeEnvironmentId(routing.environmentId),
+      ...(project ? { projectId: project.id } : {}),
+      ...(targetFolder.branch ? { branch: shortBranch(targetFolder.branch) }
+        : project?.branch ? { branch: shortBranch(project.branch) } : {}),
+      ...(defaultModel ? { model: defaultModel } : {}),
+    };
+  }
   return {
     kind: "task-run",
     itemKind,
     itemId: item.id,
     routing,
+    executionMode: "single_session",
+    projectRoutings,
     ...(suggestedProjectId ? { suggestedProjectId } : {}),
   };
 }
@@ -964,6 +999,64 @@ function createTaskRunModal(task: LocalTask): TaskRunModalState {
 
 function createTodoRunModal(todo: LocalTodo): TaskRunModalState {
   return createWorkItemRunModal("todo", todo);
+}
+
+function quickGraphCandidates(source: LocalTask): LocalTask[] {
+  return store.tasks.filter((task) => task.status !== "archived"
+    && task.domainId === source.domainId
+    && task.milestoneId === source.milestoneId);
+}
+
+function createOrderedTaskGraph(source: LocalTask, nameValue: string, taskIds: string[]): GraphDefinition {
+  const name = nameValue.trim();
+  if (!name || name.length > 200) throw new Error("그래프 이름은 1자 이상 200자 이하로 입력하십시오.");
+  if (source.status === "archived") throw new Error("보관된 Task에서는 그래프를 만들 수 없습니다.");
+  if (taskIds.length < 2 || taskIds.length > 100 || taskIds[0] !== source.id || new Set(taskIds).size !== taskIds.length) {
+    throw new Error("현재 Task를 첫 번째로 둔 서로 다른 Task 2개 이상 100개 이하를 선택하십시오.");
+  }
+  const candidates = new Map(quickGraphCandidates(source).map((task) => [task.id, task]));
+  const tasks = taskIds.map((taskId) => candidates.get(taskId));
+  if (tasks.some((task) => !task)) throw new Error("같은 Domain·Milestone의 활성 Task만 선택할 수 있습니다.");
+  const now = new Date().toISOString();
+  const nodes: GraphNode[] = tasks.map((task, index) => ({
+    id: newId("NODE"),
+    kind: "task",
+    label: `${index + 1}. ${task!.title}`,
+    x: 64 + index * (NODE_WIDTH + 64),
+    y: 96,
+    status: "pending",
+    joinMode: "all",
+    task: {
+      id: task!.id,
+      title: task!.title,
+      prompt: task!.prompt,
+      ...(task!.version !== undefined ? { version: task!.version } : {}),
+      ...(task!.metadata ? { metadata: structuredClone(task!.metadata) } : {}),
+    },
+    routing: {},
+    engineering: { role: "worker", contextMode: "inherit", maxAttempts: 1, permissions: ["read"] },
+  }));
+  return {
+    id: newId("graph"),
+    name,
+    summary: "",
+    status: "draft",
+    version: 1,
+    pinned: false,
+    processEnabled: false,
+    routineEnabled: false,
+    repeatMode: "none",
+    defaults: {},
+    runGuards: { claimLeaseSeconds: 21600, stagnationRuns: 3 },
+    engineering: { checkpointPolicy: "superstep", requireProvenance: true, humanGateForIrreversible: true, maturity: "experimental" },
+    nodes,
+    edges: nodes.slice(1).map((node, index) => ({
+      id: newId("edge"), from: nodes[index]!.id, to: node.id, kind: "sequence",
+    })),
+    runs: [],
+    createdAt: now,
+    updatedAt: now,
+  };
 }
 
 function runDraftGraph(graph: GraphDefinition, modal: RunModalState): GraphDefinition {
@@ -2087,6 +2180,44 @@ function renderModal(): string {
       <div class="modal-actions"><button data-action="close-modal">닫기</button>${refreshable ? `<button data-action="refresh-source" aria-busy="${view.sourceRefreshing}" ${view.sourceRefreshing ? "disabled" : ""}>${view.sourceRefreshing ? "새로고침 중…" : "원천 새로고침"}</button>` : ""}<button class="primary" data-action="save-source">설정 저장·연결</button></div>
     </section></div>`;
   }
+  if (view.modal.kind === "quick-graph") {
+    const modal = view.modal;
+    const source = store.tasks.find((task) => task.id === modal.sourceTaskId);
+    if (!source) {
+      return `<div class="modal-backdrop"><section class="modal" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="modal-title">
+        <div class="modal-head"><strong id="modal-title">빠른 그래프 구성</strong><button class="icon ghost" data-action="close-modal" data-modal-initial-focus aria-label="닫기">×</button></div>
+        <div class="modal-body"><p class="warning-list">현재 Task를 찾을 수 없습니다.</p></div>
+        <div class="modal-actions"><button data-action="close-modal">닫기</button></div>
+      </section></div>`;
+    }
+    const byId = new Map(quickGraphCandidates(source).map((task) => [task.id, task]));
+    const needle = modal.query.trim().toLocaleLowerCase("ko-KR");
+    const visible = [...byId.values()].filter((task) => task.id === source.id || !needle
+      || `${task.title} ${task.id}`.toLocaleLowerCase("ko-KR").includes(needle));
+    const scope = itemScope(source);
+    const invalidSelection = modal.selectedIds.length < 2 || modal.selectedIds.length > 100
+      || modal.selectedIds[0] !== source.id || new Set(modal.selectedIds).size !== modal.selectedIds.length
+      || modal.selectedIds.some((id) => !byId.has(id));
+    return `<div class="modal-backdrop"><section class="modal wide quick-graph-modal" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-head"><strong id="modal-title">빠른 그래프 구성</strong><span class="badge">${esc(source.id)}</span><button class="icon ghost" data-action="close-modal" data-modal-initial-focus aria-label="닫기">×</button></div>
+      <div class="modal-body">
+        <p class="help">현재 Task를 1번으로 고정하고 같은 Domain·Milestone의 Task를 고른 순서대로 연결합니다.</p>
+        ${modal.error ? `<p class="warning-list" role="alert">${esc(modal.error)}</p>` : ""}
+        <div class="quick-graph-heading"><label class="field"><span>새 그래프 이름</span><input data-action="quick-graph-name" value="${esc(modal.name)}" maxlength="200"></label><span class="quick-graph-scope"><span class="badge">${esc(scope.domain?.name ?? "Domain 미지정")}</span><span>›</span><span class="badge">${esc(scope.milestone?.name ?? "Milestone 미지정")}</span></span></div>
+        <section class="quick-graph-order" aria-label="선택한 실행 순서"><header><strong>실행 순서</strong><span>${modal.selectedIds.length}개 Task</span></header><ol>${modal.selectedIds.map((id, index) => {
+          const selected = id === source.id ? source : byId.get(id);
+          return `<li><span class="quick-graph-index">${index + 1}</span><span class="quick-graph-order-title" title="${esc(selected?.title ?? id)}">${esc(selected?.title ?? id)}</span>${index === 0 ? '<span class="badge">현재 Task</span>' : `<span class="quick-graph-order-actions"><button data-action="move-quick-graph-task" data-id="${esc(id)}" data-delta="-1" aria-label="${esc(selected?.title ?? id)} 순서 앞으로" ${modal.busy || index === 1 ? "disabled" : ""}>↑</button><button data-action="move-quick-graph-task" data-id="${esc(id)}" data-delta="1" aria-label="${esc(selected?.title ?? id)} 순서 뒤로" ${modal.busy || index === modal.selectedIds.length - 1 ? "disabled" : ""}>↓</button><button class="ghost" data-action="toggle-quick-graph-task" data-id="${esc(id)}" aria-label="${esc(selected?.title ?? id)} 선택 해제" ${modal.busy ? "disabled" : ""}>×</button></span>`}</li>`;
+        }).join("")}</ol></section>
+        <label class="field"><span>같은 범위 Task 검색</span><input data-action="quick-graph-search" value="${esc(modal.query)}" placeholder="Task 제목·ID 검색"></label>
+        <div class="quick-graph-candidates" role="listbox" aria-label="그래프 후보 Task">${visible.length ? visible.map((task) => {
+          const order = modal.selectedIds.indexOf(task.id);
+          const fixed = task.id === source.id;
+          return `<button role="option" aria-selected="${order >= 0 ? "true" : "false"}" class="quick-graph-candidate ${order >= 0 ? "selected" : ""}" data-action="toggle-quick-graph-task" data-id="${esc(task.id)}" ${modal.busy || fixed ? "disabled" : ""}><span class="quick-graph-index">${order >= 0 ? order + 1 : "+"}</span><span><strong>${esc(task.title)}</strong><small>${esc(taskStatusLabel[task.status])} · ${esc(task.id)}</small></span>${fixed ? '<span class="badge">시작점</span>' : order >= 0 ? `<span class="badge">${order + 1}번</span>` : ""}</button>`;
+        }).join("") : '<p class="help">같은 범위의 Task가 없습니다.</p>'}</div>
+      </div>
+      <div class="modal-actions quick-graph-footer"><span class="help">생성 결과: Task ${modal.selectedIds.length}개 · 순차 연결 ${Math.max(0, modal.selectedIds.length - 1)}개</span><button data-action="close-modal" ${modal.busy ? "disabled" : ""}>취소</button><button class="primary" data-action="confirm-quick-graph" ${modal.busy || !modal.name.trim() || invalidSelection ? "disabled" : ""}>${modal.busy ? "구성 중…" : "이 순서로 그래프 만들기"}</button></div>
+    </section></div>`;
+  }
   if (view.modal.kind === "task-run") {
     const modal = view.modal;
     const item = modal.itemKind === "task"
@@ -2101,6 +2232,12 @@ function renderModal(): string {
       </section></div>`;
     }
     const route = routingValue(modal.routing);
+    const taskTargetProjects = modal.itemKind === "task"
+      ? (taskProjectContextState?.taskId === item.id ? taskProjectContextState.projects : (item as LocalTask).projects ?? [])
+        .filter((project) => project.role === "target" && project.locatorKind === "folder")
+        .sort((left, right) => left.position - right.position)
+      : [];
+    const perProject = modal.itemKind === "task" && taskTargetProjects.length > 1 && modal.executionMode === "per_project";
     const target = route.sessionId
       ? `기존 세션 · ${sessionName(route.sessionId, route.environmentId)}`
       : route.projectId ? `새 세션 · ${projectName(route.projectId, route.environmentId)}` : "실행 대상 미지정";
@@ -2111,13 +2248,24 @@ function renderModal(): string {
     const prompt = modal.itemKind === "task"
       ? (item as LocalTask).prompt
       : currentMetaRevision(item)?.content || item.draft || (item as LocalTodo).notes;
+    const projectProblems = perProject ? taskTargetProjects.flatMap((project) => {
+      const projectRoute = routingValue(modal.projectRoutings[project.locator]);
+      const routeProject = targets.projects.find((targetProject) => targetProject.id === projectRoute.projectId
+        && routeEnvironmentId(targetProject.environmentId) === routeEnvironmentId(projectRoute.environmentId));
+      return [
+        ...(!routeProject || !projectMatchesTaskLocator(routeProject.id, routeProject.path, project.locator, routeEnvironmentId(projectRoute.environmentId))
+          ? [`${project.label ?? project.locator}: 선택 환경에서 Task 대상 경로와 일치하는 Orca 프로젝트가 없습니다.`]
+          : []),
+        ...routingProblemMessages(project.label ?? project.locator, projectRoute),
+      ];
+    }) : [];
     const problems = [
       ...(modal.itemKind === "task" && item.status === "archived" ? [`${item.title}: 보관된 Task는 실행할 수 없습니다.`] : []),
       ...(modal.itemKind === "todo" && item.status === "cancelled" ? [`${item.title}: 취소된 Todo는 실행할 수 없습니다.`] : []),
       ...(!prompt.trim() ? [`${item.title}: 실행할 Prompt가 없습니다.`] : []),
       ...(modal.itemKind === "task" && dataSource.config.mode === "structured" && !taskHasTargetProject(item.id) && !selectedRouteProject?.path
         ? [`${item.title}: 실행할 Orca 프로젝트를 하나 선택하십시오.`] : []),
-      ...routingProblemMessages(item.title, route),
+      ...(perProject ? projectProblems : routingProblemMessages(item.title, route)),
     ];
     const promptLabel = currentMetaRevision(item)?.status === "current" ? "현재 Meta Draft" : "현재 사람 Draft";
     return `<div class="modal-backdrop"><section class="modal wide run-modal" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="modal-title">
@@ -2125,10 +2273,17 @@ function renderModal(): string {
       <div class="modal-body">
         <section class="task-run-summary"><span class="badge">${esc(item.status)}</span><strong>${esc(item.title)}</strong><small>${esc(item.id)}</small></section>
         <p class="help">${modal.itemKind === "todo" ? `기존 연결 Task를 재사용하거나 새 Task를 원자적으로 만들고 연결한 뒤, ${promptLabel}를 선택한 Orca 워크트리에서 실행합니다. Todo 완료 상태는 자동으로 바뀌지 않습니다.` : `그래프 run이나 노드 claim을 만들지 않고 이 Task의 ${promptLabel}를 선택한 Orca 워크트리에서 독립 실행합니다. 원천 Task 상태는 자동으로 바뀌지 않습니다.`}</p>
+        ${taskTargetProjects.length > 1 ? `<label class="field"><span>다중 프로젝트 실행 방식</span><select data-scope="task-run-mode" data-field="executionMode">${option("single_session", "모두 한 세션 · 한 모델", modal.executionMode)}${option("per_project", "프로젝트마다 별도 세션 · 모델 개별 지정", modal.executionMode)}</select><small>Task 상세의 작업대상 프로젝트·브랜치를 그대로 사용합니다.</small></label>` : ""}
         <section class="section run-defaults">
           <div class="section-title">실행 대상 ${modal.suggestedProjectId && route.projectId === modal.suggestedProjectId ? '<span class="badge">현재 Orca 워크트리 자동 선택 · 컨텍스트 추천</span>' : ""}${willLinkTarget ? '<span class="badge good">실행 시 Task target 연결</span>' : ""}</div>
           ${willLinkTarget ? `<p class="help">선택한 프로젝트 하나와 작업 브랜치를 실행 직전에 ${modal.itemKind === "todo" ? "연결 Task" : "Task"}의 target · folder 관계로 CAS 저장합니다.</p>` : ""}
-          <div class="run-routing-grid">
+          ${perProject ? `<label class="field task-run-environment"><span>Orca 환경</span><select data-scope="task-run-routing" data-field="environmentId">${environmentOptions(route.environmentId)}</select></label><div class="task-project-run-grid" aria-label="Task 작업대상 프로젝트·브랜치">${taskTargetProjects.map((project) => {
+            const projectRoute = routingValue(modal.projectRoutings[project.locator]);
+            const routeProject = targets.projects.find((targetProject) => targetProject.id === projectRoute.projectId
+              && routeEnvironmentId(targetProject.environmentId) === routeEnvironmentId(projectRoute.environmentId));
+            const available = routeProject && projectMatchesTaskLocator(routeProject.id, routeProject.path, project.locator, routeEnvironmentId(projectRoute.environmentId));
+            return `<article class="task-project-run-card ${available ? "" : "missing"}"><header><strong>${esc(project.label ?? project.locator.split("/").filter(Boolean).at(-1) ?? project.locator)}</strong><span class="badge">${esc(projectRoute.branch ? shortBranch(projectRoute.branch) : "브랜치 미지정")}</span></header><code title="${esc(project.locator)}">${esc(project.locator)}</code><small>${available && routeProject ? esc(projectName(routeProject.id, projectRoute.environmentId)) : "선택 환경에서 프로젝트 없음"}</small><label class="field"><span>작업 브랜치</span><select data-scope="task-run-project-routing" data-field="branch" data-locator="${esc(project.locator)}">${branchOptions(projectRoute.projectId, projectRoute.branch, false, projectRoute.environmentId)}</select></label><label class="field"><span>AI 모델</span><select data-scope="task-run-project-routing" data-field="model" data-locator="${esc(project.locator)}">${modelOptions(projectRoute.model)}</select></label><label class="field"><span>Reasoning</span><select data-scope="task-run-project-routing" data-field="reasoning" data-locator="${esc(project.locator)}">${reasoningOptions(projectRoute.reasoning, projectRoute.model)}</select></label></article>`;
+          }).join("")}</div>` : `<div class="run-routing-grid">
             <label class="field"><span>Orca 환경</span><select data-scope="task-run-routing" data-field="environmentId">${environmentOptions(route.environmentId)}</select></label>
             <label class="field"><span>프로젝트</span><select data-scope="task-run-routing" data-field="projectId">${projectOptions(route.projectId, false, route.environmentId)}</select></label>
             <label class="field"><span>작업 브랜치</span><select data-scope="task-run-routing" data-field="branch">${branchOptions(route.projectId, route.branch, false, route.environmentId)}</select></label>
@@ -2136,7 +2291,8 @@ function renderModal(): string {
             <label class="field"><span>AI 모델</span><select data-scope="task-run-routing" data-field="model">${modelOptions(route.model)}</select></label>
             <label class="field"><span>Reasoning</span><select data-scope="task-run-routing" data-field="reasoning">${reasoningOptions(route.reasoning, route.model, { existingSession: Boolean(route.sessionId) })}</select></label>
           </div>
-          <div class="run-route-effective"><strong>${esc(environmentName(route.environmentId))} · ${esc(target)}${route.branch ? ` · ${esc(shortBranch(route.branch))}` : ""}</strong><span>AI · ${esc(modelName(route.model))}${route.reasoning ? ` · ${esc(route.reasoning)}` : ""}</span></div>
+          <div class="run-route-effective"><strong>${esc(environmentName(route.environmentId))} · ${esc(target)}${route.branch ? ` · ${esc(shortBranch(route.branch))}` : ""}</strong><span>AI · ${esc(modelName(route.model))}${route.reasoning ? ` · ${esc(route.reasoning)}` : ""}</span></div>`}
+          ${taskTargetProjects.length ? `<div class="task-run-target-summary"><strong>Task 상세와 동일한 작업대상 · ${taskTargetProjects.length}개</strong>${taskTargetProjects.map((project) => `<span><code>${esc(project.locator)}</code><b>${esc(project.branch || "브랜치 미지정")}</b></span>`).join("")}</div>` : ""}
         </section>
         ${problems.length ? `<div class="run-configuration-errors"><strong>실행 설정 확인</strong><ul class="finding-list">${problems.map((message) => `<li class="error"><b>대상</b> ${esc(message)}</li>`).join("")}</ul></div>` : `<p class="status-pill good">${itemLabel}와 워크트리 실행 대상이 준비되었습니다.</p>`}
         <p class="warning-list">실행하면 Orca 터미널/에이전트 세션이 실제로 생성되거나 선택한 기존 세션에 Prompt가 전송됩니다.</p>
@@ -2446,6 +2602,82 @@ function preferredRegistryBranch(project: RegistryProject): string {
     : "";
 }
 
+type PickerRegistryProject = RegistryProject & {
+  availableOnEnvironment: boolean;
+  sourcePath: string;
+  sourceWorktrees: NonNullable<RegistryProject["worktrees"]>;
+};
+
+function registryProjectIdentity(project: RegistryProject): string {
+  return project.remote?.trim().toLocaleLowerCase("en-US")
+    || `${project.kind ?? "folder"}:${project.name.trim().toLocaleLowerCase("ko-KR")}`;
+}
+
+function mergeRegistryWorktrees(...collections: Array<NonNullable<RegistryProject["worktrees"]>>): NonNullable<RegistryProject["worktrees"]> {
+  const merged = new Map<string, NonNullable<RegistryProject["worktrees"]>[number]>();
+  for (const worktree of collections.flat()) {
+    const branch = worktree.branch ? shortBranch(worktree.branch) : "";
+    const key = branch || worktree.path;
+    if (!merged.has(key)) merged.set(key, worktree);
+  }
+  return [...merged.values()];
+}
+
+function pickerRegistryProjects(context: TaskProjectContext, environment: string): PickerRegistryProject[] {
+  const source = context.registry.filter((project) => project.environment === "정석맥1");
+  const target = context.registry.filter((project) => project.environment === environment);
+  const sourceByIdentity = new Map(source.map((project) => [registryProjectIdentity(project), project]));
+  const targetIdentities = new Set(target.map(registryProjectIdentity));
+  const choices: PickerRegistryProject[] = target.map((project) => {
+    const sourceProject = sourceByIdentity.get(registryProjectIdentity(project));
+    return {
+      ...project,
+      availableOnEnvironment: true,
+      sourcePath: sourceProject?.path ?? project.path,
+      sourceWorktrees: mergeRegistryWorktrees(project.worktrees ?? [], sourceProject?.worktrees ?? []),
+    };
+  });
+  if (environment !== "정석맥1") {
+    for (const project of source) {
+      if (targetIdentities.has(registryProjectIdentity(project))) continue;
+      choices.push({
+        ...project,
+        availableOnEnvironment: false,
+        sourcePath: project.path,
+        sourceWorktrees: project.worktrees ?? [],
+      });
+    }
+  }
+  return choices;
+}
+
+function registryProjectGroup(project: RegistryProject): string {
+  const remoteParts = (project.remote ?? "").split("/").filter(Boolean);
+  if (remoteParts.length >= 3) return remoteParts.slice(1, -1).slice(0, 2).join(" / ");
+  if (remoteParts.length === 2) return remoteParts[0]!;
+  const pathParts = project.path.split("/").filter(Boolean);
+  const marker = pathParts.findIndex((part) => part === "source" || part === "soruce");
+  return (marker >= 0 ? pathParts.slice(marker + 1, -1) : pathParts.slice(-2, -1)).slice(0, 2).join(" / ") || "기타 프로젝트";
+}
+
+function pickerProjectBranches(project: PickerRegistryProject): NonNullable<RegistryProject["worktrees"]> {
+  return registryProjectWorktrees({ ...project, worktrees: project.sourceWorktrees });
+}
+
+function pickerProjectNeedsProvision(project: PickerRegistryProject, branch: string): boolean {
+  if (!project.availableOnEnvironment) return true;
+  if (!branch) return false;
+  return !registryProjectWorktrees(project).some((worktree) => shortBranch(worktree.branch ?? "") === branch);
+}
+
+function projectEnvironmentLabel(environment: string, current: string): string {
+  if (environment === current) return `${environment} · 이 장치`;
+  if (environment === "정석맥1") return "정석맥1 · jsj1";
+  if (environment === "정석맥2") return "정석맥2 · jsj2";
+  if (environment === "jsj-air") return "jsj-air · MacBook Air";
+  return environment;
+}
+
 function taskProjectSection(task: LocalTask): string {
   if (dataSource.config.mode !== "structured") return "";
   const context = taskProjectContextState?.taskId === task.id ? taskProjectContextState : null;
@@ -2454,22 +2686,42 @@ function taskProjectSection(task: LocalTask): string {
   if (!context) return `<section class="section task-projects"><div class="section-title">대상 프로젝트</div><button data-action="reload-task-projects" data-id="${esc(task.id)}">현재 Orca 프로젝트 감지</button></section>`;
   const taskProjects = [...context.projects].sort((left, right) => left.position - right.position);
   const targetProjects = taskProjects.filter((project) => project.role === "target" && project.locatorKind === "folder");
-  const localProjects = context.registry.filter((project) => project.environment === context.environment);
   const connectedPaths = new Set(taskProjects.map((project) => project.locator));
   const recommendedPaths = new Set(context.recommended.map((project) => project.path));
-  const selectedProject = localProjects.find((project) => project.path === selectedTaskProjectPath);
-  const selectedWorktrees = registryProjectWorktrees(selectedProject);
+  const environment = taskProjectPickerEnvironment || context.environment;
+  const choices = pickerRegistryProjects(context, environment);
+  const needle = taskProjectPickerQuery.trim().toLocaleLowerCase("ko-KR");
+  const filtered = needle ? choices.filter((project) => [
+    project.name, project.path, project.remote ?? "",
+    ...project.sourceWorktrees.map((worktree) => worktree.branch ?? ""),
+  ].join(" ").toLocaleLowerCase("ko-KR").includes(needle)) : choices;
+  const groups = new Map<string, PickerRegistryProject[]>();
+  for (const project of filtered) groups.set(registryProjectGroup(project), [...(groups.get(registryProjectGroup(project)) ?? []), project]);
+  const grouped = [...groups.entries()].sort(([left], [right]) => left.localeCompare(right, "ko"));
+  const selectedProjects = choices.filter((project) => selectedTaskProjectBundles.has(project.sourcePath));
+  const provisionCount = selectedProjects.filter((project) => pickerProjectNeedsProvision(
+    project, selectedTaskProjectBundles.get(project.sourcePath) ?? "",
+  )).length;
+  const environments = [...new Set([context.environment, "정석맥1", "정석맥2", "jsj-air", "Hermes", ...context.registry.map((project) => project.environment)])];
   return `<section class="section task-projects"><div class="section-title">대상 프로젝트 · ${targetProjects.length} ${!targetProjects.length && context.recommended.length ? '<span class="badge">현재 컨텍스트 추천</span>' : ""}<button class="icon ghost" data-action="reload-task-projects" data-id="${esc(task.id)}" aria-label="프로젝트 다시 감지">↻</button></div>
     ${taskProjects.length ? `<ul class="work-link-list task-project-list">${taskProjects.map((project) => `<li><span><strong>${esc(project.label ?? project.locator.split("/").at(-1) ?? project.locator)}</strong><code>${esc(project.locator)}</code><small>${project.role === "target" ? "대상" : "관련"} · ${project.locatorKind}</small></span><label class="task-project-branch"><span>작업 브랜치</span><input data-scope="task-project-branch" data-task-id="${esc(task.id)}" data-project-id="${esc(project.id ?? "")}" data-locator="${esc(project.locator)}" value="${esc(project.branch ?? "")}" placeholder="예: feature/task-42"></label></li>`).join("")}</ul>` : '<p class="help">연결된 대상 프로젝트가 없습니다.</p>'}
     <p class="help">Task 실행 시 target · folder 경로와 작업 브랜치에 정확히 일치하는 Orca 워크트리를 우선 선택합니다.</p>
-    ${localProjects.length ? `<details class="registry-project-picker" ${!targetProjects.length ? "open" : ""}><summary>이 장치의 프로젝트에서 추가</summary><p class="help">Orca에 구성된 프로젝트와 실제 워크트리에서 작업 위치를 고릅니다.</p><div class="registry-project-list" role="radiogroup" aria-label="Orca 프로젝트">${localProjects.map((project) => {
-      const selected = project.path === selectedTaskProjectPath;
-      const connected = connectedPaths.has(project.path);
-      return `<button type="button" role="radio" aria-checked="${selected}" class="registry-project ${recommendedPaths.has(project.path) ? "recommended" : ""} ${selected ? "selected" : ""}" data-action="select-task-project" data-path="${esc(project.path)}" ${connected ? "disabled" : ""}><span class="registry-project-radio" aria-hidden="true">${selected ? "✓" : ""}</span><span><strong>${esc(project.name)}</strong><code>${esc(project.path)}</code><small>${esc(project.environment)} · 워크트리 ${project.worktrees?.length ?? 0}${recommendedPaths.has(project.path) ? " · 추천" : ""}${connected ? " · 연결됨" : ""}</small></span></button>`;
-    }).join("")}</div>${selectedProject ? `<div class="registry-worktree-picker"><label class="field"><span>Orca 워크트리 브랜치</span><select data-scope="task-project-candidate" data-field="branch">${option("", "브랜치 지정 안 함", selectedTaskProjectBranch)}${selectedWorktrees.map((worktree) => {
-      const branch = shortBranch(worktree.branch!);
-      return option(branch, `${branch}${worktree.is_main ? " · 기본" : ""}`, selectedTaskProjectBranch);
-    }).join("")}</select></label><p class="help">Orca에 실제로 구성된 워크트리 브랜치만 표시합니다.</p><button class="primary" data-action="connect-task-projects" data-id="${esc(task.id)}">Task 작업대상으로 추가</button></div>` : ""}</details>` : '<p class="warning-list">이 장치의 게시된 Orca 프로젝트가 없습니다. Orca 대상 새로고침을 실행하십시오.</p>'}
+    <details class="registry-project-picker" ${!targetProjects.length ? "open" : ""}><summary>Orca 프로젝트·브랜치 선택</summary>
+      <div class="registry-picker-toolbar"><label class="field"><span>실행 장치</span><select data-scope="task-project-picker" data-field="environment">${environments.map((value) => option(value, projectEnvironmentLabel(value, context.environment), environment)).join("")}</select></label><label class="field"><span>프로젝트 검색</span><input data-action="task-project-search" value="${esc(taskProjectPickerQuery)}" placeholder="프로젝트명, 경로, remote, 브랜치"></label></div>
+      <p class="help">프로젝트와 실제 Orca 워크트리 브랜치를 한 묶음으로 여러 개 선택합니다. 선택 장치에 없으면 Git remote를 사용해 준비합니다.</p>
+      ${choices.length ? `<div class="registry-project-groups" role="group" aria-label="Orca 프로젝트·브랜치 다중 선택">${grouped.map(([label, projects]) => `<section class="registry-project-group"><header><strong>${esc(label)}</strong><span>${projects.length}</span></header><div class="registry-project-list">${projects.sort((left, right) => left.name.localeCompare(right.name, "ko")).map((project) => {
+        const selected = selectedTaskProjectBundles.has(project.sourcePath);
+        const selectedBranch = selectedTaskProjectBundles.get(project.sourcePath) ?? preferredRegistryBranch({ ...project, worktrees: project.sourceWorktrees });
+        const connected = connectedPaths.has(project.path);
+        const needsProvision = pickerProjectNeedsProvision(project, selectedBranch);
+        const recommended = environment === context.environment && recommendedPaths.has(project.path);
+        return `<article class="registry-project ${recommended ? "recommended" : ""} ${selected ? "selected" : ""} ${connected ? "connected" : ""}"><input type="checkbox" data-action="toggle-task-project" data-source-path="${esc(project.sourcePath)}" aria-label="${esc(project.name)} 프로젝트 선택" ${selected ? "checked" : ""} ${connected ? "disabled" : ""}><span><strong>${esc(project.name)}</strong><code title="${esc(project.path)}">${esc(project.path)}</code><small>${project.availableOnEnvironment ? `워크트리 ${project.worktrees?.length ?? 0}` : "이 장치에 없음"}${recommended ? " · 추천" : ""}${connected ? " · 연결됨" : ""}${needsProvision ? " · 준비 필요" : ""}</small><select aria-label="${esc(project.name)} 작업 브랜치" data-scope="task-project-picker" data-field="branch" data-source-path="${esc(project.sourcePath)}" ${connected ? "disabled" : ""}>${option("", "브랜치 지정 안 함", selectedBranch)}${pickerProjectBranches(project).map((worktree) => {
+          const branch = shortBranch(worktree.branch!);
+          return option(branch, `${branch}${worktree.is_main ? " · 기본" : ""}`, selectedBranch);
+        }).join("")}</select></span></article>`;
+      }).join("")}</div></section>`).join("")}${!grouped.length ? '<p class="help">검색 결과가 없습니다.</p>' : ""}</div>` : '<p class="warning-list">선택한 장치에 게시되었거나 기준 장치에서 준비할 수 있는 Orca 프로젝트가 없습니다.</p>'}
+      <div class="registry-picker-actions"><span>현재 ${selectedProjects.length}개 선택${provisionCount ? ` · ${provisionCount}개 장치 준비 필요` : ""}</span><button class="primary" data-action="connect-task-projects" data-id="${esc(task.id)}" ${selectedProjects.length ? "" : "disabled"}>선택 ${selectedProjects.length}개 작업대상으로 추가</button></div>
+    </details>
   </section>`;
 }
 
@@ -2479,7 +2731,7 @@ function taskInspector(task: LocalTask): string {
     <header class="work-detail-header">
       <button class="back-button" data-action="back-to-task-list" aria-label="Task 목록으로 돌아가기">← Task 목록</button>
       <div><span class="badge priority-${task.priority}">${priorityLabel[task.priority]}</span><strong>${esc(task.title)}</strong><small>${esc(task.id)}</small></div>
-      <button class="primary task-run-button" data-action="open-task-run" data-id="${esc(task.id)}">⚡ 워크트리 빠른 실행</button>
+      <span class="work-detail-actions"><button data-action="open-quick-graph" data-id="${esc(task.id)}" ${task.status === "archived" ? "disabled" : ""}>빠른 그래프 구성</button><button class="primary task-run-button" data-action="open-task-run" data-id="${esc(task.id)}">⚡ 워크트리 빠른 실행</button></span>
     </header>
     <div class="work-detail-body">
       <label class="field"><span>제목</span><input data-scope="local-task" data-field="title" value="${esc(task.title)}"></label>
@@ -3199,8 +3451,9 @@ async function loadTaskProjectContext(taskId: string): Promise<TaskProjectContex
     if (!result) return null;
     taskProjectContextState = result;
     currentOrcaProjectState = result.current;
-    selectedTaskProjectPath = "";
-    selectedTaskProjectBranch = "";
+    taskProjectPickerEnvironment = result.environment;
+    taskProjectPickerQuery = "";
+    selectedTaskProjectBundles.clear();
     const connected = new Set(result.projects.map((project) => project.locator));
     const unconnectedRecommendations = result.recommended.filter((project) => !connected.has(project.path));
     const hasTargetProject = result.projects.some((project) => project.role === "target" && project.locatorKind === "folder");
@@ -3208,11 +3461,17 @@ async function loadTaskProjectContext(taskId: string): Promise<TaskProjectContex
       ? unconnectedRecommendations[0]
       : undefined;
     if (recommended) {
-      selectedTaskProjectPath = recommended.path;
-      selectedTaskProjectBranch = preferredRegistryBranch(recommended);
+      const choice = pickerRegistryProjects(result, result.environment).find((project) => project.path === recommended.path);
+      if (choice) selectedTaskProjectBundles.set(
+        choice.sourcePath,
+        preferredRegistryBranch({ ...choice, worktrees: choice.sourceWorktrees }),
+      );
     }
     const task = store.tasks.find((item) => item.id === taskId);
-    if (task) task.projects = result.projects;
+    if (task) {
+      task.version = result.taskVersion;
+      task.projects = result.projects;
+    }
     return result;
   } catch (error) {
     taskProjectContextError = error instanceof Error ? error.message : String(error);
@@ -3241,38 +3500,32 @@ async function updateTaskProjectBranch(taskId: string, projectId: string, locato
 }
 
 async function connectSelectedTaskProjects(taskId: string): Promise<void> {
-  const projectPath = selectedTaskProjectPath;
-  if (!projectPath) { toast("연결할 Orca 프로젝트를 선택하십시오."); return; }
+  const context = taskProjectContextState?.taskId === taskId ? taskProjectContextState : null;
+  if (!context) { toast("Task 프로젝트 정본을 먼저 다시 확인하십시오."); return; }
+  const environment = taskProjectPickerEnvironment || context.environment;
+  const choices = pickerRegistryProjects(context, environment);
+  const selected = choices.filter((project) => selectedTaskProjectBundles.has(project.sourcePath));
+  if (!selected.length) { toast("연결할 Orca 프로젝트를 하나 이상 선택하십시오."); return; }
   try {
-    const modalBranch = view.modal?.kind === "task-run" && view.modal.itemKind === "task" && view.modal.itemId === taskId
-      ? view.modal.routing.branch
-      : taskProjectContextState?.current?.branch;
-    const branch = selectedTaskProjectBranch || (modalBranch ? shortBranch(modalBranch) : "");
-    const result = await sendBridge<{ context: TaskProjectContext; store?: GraphStore }>({
-      type: "link-task-projects", taskId, paths: [projectPath],
-      ...(branch ? { branch } : {}),
+    const result = await sendBridge<{ context: TaskProjectContext; store?: GraphStore; provisioned?: number }>({
+      type: "connect-task-project-bundles",
+      taskId,
+      environment,
+      selections: selected.map((project) => ({
+        sourcePath: project.sourcePath,
+        targetPath: project.availableOnEnvironment ? project.path : undefined,
+        label: project.name,
+        branch: selectedTaskProjectBundles.get(project.sourcePath) ?? "",
+      })),
     });
     if (!result) return;
     if (result.store) store = normalizeGraphStore(result.store);
     taskProjectContextState = result.context;
     const task = store.tasks.find((item) => item.id === taskId);
     if (task) task.projects = result.context.projects;
-    if (view.modal?.kind === "task-run" && view.modal.itemKind === "task" && view.modal.itemId === taskId) {
-      const environmentId = routeEnvironmentId(view.modal.routing.environmentId);
-      const project = targets.projects.find((item) => routeEnvironmentId(item.environmentId) === environmentId
-        && item.path === projectPath);
-      const relation = result.context.projects.find((item) => item.role === "target"
-        && item.locatorKind === "folder" && item.locator === projectPath);
-      if (project) {
-        view.modal.routing.projectId = project.id;
-        if (relation?.branch) view.modal.routing.branch = shortBranch(relation.branch);
-        else if (project.branch) view.modal.routing.branch = shortBranch(project.branch);
-      }
-    }
-    selectedTaskProjectPath = "";
-    selectedTaskProjectBranch = "";
+    selectedTaskProjectBundles.clear();
     render();
-    toast("Task 대상 프로젝트를 연결했습니다.");
+    toast(`Task 대상 프로젝트 ${selected.length}개를 연결했습니다.${result.provisioned ? ` · ${result.provisioned}개 장치 준비 완료` : ""}`);
   } catch (error) {
     await loadTaskProjectContext(taskId);
     toast(error instanceof Error ? error.message : String(error));
@@ -3728,13 +3981,108 @@ app.addEventListener("click", (event) => {
       if (taskId) void loadTaskProjectContext(taskId);
       break;
     }
-    case "select-task-project": {
-      const projectPath = target.dataset.path;
-      if (!projectPath) return;
-      const project = taskProjectContextState?.registry.find((item) => item.path === projectPath);
-      if (!project) return;
-      selectedTaskProjectPath = projectPath;
-      selectedTaskProjectBranch = preferredRegistryBranch(project);
+    case "open-quick-graph": {
+      const task = store.tasks.find((item) => item.id === target.dataset.id && item.status !== "archived");
+      if (!task) return;
+      openModal({
+        kind: "quick-graph", sourceTaskId: task.id, name: `${task.title} · 빠른 흐름`,
+        query: "", selectedIds: [task.id], busy: false,
+      });
+      break;
+    }
+    case "toggle-quick-graph-task": {
+      if (view.modal?.kind !== "quick-graph" || view.modal.busy) return;
+      const modal = view.modal;
+      const taskId = target.dataset.id;
+      const source = store.tasks.find((item) => item.id === modal.sourceTaskId);
+      if (!taskId || !source || taskId === source.id || !quickGraphCandidates(source).some((item) => item.id === taskId)) return;
+      const selected = modal.selectedIds;
+      modal.selectedIds = selected.includes(taskId) ? selected.filter((id) => id !== taskId) : [...selected, taskId];
+      delete modal.error;
+      render();
+      break;
+    }
+    case "move-quick-graph-task": {
+      if (view.modal?.kind !== "quick-graph" || view.modal.busy) return;
+      const taskId = target.dataset.id;
+      const delta = Number(target.dataset.delta);
+      if (!taskId || ![-1, 1].includes(delta)) return;
+      const index = view.modal.selectedIds.indexOf(taskId);
+      const destination = index + delta;
+      if (index <= 0 || destination <= 0 || destination >= view.modal.selectedIds.length) return;
+      const selected = [...view.modal.selectedIds];
+      [selected[index], selected[destination]] = [selected[destination]!, selected[index]!];
+      view.modal.selectedIds = selected;
+      render();
+      break;
+    }
+    case "confirm-quick-graph": {
+      if (view.modal?.kind !== "quick-graph" || view.modal.busy) return;
+      const modal = view.modal;
+      const source = store.tasks.find((item) => item.id === modal.sourceTaskId);
+      if (!source) return;
+      if (dataSource.config.mode !== "structured") {
+        try {
+          const quickGraph = createOrderedTaskGraph(source, modal.name, modal.selectedIds);
+          store.graphs.push(quickGraph);
+          store.activeGraphId = quickGraph.id;
+          view.mode = "canvas";
+          view.graphTrail = [];
+          clearGraphSelection();
+          view.dirty = true;
+          closeModal();
+          toast(`Task ${quickGraph.nodes.length}개를 순서대로 연결한 그래프를 만들었습니다.`);
+          window.setTimeout(fitGraph, 0);
+        } catch (error) {
+          modal.error = error instanceof Error ? error.message : String(error);
+          render();
+        }
+        break;
+      }
+      const expectedTaskVersion = Number(source.version ?? 0);
+      if (!Number.isInteger(expectedTaskVersion) || expectedTaskVersion <= 0) {
+        modal.error = "Task의 최신 CAS version을 읽지 못했습니다. Task 프로젝트를 다시 감지한 뒤 시도하십시오.";
+        render();
+        return;
+      }
+      modal.busy = true;
+      delete modal.error;
+      render();
+      void sendBridge<{ graphId: string; store?: GraphStore }>({
+        type: "create-quick-graph",
+        sourceTaskId: source.id,
+        expectedTaskVersion,
+        name: modal.name.trim(),
+        taskIds: [...modal.selectedIds],
+      }).then((result) => {
+        if (!result) return;
+        if (result.store) store = normalizeGraphStore(result.store);
+        if (result.graphId && store.graphs.some((graph) => graph.id === result.graphId)) store.activeGraphId = result.graphId;
+        view.mode = "canvas";
+        view.graphTrail = [];
+        clearGraphSelection();
+        closeModal();
+        toast(`Task ${modal.selectedIds.length}개를 순서대로 연결한 그래프를 원천에 만들었습니다.`);
+        window.setTimeout(fitGraph, 0);
+      }).catch((error) => {
+        if (view.modal?.kind !== "quick-graph") return;
+        view.modal.busy = false;
+        view.modal.error = error instanceof Error ? error.message : String(error);
+        render();
+      });
+      break;
+    }
+    case "toggle-task-project": {
+      const sourcePath = target.dataset.sourcePath;
+      const context = taskProjectContextState;
+      if (!sourcePath || !context) return;
+      if (selectedTaskProjectBundles.has(sourcePath)) selectedTaskProjectBundles.delete(sourcePath);
+      else {
+        const project = pickerRegistryProjects(context, taskProjectPickerEnvironment || context.environment)
+          .find((item) => item.sourcePath === sourcePath);
+        if (!project) return;
+        selectedTaskProjectBundles.set(sourcePath, preferredRegistryBranch({ ...project, worktrees: project.sourceWorktrees }));
+      }
       render();
       break;
     }
@@ -4272,14 +4620,33 @@ app.addEventListener("click", (event) => {
     }
     case "confirm-task-run": {
       if (view.modal?.kind !== "task-run") return;
-      const { itemKind, itemId } = view.modal;
-      const routing = routingValue(view.modal.routing);
+      const modal = view.modal;
+      const { itemKind, itemId } = modal;
+      const routing = routingValue(modal.routing);
       const routeProject = targets.projects.find((item) => item.id === routing.projectId
         && routeEnvironmentId(item.environmentId) === routeEnvironmentId(routing.environmentId));
-      const prepare = itemKind === "task" && dataSource.config.mode === "structured" && routeProject?.path
+      const task = itemKind === "task" ? store.tasks.find((item) => item.id === itemId) : undefined;
+      const targetProjects = itemKind === "task"
+        ? (taskProjectContextState?.taskId === itemId ? taskProjectContextState.projects : task?.projects ?? [])
+          .filter((project) => project.role === "target" && project.locatorKind === "folder")
+          .sort((left, right) => left.position - right.position)
+        : [];
+      const perProject = itemKind === "task" && targetProjects.length > 1 && modal.executionMode === "per_project";
+      const bundles = perProject
+        ? targetProjects.map((project) => ({
+            path: project.locator,
+            label: project.label,
+            branch: modal.projectRoutings[project.locator]?.branch ? shortBranch(modal.projectRoutings[project.locator]!.branch!) : "",
+          }))
+        : targetProjects[0] ? [{
+            path: targetProjects[0].locator,
+            label: targetProjects[0].label,
+            branch: routing.branch ? shortBranch(routing.branch) : "",
+          }]
+          : routeProject?.path ? [{ path: routeProject.path, branch: routing.branch ? shortBranch(routing.branch) : "" }] : [];
+      const prepare = itemKind === "task" && dataSource.config.mode === "structured" && bundles.length
         ? sendBridge<{ context: TaskProjectContext; store?: GraphStore }>({
-            type: "link-task-projects", taskId: itemId, paths: [routeProject.path],
-            ...(routing.branch ? { branch: shortBranch(routing.branch) } : {}),
+            type: "link-task-project-bundles", taskId: itemId, bundles,
           }).then((linked) => {
             if (linked?.store) store = normalizeGraphStore(linked.store);
             if (linked?.context) taskProjectContextState = linked.context;
@@ -4287,17 +4654,22 @@ app.addEventListener("click", (event) => {
         : dataSource.config.mode === "structured" ? Promise.resolve() : saveStore(false);
       closeModal();
       void prepare
-        .then(() => sendBridge<{ sessionId?: string }>({
+        .then(() => sendBridge<{ sessionId?: string; sessions?: Array<{ sessionId?: string }> }>({
           type: itemKind === "task" ? "run-task" : "run-todo",
           ...(itemKind === "task" ? { taskId: itemId } : { todoId: itemId }),
           ...(itemKind === "todo"
             ? { idempotencyKey: todoQuickRunIdempotencyKey(store.todos.find((item) => item.id === itemId)!) }
             : {}),
           routing,
+          ...(itemKind === "task" ? { executionMode: perProject ? "per_project" : "single_session" } : {}),
+          ...(perProject ? { projectSessions: targetProjects.map((project) => ({
+            locator: project.locator,
+            routing: routingValue(modal.projectRoutings[project.locator]),
+          })) } : {}),
           dryRun: false,
         }))
         .then((result) => toast(result?.sessionId
-          ? `${itemKind === "task" ? "Task" : "Todo"} 실행을 마쳤습니다 · ${result.sessionId}`
+          ? `${itemKind === "task" ? "Task" : "Todo"} 실행을 마쳤습니다 · ${result.sessions?.length && result.sessions.length > 1 ? `${result.sessions.length}개 세션` : result.sessionId}`
           : `${itemKind === "task" ? "Task" : "Todo"} 워크트리 실행을 요청했습니다.`))
         .catch((error) => toast(error instanceof Error ? error.message : String(error)));
       break;
@@ -4364,6 +4736,19 @@ app.addEventListener("change", (event) => {
     else if (field === "inputPrompt") view.modal.inputPrompt = input.value;
     render();
     return;
+  } else if (scope === "task-run-mode" && view.modal?.kind === "task-run") {
+    view.modal.executionMode = input.value === "per_project" ? "per_project" : "single_session";
+    render();
+    return;
+  } else if (scope === "task-run-project-routing" && view.modal?.kind === "task-run") {
+    const locator = input.dataset.locator;
+    if (!locator || !view.modal.projectRoutings[locator]) return;
+    const routing = view.modal.projectRoutings[locator]!;
+    if (raw) (routing as Record<string, unknown>)[field] = raw;
+    else delete (routing as Record<string, unknown>)[field];
+    if (field === "model") delete routing.reasoning;
+    render();
+    return;
   } else if (scope === "task-run-routing" && view.modal?.kind === "task-run") {
     const modal = view.modal;
     if (raw) (modal.routing as Record<string, unknown>)[field] = raw;
@@ -4373,6 +4758,26 @@ app.addEventListener("change", (event) => {
       delete view.modal.routing.branch;
       delete view.modal.routing.sessionId;
       delete view.modal.routing.reasoning;
+      const task = modal.itemKind === "task" ? store.tasks.find((item) => item.id === modal.itemId) : undefined;
+      const taskProjects = taskProjectContextState?.taskId === modal.itemId
+        ? taskProjectContextState.projects
+        : task?.projects ?? [];
+      const targetProjects = taskProjects.filter((project) => project.role === "target" && project.locatorKind === "folder")
+        .sort((left, right) => left.position - right.position);
+      for (const project of targetProjects) {
+        const projectRouting = modal.projectRoutings[project.locator] ??= {};
+        projectRouting.environmentId = input.value;
+        delete projectRouting.projectId;
+        delete projectRouting.sessionId;
+        const routeProject = projectForTaskLocator(project.locator, routeEnvironmentId(input.value));
+        if (routeProject) projectRouting.projectId = routeProject.id;
+        if (project.branch) projectRouting.branch = shortBranch(project.branch);
+        else if (routeProject?.branch) projectRouting.branch = shortBranch(routeProject.branch);
+        else delete projectRouting.branch;
+      }
+      const primary = targetProjects[0] ? modal.projectRoutings[targetProjects[0].locator] : undefined;
+      if (primary?.projectId) modal.routing.projectId = primary.projectId;
+      if (primary?.branch) modal.routing.branch = primary.branch;
     } else if (field === "projectId" && typeof raw === "string" && raw) {
       const project = targets.projects.find((item) => item.id === raw
         && routeEnvironmentId(item.environmentId) === routeEnvironmentId(modal.routing.environmentId));
@@ -4436,8 +4841,15 @@ app.addEventListener("change", (event) => {
     if (!taskId || !locator) return;
     void updateTaskProjectBranch(taskId, input.dataset.projectId ?? "", locator, input.value);
     return;
-  } else if (scope === "task-project-candidate" && field === "branch") {
-    selectedTaskProjectBranch = input.value ? shortBranch(input.value) : "";
+  } else if (scope === "task-project-picker") {
+    if (field === "environment") {
+      taskProjectPickerEnvironment = input.value;
+      selectedTaskProjectBundles.clear();
+    } else if (field === "branch") {
+      const sourcePath = input.dataset.sourcePath;
+      if (!sourcePath) return;
+      selectedTaskProjectBundles.set(sourcePath, input.value ? shortBranch(input.value) : "");
+    }
     render();
     return;
   } else if (scope === "run-condition" && view.modal?.kind === "run") {
@@ -4694,18 +5106,24 @@ app.addEventListener("change", (event) => {
 });
 
 app.addEventListener("input", (event) => {
-  const input = (event.target as HTMLElement).closest<HTMLInputElement>('[data-action="graph-search"], [data-action="work-search"], [data-action="scope-search"], [data-action="node-search"]');
+  const input = (event.target as HTMLElement).closest<HTMLInputElement>('[data-action="graph-search"], [data-action="work-search"], [data-action="scope-search"], [data-action="node-search"], [data-action="task-project-search"], [data-action="quick-graph-name"], [data-action="quick-graph-search"]');
   if (!input || (event as InputEvent).isComposing) return;
   const workSearch = input.dataset.action === "work-search";
   const scopeSearch = input.dataset.action === "scope-search";
   const nodeSearch = input.dataset.action === "node-search";
+  const taskProjectSearch = input.dataset.action === "task-project-search";
+  const quickGraphName = input.dataset.action === "quick-graph-name";
+  const quickGraphSearch = input.dataset.action === "quick-graph-search";
   if (workSearch) view.workQuery = input.value;
   else if (scopeSearch) view.scopeQuery = input.value;
   else if (nodeSearch) view.nodeQuery = input.value;
+  else if (taskProjectSearch) taskProjectPickerQuery = input.value;
+  else if (quickGraphName && view.modal?.kind === "quick-graph") view.modal.name = input.value;
+  else if (quickGraphSearch && view.modal?.kind === "quick-graph") view.modal.query = input.value;
   else view.graphQuery = input.value;
   const start = input.selectionStart;
   render();
-  const next = app.querySelector<HTMLInputElement>(workSearch ? '[data-action="work-search"]' : scopeSearch ? '[data-action="scope-search"]' : nodeSearch ? '[data-action="node-search"]' : '[data-action="graph-search"]');
+  const next = app.querySelector<HTMLInputElement>(workSearch ? '[data-action="work-search"]' : scopeSearch ? '[data-action="scope-search"]' : nodeSearch ? '[data-action="node-search"]' : taskProjectSearch ? '[data-action="task-project-search"]' : quickGraphName ? '[data-action="quick-graph-name"]' : quickGraphSearch ? '[data-action="quick-graph-search"]' : '[data-action="graph-search"]');
   next?.focus();
   if (start !== null) next?.setSelectionRange(start, start);
 });

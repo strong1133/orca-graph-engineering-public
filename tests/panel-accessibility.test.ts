@@ -157,6 +157,61 @@ describe.each([
     }
   });
 
+  it("creates an ordered quick graph from Tasks in the same Domain and Milestone", async () => {
+    const now = "2026-08-10T00:00:00.000Z";
+    const task = (id: string, title: string, milestoneId = "milestone-a", status = "ready") => ({
+      id, title, prompt: `Prompt ${title}`, draft: `Prompt ${title}`, promptRevisions: [],
+      domainId: "domain-a", milestoneId, status, priority: "medium", tags: [], createdAt: now, updatedAt: now,
+    });
+    const dom = await mountPanel(wide, ({ store }) => {
+      store.domains = [{
+        id: "domain-a", name: "Delivery", summary: "", objectives: "", commonNotes: "", constraintNotes: "",
+        status: "active", owners: [], version: 1, createdAt: now, updatedAt: now,
+      }];
+      store.milestones = [
+        { id: "milestone-a", domainId: "domain-a", name: "Release A", summary: "", objectives: "", commonNotes: "", constraintNotes: "", status: "active", priority: "medium", successCriteria: [], owners: [], version: 1, createdAt: now, updatedAt: now },
+        { id: "milestone-b", domainId: "domain-a", name: "Release B", summary: "", objectives: "", commonNotes: "", constraintNotes: "", status: "active", priority: "medium", successCriteria: [], owners: [], version: 1, createdAt: now, updatedAt: now },
+      ];
+      store.tasks = [
+        task("task-source", "시작 Task"), task("task-second", "두 번째 Task"), task("task-third", "세 번째 Task"),
+        task("task-other", "다른 범위 Task", "milestone-b"), task("task-archived", "보관 Task", "milestone-a", "archived"),
+      ];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-source"]')?.click();
+      const opener = document.querySelector<HTMLButtonElement>('[data-action="open-quick-graph"]');
+      expect(opener?.textContent).toContain("빠른 그래프 구성");
+      opener?.click();
+
+      let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).toContain("현재 Task를 1번으로 고정");
+      expect(dialog?.querySelectorAll('[role="option"]')).toHaveLength(3);
+      expect(dialog?.textContent).not.toContain("다른 범위 Task");
+      expect(dialog?.textContent).not.toContain("보관 Task");
+      dialog?.querySelector<HTMLButtonElement>('[data-action="toggle-quick-graph-task"][data-id="task-second"]')?.click();
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      dialog?.querySelector<HTMLButtonElement>('[data-action="toggle-quick-graph-task"][data-id="task-third"]')?.click();
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      dialog?.querySelector<HTMLButtonElement>('[data-action="move-quick-graph-task"][data-id="task-third"][data-delta="-1"]')?.click();
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect([...dialog?.querySelectorAll(".quick-graph-order-title") ?? []].map((item) => item.textContent)).toEqual([
+        "시작 Task", "세 번째 Task", "두 번째 Task",
+      ]);
+      dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-quick-graph"]')?.click();
+
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+      expect([...document.querySelectorAll(".node-title")].map((item) => item.textContent)).toEqual([
+        "1. 시작 Task", "2. 세 번째 Task", "3. 두 번째 Task",
+      ]);
+      expect(document.querySelectorAll("g[data-edge-id]")).toHaveLength(2);
+      expect(document.querySelector<HTMLSelectElement>(".graph-switcher")?.selectedOptions[0]?.textContent).toContain("시작 Task · 빠른 흐름");
+    } finally {
+      dom.window.close();
+    }
+  });
+
   it("opens a standalone Task run dialog with one-off Orca routing", async () => {
     const dom = await mountPanel(wide, ({ store, targets }) => {
       store.bridgeWorkspace = "current-project";
@@ -1143,6 +1198,73 @@ describe("structured source work editing", () => {
     }
   });
 
+  it("creates a quick graph with the last-read Task CAS version and ordered IDs", async () => {
+    const now = "2026-08-10T00:00:00.000Z";
+    const requests: any[] = [];
+    let createdStore: Record<string, any> | null = null;
+    const dom = await mountPanel(true, (bootstrap) => {
+      bootstrap.store.tasks = [
+        { id: "TASK-source", version: 4, title: "Source", prompt: "source prompt", draft: "source prompt", promptRevisions: [], domainId: "DOMAIN-a", milestoneId: "MILESTONE-a", status: "ready", priority: "medium", tags: [], createdAt: now, updatedAt: now },
+        { id: "TASK-next", version: 2, title: "Next", prompt: "next prompt", draft: "next prompt", promptRevisions: [], domainId: "DOMAIN-a", milestoneId: "MILESTONE-a", status: "backlog", priority: "medium", tags: [], createdAt: now, updatedAt: now },
+      ];
+      (bootstrap as typeof bootstrap & { bridgeApiUrl: string; dataSource: Record<string, unknown> }).bridgeApiUrl = "/test/api";
+      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
+        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
+        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
+        capabilities: { graphCommit: true, taskMutation: true },
+      };
+      createdStore = structuredClone(bootstrap.store);
+      const quick = { ...structuredClone(createdStore.graphs[0]), id: "GRAPH-quick", name: "검수 흐름", version: 1, nodes: [], edges: [] };
+      createdStore.graphs.push(quick);
+      createdStore.activeGraphId = quick.id;
+    }, (window) => {
+      Object.defineProperty(window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          const request = JSON.parse(String(init.body));
+          requests.push(request);
+          if (request.type === "task-project-context") {
+            return Response.json({ ok: true, value: {
+              taskId: "TASK-source", taskVersion: 9, projects: [], registry: [], recommended: [],
+              environment: "정석맥1", current: null,
+            } });
+          }
+          if (request.type === "create-quick-graph") {
+            return Response.json({ ok: true, value: { graphId: "GRAPH-quick", store: createdStore } });
+          }
+          return Response.json({ ok: true, value: undefined });
+        }),
+      });
+    });
+    try {
+      const { document, Event } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="TASK-source"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      document.querySelector<HTMLButtonElement>('[data-action="open-quick-graph"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="toggle-quick-graph-task"][data-id="TASK-next"]')?.click();
+      const name = document.querySelector<HTMLInputElement>('[data-action="quick-graph-name"]');
+      if (name) {
+        name.value = "검수 흐름";
+        name.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      document.querySelector<HTMLButtonElement>('[data-action="confirm-quick-graph"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(requests.find((request) => request.type === "create-quick-graph")).toEqual({
+        type: "create-quick-graph",
+        sourceTaskId: "TASK-source",
+        expectedTaskVersion: 9,
+        name: "검수 흐름",
+        taskIds: ["TASK-source", "TASK-next"],
+      });
+      expect(document.querySelector<HTMLElement>('[role="dialog"]')).toBeNull();
+      expect(document.querySelector<HTMLSelectElement>(".graph-switcher")?.value).toBe("GRAPH-quick");
+    } finally {
+      dom.window.close();
+    }
+  });
+
   it("creates or reuses a Task before opening Todo quick run", async () => {
     let preparedStore: Record<string, any> | null = null;
     const dom = await mountPanel(true, (bootstrap) => {
@@ -1205,7 +1327,7 @@ describe("structured source work editing", () => {
     }
   });
 
-  it("selects one registered Orca project and one actual worktree branch", async () => {
+  it("selects multiple registered Orca project and actual worktree branch bundles", async () => {
     const dom = await mountPanel(true, (bootstrap) => {
       (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
         config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
@@ -1243,11 +1365,14 @@ describe("structured source work editing", () => {
               }],
             } });
           }
-          if (request.type === "link-task-projects") {
+          if (request.type === "connect-task-project-bundles") {
             return Response.json({ ok: true, value: {
               context: {
                 taskId: request.taskId, taskVersion: 5, registry: [], recommended: [], environment: "정석맥1", current: null,
-                projects: [{ role: "target", locatorKind: "folder", locator: request.paths[0], branch: request.branch, position: 0 }],
+                projects: request.selections.map((selection: any, position: number) => ({
+                  role: "target", locatorKind: "folder", locator: selection.targetPath ?? selection.sourcePath,
+                  branch: selection.branch || undefined, position,
+                })),
               },
             } });
           }
@@ -1259,18 +1384,18 @@ describe("structured source work editing", () => {
       document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      const radios = [...document.querySelectorAll<HTMLButtonElement>('[role="radiogroup"] [role="radio"]')];
-      expect(radios).toHaveLength(2);
-      expect(radios[0]?.getAttribute("aria-checked")).toBe("true");
-      expect(radios[0]?.textContent).toContain("워크트리 2");
-      let branch = document.querySelector<HTMLSelectElement>('[data-scope="task-project-candidate"][data-field="branch"]');
+      const projects = [...document.querySelectorAll<HTMLInputElement>('[data-action="toggle-task-project"]')];
+      expect(projects).toHaveLength(2);
+      expect(projects[0]?.checked).toBe(true);
+      expect(projects[0]?.closest("article")?.textContent).toContain("워크트리 2");
+      let branch = document.querySelector<HTMLSelectElement>('[data-scope="task-project-picker"][data-field="branch"][data-source-path="/workspace/a"]');
       expect(branch?.value).toBe("main");
       expect([...(branch?.options ?? [])].map((item) => item.textContent)).toEqual([
         "브랜치 지정 안 함", "main · 기본", "feature/review",
       ]);
 
-      radios[1]?.click();
-      branch = document.querySelector<HTMLSelectElement>('[data-scope="task-project-candidate"][data-field="branch"]');
+      projects[1]?.click();
+      branch = document.querySelector<HTMLSelectElement>('[data-scope="task-project-picker"][data-field="branch"][data-source-path="/workspace/b"]');
       expect(branch?.value).toBe("release");
       if (branch) {
         branch.value = "";
@@ -1278,8 +1403,103 @@ describe("structured source work editing", () => {
       }
       document.querySelector<HTMLButtonElement>('[data-action="connect-task-projects"]')?.click();
       await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(requests.find((request) => request.type === "link-task-projects")).toMatchObject({
-        taskId: "task-design", paths: ["/workspace/b"],
+      expect(requests.find((request) => request.type === "connect-task-project-bundles")).toMatchObject({
+        taskId: "task-design", environment: "정석맥1",
+        selections: [
+          { sourcePath: "/workspace/a", targetPath: "/workspace/a", branch: "main" },
+          { sourcePath: "/workspace/b", targetPath: "/workspace/b", branch: "" },
+        ],
+      });
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("runs every Task target in its own project branch and model session", async () => {
+    const projectRows = [
+      { id: "TP-A", role: "target" as const, locatorKind: "folder" as const, locator: "/workspace/api", label: "API", branch: "main", position: 0 },
+      { id: "TP-B", role: "target" as const, locatorKind: "folder" as const, locator: "/workspace/web", label: "Web", branch: "release", position: 1 },
+    ];
+    const dom = await mountPanel(true, (bootstrap) => {
+      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
+        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
+        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
+        capabilities: { taskMutation: true },
+      };
+      bootstrap.store.tasks = [{
+        id: "task-design", version: 7, title: "다중 프로젝트 실행", prompt: "API와 Web을 함께 수정",
+        draft: "API와 Web을 함께 수정", promptRevisions: [], status: "ready", priority: "medium", tags: [],
+        projects: projectRows, createdAt: "2026-08-10T00:00:00.000Z", updatedAt: "2026-08-10T00:00:00.000Z",
+      }];
+      bootstrap.targets.environments = [{ id: "local", name: "jsj1", local: true, connected: true }];
+      bootstrap.targets.projects = [
+        { id: "project-api", name: "API", environmentId: "local", repoId: "repo-api", worktreeId: "wt-api", path: "/workspace/api", branch: "main" },
+        { id: "project-web", name: "Web", environmentId: "local", repoId: "repo-web", worktreeId: "wt-web", path: "/workspace/web", branch: "release" },
+      ];
+      bootstrap.targets.branches = [
+        { id: "branch-api", branch: "main", environmentId: "local", projectId: "project-api", repoId: "repo-api", worktreeId: "wt-api", path: "/workspace/api" },
+        { id: "branch-web", branch: "release", environmentId: "local", projectId: "project-web", repoId: "repo-web", worktreeId: "wt-web", path: "/workspace/web" },
+      ];
+    });
+    try {
+      const requests: any[] = [];
+      Object.defineProperty(dom.window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          const request = JSON.parse(String(init.body));
+          requests.push(request);
+          if (request.type === "task-project-context") {
+            return Response.json({ ok: true, value: {
+              taskId: "task-design", taskVersion: 7, projects: projectRows, registry: [], recommended: [],
+              environment: "정석맥1", current: null,
+            } });
+          }
+          if (request.type === "link-task-project-bundles") {
+            return Response.json({ ok: true, value: {
+              context: { taskId: "task-design", taskVersion: 8, projects: projectRows, registry: [], recommended: [], environment: "정석맥1", current: null },
+            } });
+          }
+          if (request.type === "run-task") {
+            return Response.json({ ok: true, value: { sessionId: "session-api", sessions: [{ sessionId: "session-api" }, { sessionId: "session-web" }] } });
+          }
+          return Response.json({ ok: true, value: undefined });
+        }),
+      });
+      const { document, Event } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-design"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      let mode = document.querySelector<HTMLSelectElement>('[data-scope="task-run-mode"]');
+      expect(mode).not.toBeNull();
+      if (mode) {
+        mode.value = "per_project";
+        mode.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      expect(document.querySelectorAll(".task-project-run-card")).toHaveLength(2);
+      expect([...document.querySelectorAll<HTMLSelectElement>('[data-scope="task-run-project-routing"][data-field="branch"]')].map((select) => select.value)).toEqual(["main", "release"]);
+      let webModel = document.querySelector<HTMLSelectElement>('[data-scope="task-run-project-routing"][data-field="model"][data-locator="/workspace/web"]');
+      if (webModel) {
+        webModel.value = "gpt-5.6-luna";
+        webModel.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      document.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(requests.find((request) => request.type === "link-task-project-bundles")?.bundles).toEqual([
+        { path: "/workspace/api", label: "API", branch: "main" },
+        { path: "/workspace/web", label: "Web", branch: "release" },
+      ]);
+      expect(requests.find((request) => request.type === "run-task")).toMatchObject({
+        executionMode: "per_project",
+        projectSessions: [
+          { locator: "/workspace/api", routing: { environmentId: "local", projectId: "project-api", branch: "main", model: "gpt-5.6-sol" } },
+          { locator: "/workspace/web", routing: { environmentId: "local", projectId: "project-web", branch: "release", model: "gpt-5.6-luna" } },
+        ],
       });
     } finally {
       dom.window.close();
@@ -1318,8 +1538,7 @@ describe("structured source work editing", () => {
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
       document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
       await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(document.querySelector('[role="radiogroup"] [aria-checked="true"]')).toBeNull();
-      expect(document.querySelector('[data-scope="task-project-candidate"]')).toBeNull();
+      expect(document.querySelector<HTMLInputElement>('[data-action="toggle-task-project"]:checked')).toBeNull();
     } finally {
       dom.window.close();
     }

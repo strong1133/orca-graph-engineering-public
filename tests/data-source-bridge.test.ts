@@ -134,6 +134,96 @@ describe("bridge structured source boundary", () => {
     ]);
     child.stdin.end();
   });
+
+  it("creates an ordered quick graph through the workspace API and refreshes that graph", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "orca-graph-quick-bridge-"));
+    cleanup.push(() => rm(directory, { recursive: true, force: true }));
+    const requests: Array<{ method: string; url: string; body?: any }> = [];
+    const quickGraph = { ...graph(1), id: "GRAPH-quick", name: "검수 흐름" };
+    const quickStore = {
+      schemaVersion: 1, activeGraphId: "graph-remote", graphs: [graph(4), quickGraph],
+      domains: [], milestones: [], tasks: [], todos: [],
+    };
+    const server = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
+      requests.push({ method: request.method ?? "", url: request.url ?? "", ...(body ? { body } : {}) });
+      if (request.method === "GET" && request.url === "/") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end('<script>window.__HERMES_SESSION_TOKEN__="abcdefghijklmnopqrstuvwxyz012345"</script>');
+        return;
+      }
+      if (request.method === "POST" && request.url?.endsWith("/graphs/quick")) {
+        response.writeHead(201, { "content-type": "application/json" });
+        response.end(JSON.stringify({ item: { id: "GRAPH-quick", version: 1 } }));
+        return;
+      }
+      if (request.method === "GET" && request.url === "/orca-graph-source/v1/snapshot") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          contractVersion: 1, source: { id: "workspace", name: "Workspace" },
+          capabilities: { graphCommit: true, taskMutation: true },
+          store: quickStore, catalog: { tasks: [], todos: [] },
+        }));
+        return;
+      }
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ detail: "not found" }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    cleanup.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const initialStore = {
+      schemaVersion: 1, activeGraphId: "graph-remote", graphs: [graph(4)],
+      domains: [], milestones: [], tasks: [], todos: [],
+    };
+    await Promise.all([
+      writeFile(path.join(directory, "data-source.json"), JSON.stringify({ schemaVersion: 1, mode: "structured", url: `${baseUrl}/` })),
+      writeFile(path.join(directory, "source-cache.json"), JSON.stringify({ schemaVersion: 1, mode: "structured", status: "ready", store: initialStore, catalog: [] })),
+      writeFile(path.join(directory, "store.json"), JSON.stringify(initialStore)),
+    ]);
+    const child = spawn(process.execPath, [path.join(process.cwd(), "bridge/index.mjs")], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        ORCA_GRAPH_RUNTIME_DIR: directory,
+        ORCA_GRAPH_SKIP_REBUILD: "1",
+        ORCA_GRAPH_WORKSPACE_BASE_URL: baseUrl,
+        ORCA_GRAPH_WORKSPACE_ALLOW_INSECURE_LOOPBACK: "1",
+        [["ORCA", "GRAPH", "WORK", "TASKS", "ENVIRONMENT"].join("_")]: "Hermes",
+        ORCA_CLI_COMMAND: "/usr/bin/false",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    cleanup.push(async () => { if (child.exitCode === null) child.kill(); });
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.stderr.on("data", (chunk) => { output += chunk; });
+    await waitFor(child, () => output, "bridge ready");
+    child.stdin.write(frame({
+      type: "create-quick-graph", sourceTaskId: "TASK-source", expectedTaskVersion: 9,
+      name: "검수 흐름", taskIds: ["TASK-source", "TASK-next"],
+    }));
+    await waitFor(child, () => output, "quick graph GRAPH-quick created");
+
+    const request = requests.find((item) => item.method === "POST" && item.url.endsWith("/graphs/quick"));
+    expect(request?.body).toEqual({
+      source_task_id: "TASK-source", expected_task_version: 9,
+      name: "검수 흐름", task_ids: ["TASK-source", "TASK-next"],
+    });
+    const cache = JSON.parse(await readFile(path.join(directory, "source-cache.json"), "utf8"));
+    expect(cache.store.activeGraphId).toBe("GRAPH-quick");
+    expect(cache.store.graphs.map((item: any) => item.id)).toContain("GRAPH-quick");
+    child.stdin.end();
+  });
 });
 
 describe("bridge folder source boundary", () => {
