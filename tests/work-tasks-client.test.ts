@@ -4,6 +4,7 @@ const {
   mapOrcaRepos,
   normalizeWorkBranch,
   taskProjectInput,
+  todoQuickTaskInput,
   validateWorkTasksBaseUrl,
   workTasksEnvironment,
 } = await import(`../bridge/${["work", "tasks"].join("-")}-client.mjs`);
@@ -94,6 +95,19 @@ describe("Orca project registry mapping", () => {
     expect(normalizeWorkBranch("refs/heads/feature/task-42")).toBe("feature/task-42");
     expect(() => normalizeWorkBranch("feature/bad branch")).toThrow("whitespace or control");
     expect(() => normalizeWorkBranch("feature/bad\u0000branch")).toThrow("whitespace or control");
+  });
+
+  it("maps a Todo to the atomic quick-Task contract without changing its source bytes", () => {
+    const content = "  첫 줄\r\n둘째 줄\n끝 공백  ";
+    expect(todoQuickTaskInput({
+      id: "TODO-1", content, memo: "  원문 메모  ", due_on: "2026-08-11", priority: "normal",
+    })).toEqual({
+      title: "첫 줄\r\n둘째 줄\n끝 공백",
+      description: "  원문 메모  ",
+      due_on: "2026-08-11",
+      priority: "normal",
+      draft: content,
+    });
   });
 
   it("fails before publishing values outside the registry contract", () => {

@@ -21,7 +21,7 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 �
 - 그래프 생성, 복제, 보관, 초기화, pin, routine 메타데이터, JSON import/export
 - 🧭 업무프로세스 그래프, 실행별 원문 업무 입력과 회차별 입력 이력
 - 그래프와 노드의 project, Orca worktree branch, session, model, reasoning 라우팅
-- 장치의 Orca repo registry 게시, Task 대상 folder 프로젝트 감지·확인 연결과 작업 브랜치 편집
+- 장치의 Orca repo/worktree registry 게시, Task 대상 folder 프로젝트 감지·단일 선택 연결과 실제 워크트리 브랜치 선택
 - path, diamond, router, star, cycle, tree, tool-bipartite topology template
 - superstep, critical path, 병렬 writer/reducer, loop guard, 예산, 권한, provenance 검사
 - retry, timeout, idempotency, compensation, human gate, 실행 이력
@@ -37,8 +37,8 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 �
 - Task/Todo 검색은 제목·ID·태그·사람 Draft·Meta Draft를 함께 찾고, Task는 Domain/Milestone, Todo는 그룹/하위그룹 이름까지 검색합니다. Task는 기본적으로 Domain→Milestone, Todo는 원천의 그룹→하위그룹별로 묶이며 상태와 우선순위 그룹으로 바꿀 수 있습니다. Todo 그룹 계층은 실행 scope인 Domain/Milestone과 독립적입니다. Todo는 원천 화면과 같은 활성 상태(할 일·진행 중)를 기본으로 표시하며, 완료·취소 이력은 `모든 상태` 또는 개별 상태 필터에서 확인할 수 있습니다.
 - 사람 Draft를 고치면 새 immutable revision을 추가하고 이전 Meta Draft는 삭제하지 않은 채 stale로 표시합니다. `Meta Prompt 만들기`는 선택된 Orca bridge worktree에 새 Codex 세션을 만들고 플러그인에 내장된 공개 prompt 계약으로 결과를 생성합니다. Task의 project 관계도 정렬된 context로 전달하며 target locator가 빠진 결과는 9개 H1 구조를 유지한 채 `작업 컨텍스트` 안에 결정적으로 보강합니다. 결과가 고정 9개 섹션 계약을 통과하고 실행 중 사람 Draft revision이 바뀌지 않았을 때만 Meta Draft로 저장합니다.
 - 하나의 Task를 여러 Graph의 Task 노드에 재사용할 수 있습니다. 최신 Meta Draft가 있으면 실행 payload로 사용하고, 없거나 stale이면 현재 사람 Draft를 사용합니다. 제목이나 유효 실행 지시문이 바뀌면 연결된 모든 노드도 함께 갱신됩니다.
-- Task·Todo 목록의 ⚡ 버튼과 상세의 `워크트리 빠른 실행`은 그래프를 만들지 않고 현재 Meta Draft 또는 사람 Draft를 단건으로 보냅니다. 실행 전에 연결된 Orca 환경, 그 환경의 project·실제 Orca worktree branch·기존 session, AI model, reasoning을 고르며 그래프 run·node claim이나 원천 상태 변경은 만들지 않습니다. 현재 활성 Orca worktree를 먼저 감지하며 구조화 Workspace Task에 target folder가 없으면 사용자가 확인한 프로젝트 하나와 브랜치를 실행 직전에 기존 Task project 관계에 CAS로 추가합니다. Todo 실행은 Todo 관계나 상태를 변경하지 않습니다. 연결된 Task target folder와 branch는 단건 실행과 해당 Task를 쓰는 그래프 노드의 기본 추천이 되며, 정확한 기존 Orca worktree가 없으면 실행 전에 차단합니다. 로컬 환경 이름은 `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME`으로 지정할 수 있고 저장된 원격 Orca 환경은 대상 갱신 때 자동으로 합쳐집니다.
-- Todo는 워크트리에 직접 빠른 실행할 수 있고, 선택적으로 Task에 연결하거나 새 Task로 전환할 수도 있습니다. 전환 뒤에도 원래 Todo는 보존되고 Domain·Milestone과 Prompt revision lineage도 새 Task에 복사됩니다.
+- Task·Todo 목록의 ⚡ 버튼과 상세의 `워크트리 빠른 실행`은 그래프를 만들지 않고 현재 Meta Draft 또는 사람 Draft를 단건으로 보냅니다. 실행 전에 연결된 Orca 환경, 그 환경의 project·실제 Orca worktree branch·기존 session, AI model, reasoning을 고르며 그래프 run·node claim이나 lifecycle 상태 변경은 만들지 않습니다. 현재 활성 Orca worktree를 먼저 감지하며 구조화 Workspace Task에 target folder가 없으면 사용자가 확인한 프로젝트 하나와 브랜치를 실행 직전에 기존 Task project 관계에 CAS로 추가합니다. 연결된 Task target folder와 branch는 단건 실행과 해당 Task를 쓰는 그래프 노드의 기본 추천이 되며, 정확한 기존 Orca worktree가 없으면 실행 전에 차단합니다. 로컬 환경 이름은 `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME`으로 지정할 수 있고 저장된 원격 Orca 환경은 대상 갱신 때 자동으로 합쳐집니다.
+- Todo 빠른 실행은 이미 연결된 Task를 재사용하고, 연결이 없으면 원천의 원자적 `POST /todos/{id}/task` 계약과 재시도 가능한 idempotency key로 Task를 먼저 생성·연결한 뒤 그 Task를 실행합니다. Todo의 완료 상태는 바꾸지 않습니다. 로컬/폴더 원천에서도 같은 의미로 Task를 만들며 원래 Todo, Domain·Milestone, Prompt revision lineage를 보존합니다.
 - hard delete 대신 Domain/Milestone 보관, 확인 창이 있는 `Task 삭제`(복원 가능한 보관), Todo 취소를 사용합니다. 활성 하위 Milestone·Task·Todo가 남은 Domain이나 Milestone은 보관할 수 없습니다.
 
 기존 Graph에 이미 들어 있던 Task는 처음 열 때 로컬 Task 목록과 사람 Draft revision에 자동 편입됩니다. `로컬 JSON`과 `구조 없음` 모드에서는 로컬 저장소를 직접 편집합니다. 양방향 capability를 제공하는 `구조화 Workspace`에서는 같은 관리 GUI가 Domain·Milestone·Task·Todo·Draft/Meta revision을 원천에 CAS 저장하고, 성공 직후 정본 snapshot으로 교체합니다. 파일 영속화와 Meta Prompt 생성에는 로컬 브리지가 필요하지만 별도의 데이터 원천 서버는 필요하지 않습니다.
@@ -123,7 +123,7 @@ corepack npm run package:plugin
 # release/orca-graph-engineering-plugin-0.2.0.tgz
 ```
 
-bundle에는 manifest가 선언한 `dist/panel.html`, bridge, source, fixture, tests, CI와 `npm-shrinkwrap.json`이 함께 들어갑니다. 빌드는 공개 fixture만 사용하고 contributor의 절대 경로를 넣지 않습니다. 압축을 푼 `package/` 디렉터리는 추가 설치 없이 Orca Development plugin 경로로 사용할 수 있으며 기본 bridge의 ping, 저장, reload도 Node.js 내장 모듈과 이미 번들된 panel만 사용합니다. 저장 시 TypeScript를 다시 compile하지 않고 `dist/panel.html`의 안전한 JSON bootstrap만 원자적으로 갱신합니다. `corepack npm ci && corepack npm run check`는 기여자용 전체 source/test 재검증 경로이지 plugin 사용 전제조건이 아닙니다. 브리지를 선택할 때는 plugin root에서 열린 shell terminal을 사용해야 portable `node ./bridge/index.mjs` 시작 명령이 정확히 동작합니다.
+bundle에는 manifest가 선언한 `dist/panel.html`, bridge, source, fixture, tests, CI와 `npm-shrinkwrap.json`이 함께 들어갑니다. 빌드는 공개 fixture만 사용하고 contributor의 절대 경로를 넣지 않습니다. 압축을 푼 `package/` 디렉터리는 추가 설치 없이 Orca Development plugin 경로로 사용할 수 있으며 기본 bridge의 ping, 저장, reload도 Node.js 내장 모듈과 이미 번들된 panel만 사용합니다. 브리지 기동 시 tokenized loopback response endpoint가 runtime bootstrap에 주입되어 사이드 패널도 저장·원천 새로고침 결과를 즉시 받습니다. 브리지가 재시작되면 terminal fallback 뒤 새 endpoint로 자동 재동기화하고, 기존 넓게 보기 탭도 다시 열 때 강제로 reload합니다. 저장 시 TypeScript를 다시 compile하지 않고 `dist/panel.html`의 안전한 JSON bootstrap만 원자적으로 갱신합니다. `corepack npm ci && corepack npm run check`는 기여자용 전체 source/test 재검증 경로이지 plugin 사용 전제조건이 아닙니다. 브리지를 선택할 때는 plugin root에서 열린 shell terminal을 사용해야 portable `node ./bridge/index.mjs` 시작 명령이 정확히 동작합니다.
 
 artifact를 만들지 않고 내용 계약만 검사하려면 `corepack npm run package:plugin -- --dry-run`을 사용합니다. 만들어진 tgz 자체를 독립적으로 검사하려면 `corepack npm run verify:plugin -- release/orca-graph-engineering-plugin-0.2.0.tgz`를 실행하십시오. plugin tar는 정렬된 경로, 고정 timestamp/owner/mode와 canonical gzip header로 생성되며 npm의 `pack` 구현에 의존하지 않습니다. CI는 실제 tgz를 dependency install 전에 추출해 manifest schema, entry, 금지 경로, bridge ping과 realistic save/`dist/panel.html` 갱신을 확인합니다. 그 뒤 pinned `corepack npm ci`/`corepack npm run check`를 별도로 확인하고, 별도 clean directory의 npm 10/11 결과가 byte-for-byte 같은지도 비교합니다. 일부 Node 배포는 기존 bare `npm`을 Corepack shim으로 바꾸지 않으므로 재현 가능한 명령은 `corepack npm ...` 형식을 사용합니다.
 

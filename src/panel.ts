@@ -85,6 +85,13 @@ type RegistryProject = {
   kind?: string;
   repo_id?: string;
   remote?: string;
+  worktrees?: Array<{
+    id: string;
+    path: string;
+    branch?: string;
+    display_name?: string;
+    is_main?: boolean;
+  }>;
 };
 
 type TaskProjectContext = {
@@ -178,8 +185,22 @@ interface ViewState {
 const bootstrapElement = document.querySelector<HTMLScriptElement>("#orca-graph-bootstrap");
 if (!bootstrapElement?.textContent) throw new Error("Graph Engineering bootstrap is missing.");
 const bootstrap = structuredClone(JSON.parse(bootstrapElement.textContent) as Bootstrap);
-const wideApi = (window as Window & { __ORCA_GRAPH_WIDE_API__?: string }).__ORCA_GRAPH_WIDE_API__;
-const isWideMode = typeof wideApi === "string" && wideApi.startsWith("/");
+const injectedWideApi = (window as Window & { __ORCA_GRAPH_WIDE_API__?: string }).__ORCA_GRAPH_WIDE_API__;
+const isWideMode = typeof injectedWideApi === "string" && injectedWideApi.startsWith("/");
+
+function trustedBridgeApi(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (value.startsWith("/")) return value;
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" && url.hostname === "127.0.0.1" ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+let responseBridgeApi = trustedBridgeApi(injectedWideApi) ?? trustedBridgeApi(bootstrap.bridgeApiUrl);
+const pendingBridgeSyncKey = "orca-graph-engineering:pending-terminal-bridge-sync";
 let store: GraphStore = normalizeGraphStore(bootstrap.store);
 let targets = bootstrap.targets;
 let dataSource: DataSourceState = bootstrap.dataSource ?? {
@@ -192,7 +213,10 @@ let taskProjectContextState: TaskProjectContext | null = null;
 let taskProjectContextLoading = false;
 let taskProjectContextError = "";
 let currentOrcaProjectState: TaskProjectContext["current"] = null;
-const selectedTaskProjectPaths = new Set<string>();
+let selectedTaskProjectPath = "";
+let selectedTaskProjectBranch = "";
+const todoQuickRunKeys = new Map<string, { signature: string; key: string }>();
+const preparingTodoRuns = new Set<string>();
 if (!store.graphs.length) {
   const now = new Date().toISOString();
   const id = newId("graph");
@@ -1576,7 +1600,7 @@ function renderCanvas(graph: GraphDefinition): string {
           <span class="node-status ${node.status}" title="${esc(node.status)}"></span>
         </div>
         <div class="node-body">
-          <div class="node-subtitle">${esc(nodeSubtitle(node))}</div>
+          <div class="node-subtitle" title="${esc(nodeSubtitle(node))}">${esc(nodeSubtitle(node))}</div>
           ${node.kind === "condition"
             ? `<div class="condition-route"><b>${node.branchTaken?.trim() ? `고정 분기 · ${esc(node.branchTaken)}` : `AI 자동 · ${esc(model)}`}</b>${node.branchTaken?.trim() ? "" : `<span>${esc(targetKind)} · ${esc(target)}</span>`}</div>`
             : `<div class="node-route-summary">
@@ -2082,8 +2106,8 @@ function renderModal(): string {
       : route.projectId ? `새 세션 · ${projectName(route.projectId, route.environmentId)}` : "실행 대상 미지정";
     const selectedRouteProject = targets.projects.find((item) => item.id === route.projectId
       && routeEnvironmentId(item.environmentId) === routeEnvironmentId(route.environmentId));
-    const willLinkTarget = modal.itemKind === "task" && dataSource.config.mode === "structured"
-      && !taskHasTargetProject(item.id) && Boolean(selectedRouteProject?.path);
+    const willLinkTarget = dataSource.config.mode === "structured" && Boolean(selectedRouteProject?.path)
+      && (modal.itemKind === "todo" || !taskHasTargetProject(item.id));
     const prompt = modal.itemKind === "task"
       ? (item as LocalTask).prompt
       : currentMetaRevision(item)?.content || item.draft || (item as LocalTodo).notes;
@@ -2100,10 +2124,10 @@ function renderModal(): string {
       <div class="modal-head"><strong id="modal-title">${itemLabel} 워크트리 빠른 실행</strong><button class="icon ghost" data-action="close-modal" data-modal-initial-focus aria-label="닫기">×</button></div>
       <div class="modal-body">
         <section class="task-run-summary"><span class="badge">${esc(item.status)}</span><strong>${esc(item.title)}</strong><small>${esc(item.id)}</small></section>
-        <p class="help">그래프 run이나 노드 claim을 만들지 않고 이 ${itemLabel}의 ${promptLabel}를 선택한 Orca 워크트리에서 독립 실행합니다. 원천 ${itemLabel} 상태는 자동으로 바뀌지 않습니다.</p>
+        <p class="help">${modal.itemKind === "todo" ? `기존 연결 Task를 재사용하거나 새 Task를 원자적으로 만들고 연결한 뒤, ${promptLabel}를 선택한 Orca 워크트리에서 실행합니다. Todo 완료 상태는 자동으로 바뀌지 않습니다.` : `그래프 run이나 노드 claim을 만들지 않고 이 Task의 ${promptLabel}를 선택한 Orca 워크트리에서 독립 실행합니다. 원천 Task 상태는 자동으로 바뀌지 않습니다.`}</p>
         <section class="section run-defaults">
           <div class="section-title">실행 대상 ${modal.suggestedProjectId && route.projectId === modal.suggestedProjectId ? '<span class="badge">현재 Orca 워크트리 자동 선택 · 컨텍스트 추천</span>' : ""}${willLinkTarget ? '<span class="badge good">실행 시 Task target 연결</span>' : ""}</div>
-          ${willLinkTarget ? '<p class="help">선택한 프로젝트 하나와 작업 브랜치를 실행 직전에 Task의 target · folder 관계로 CAS 저장합니다.</p>' : ""}
+          ${willLinkTarget ? `<p class="help">선택한 프로젝트 하나와 작업 브랜치를 실행 직전에 ${modal.itemKind === "todo" ? "연결 Task" : "Task"}의 target · folder 관계로 CAS 저장합니다.</p>` : ""}
           <div class="run-routing-grid">
             <label class="field"><span>Orca 환경</span><select data-scope="task-run-routing" data-field="environmentId">${environmentOptions(route.environmentId)}</select></label>
             <label class="field"><span>프로젝트</span><select data-scope="task-run-routing" data-field="projectId">${projectOptions(route.projectId, false, route.environmentId)}</select></label>
@@ -2376,6 +2400,52 @@ function promptPairEditor(kind: "task" | "todo", item: LocalTask | LocalTodo): s
   </section>`;
 }
 
+function createLocalTaskFromTodo(todo: LocalTodo): { task: LocalTask; created: boolean } {
+  const linked = todo.taskId ? store.tasks.find((item) => item.id === todo.taskId) : undefined;
+  if (linked) return { task: linked, created: false };
+  const now = new Date().toISOString();
+  const taskId = newId("task");
+  const revisionIds = new Map(todo.promptRevisions.map((revision) => [revision.id, `${taskId}:${revision.kind}:${crypto.randomUUID()}`]));
+  const task: LocalTask = {
+    id: taskId, title: todo.title, prompt: currentMetaRevision(todo)?.content || todo.draft,
+    ...(todo.domainId ? { domainId: todo.domainId } : {}),
+    ...(todo.milestoneId ? { milestoneId: todo.milestoneId } : {}),
+    draft: todo.draft,
+    ...(todo.metaDraft ? { metaDraft: todo.metaDraft } : {}),
+    promptRevisions: todo.promptRevisions.map((revision) => ({
+      ...revision,
+      id: revisionIds.get(revision.id)!,
+      ...(revision.basedOnId && revisionIds.get(revision.basedOnId) ? { basedOnId: revisionIds.get(revision.basedOnId)! } : {}),
+    })),
+    status: "backlog", priority: todo.priority, ...(todo.dueDate ? { dueDate: todo.dueDate } : {}),
+    tags: [...todo.tags], createdAt: now, updatedAt: now,
+    ...(dataSource.config.mode === "structured" ? { version: 0 } : {}),
+  };
+  store.tasks.push(task);
+  todo.taskId = task.id;
+  touchWorkItem(todo);
+  view.dirty = true;
+  return { task, created: true };
+}
+
+function registryProjectWorktrees(project: RegistryProject | undefined): NonNullable<RegistryProject["worktrees"]> {
+  const seen = new Set<string>();
+  return [...(project?.worktrees ?? [])]
+    .sort((left, right) => Number(Boolean(right.is_main)) - Number(Boolean(left.is_main)))
+    .filter((worktree) => {
+      const branch = worktree.branch ? shortBranch(worktree.branch.trim()) : "";
+      if (!branch || seen.has(branch)) return false;
+      seen.add(branch);
+      return true;
+    });
+}
+
+function preferredRegistryBranch(project: RegistryProject): string {
+  return registryProjectWorktrees(project)[0]?.branch
+    ? shortBranch(registryProjectWorktrees(project)[0]!.branch!)
+    : "";
+}
+
 function taskProjectSection(task: LocalTask): string {
   if (dataSource.config.mode !== "structured") return "";
   const context = taskProjectContextState?.taskId === task.id ? taskProjectContextState : null;
@@ -2386,12 +2456,20 @@ function taskProjectSection(task: LocalTask): string {
   const targetProjects = taskProjects.filter((project) => project.role === "target" && project.locatorKind === "folder");
   const localProjects = context.registry.filter((project) => project.environment === context.environment);
   const connectedPaths = new Set(taskProjects.map((project) => project.locator));
-  const availableProjects = localProjects.filter((project) => !connectedPaths.has(project.path));
   const recommendedPaths = new Set(context.recommended.map((project) => project.path));
+  const selectedProject = localProjects.find((project) => project.path === selectedTaskProjectPath);
+  const selectedWorktrees = registryProjectWorktrees(selectedProject);
   return `<section class="section task-projects"><div class="section-title">대상 프로젝트 · ${targetProjects.length} ${!targetProjects.length && context.recommended.length ? '<span class="badge">현재 컨텍스트 추천</span>' : ""}<button class="icon ghost" data-action="reload-task-projects" data-id="${esc(task.id)}" aria-label="프로젝트 다시 감지">↻</button></div>
     ${taskProjects.length ? `<ul class="work-link-list task-project-list">${taskProjects.map((project) => `<li><span><strong>${esc(project.label ?? project.locator.split("/").at(-1) ?? project.locator)}</strong><code>${esc(project.locator)}</code><small>${project.role === "target" ? "대상" : "관련"} · ${project.locatorKind}</small></span><label class="task-project-branch"><span>작업 브랜치</span><input data-scope="task-project-branch" data-task-id="${esc(task.id)}" data-project-id="${esc(project.id ?? "")}" data-locator="${esc(project.locator)}" value="${esc(project.branch ?? "")}" placeholder="예: feature/task-42"></label></li>`).join("")}</ul>` : '<p class="help">연결된 대상 프로젝트가 없습니다.</p>'}
     <p class="help">Task 실행 시 target · folder 경로와 작업 브랜치에 정확히 일치하는 Orca 워크트리를 우선 선택합니다.</p>
-    ${availableProjects.length ? `<details class="registry-project-picker" ${!targetProjects.length ? "open" : ""}><summary>이 장치의 프로젝트에서 추가</summary><div class="registry-project-list">${availableProjects.map((project) => `<label class="registry-project ${recommendedPaths.has(project.path) ? "recommended" : ""}"><input type="checkbox" data-action="toggle-task-project" data-path="${esc(project.path)}" ${selectedTaskProjectPaths.has(project.path) ? "checked" : ""}><span><strong>${esc(project.name)}</strong><code>${esc(project.path)}</code><small>${esc(project.environment)}${recommendedPaths.has(project.path) ? " · 추천" : ""}</small></span></label>`).join("")}</div><button class="primary" data-action="connect-task-projects" data-id="${esc(task.id)}" ${selectedTaskProjectPaths.size ? "" : "disabled"}>선택 프로젝트를 Task에 연결</button></details>` : (!localProjects.length ? '<p class="warning-list">이 장치의 게시된 Orca 프로젝트가 없습니다. Orca 대상 새로고침을 실행하십시오.</p>' : "")}
+    ${localProjects.length ? `<details class="registry-project-picker" ${!targetProjects.length ? "open" : ""}><summary>이 장치의 프로젝트에서 추가</summary><p class="help">Orca에 구성된 프로젝트와 실제 워크트리에서 작업 위치를 고릅니다.</p><div class="registry-project-list" role="radiogroup" aria-label="Orca 프로젝트">${localProjects.map((project) => {
+      const selected = project.path === selectedTaskProjectPath;
+      const connected = connectedPaths.has(project.path);
+      return `<button type="button" role="radio" aria-checked="${selected}" class="registry-project ${recommendedPaths.has(project.path) ? "recommended" : ""} ${selected ? "selected" : ""}" data-action="select-task-project" data-path="${esc(project.path)}" ${connected ? "disabled" : ""}><span class="registry-project-radio" aria-hidden="true">${selected ? "✓" : ""}</span><span><strong>${esc(project.name)}</strong><code>${esc(project.path)}</code><small>${esc(project.environment)} · 워크트리 ${project.worktrees?.length ?? 0}${recommendedPaths.has(project.path) ? " · 추천" : ""}${connected ? " · 연결됨" : ""}</small></span></button>`;
+    }).join("")}</div>${selectedProject ? `<div class="registry-worktree-picker"><label class="field"><span>Orca 워크트리 브랜치</span><select data-scope="task-project-candidate" data-field="branch">${option("", "브랜치 지정 안 함", selectedTaskProjectBranch)}${selectedWorktrees.map((worktree) => {
+      const branch = shortBranch(worktree.branch!);
+      return option(branch, `${branch}${worktree.is_main ? " · 기본" : ""}`, selectedTaskProjectBranch);
+    }).join("")}</select></label><p class="help">Orca에 실제로 구성된 워크트리 브랜치만 표시합니다.</p><button class="primary" data-action="connect-task-projects" data-id="${esc(task.id)}">Task 작업대상으로 추가</button></div>` : ""}</details>` : '<p class="warning-list">이 장치의 게시된 Orca 프로젝트가 없습니다. Orca 대상 새로고침을 실행하십시오.</p>'}
   </section>`;
 }
 
@@ -2431,7 +2509,7 @@ function todoInspector(todo: LocalTodo): string {
   return `<aside class="work-inspector">
     <header><div><span class="badge priority-${todo.priority}">${priorityLabel[todo.priority]}</span><strong>${esc(todo.title)}</strong></div><small>${esc(todo.id)}</small></header>
     <div class="work-inspector-body">
-      <button class="primary task-run-button" data-action="open-todo-run" data-id="${esc(todo.id)}">⚡ 워크트리 빠른 실행</button>
+      <button class="primary task-run-button" data-action="open-todo-run" data-id="${esc(todo.id)}" ${["done", "cancelled"].includes(todo.status) || preparingTodoRuns.has(todo.id) ? "disabled" : ""}>${preparingTodoRuns.has(todo.id) ? "Task 준비 중…" : "⚡ 워크트리 빠른 실행"}</button>
       <label class="field"><span>제목</span><input data-scope="local-todo" data-field="title" value="${esc(todo.title)}"></label>
       <div class="field-row"><label class="field"><span>그룹</span><input data-scope="local-todo" data-field="groupName" value="${esc(todo.groupName ?? "")}" placeholder="Todo 그룹"></label><label class="field"><span>하위그룹</span><input data-scope="local-todo" data-field="subgroupName" value="${esc(todo.subgroupName ?? "")}" placeholder="선택 사항"></label></div>
       ${scopeSelectors("local-todo", todo)}
@@ -2501,12 +2579,13 @@ function renderWorkCards(items: Array<LocalTask | LocalTodo>, isTask: boolean, s
       const detail = item.draft;
       const link = isTask ? `${taskGraphLinks(item.id).length} graph nodes` : ((item as LocalTodo).taskId ? "Task 연결됨" : "Task 미연결");
       const metaState = promptState(item);
-      const runDisabled = isTask ? item.status === "archived" : item.status === "cancelled";
+      const runPreparing = !isTask && preparingTodoRuns.has(item.id);
+      const runDisabled = isTask ? item.status === "archived" : ["done", "cancelled"].includes(item.status) || runPreparing;
       return `<div class="work-card-row"><button class="work-card ${selected ? "selected" : ""}" data-action="${isTask ? "select-local-task" : "select-local-todo"}" data-id="${esc(item.id)}">
         <span class="work-card-head"><span class="work-status-dot status-${esc(item.status)}"></span><strong>${esc(item.title)}</strong><span class="badge priority-${item.priority}">${priorityLabel[item.priority]}</span></span>
         <span class="work-card-detail">${esc(detail || "Draft 없음")}</span>
         <span class="work-card-meta"><span>${esc(status)}</span><span>${esc(itemScope(item).label)}</span><span class="meta-label meta-${metaState}">Meta ${metaState === "current" ? "최신" : metaState === "running" ? "생성 중" : metaState === "stale" ? "이전본" : metaState === "failed" ? "실패" : "없음"}</span><span>${esc(link)}</span>${item.dueDate ? `<span>마감 ${esc(item.dueDate)}</span>` : ""}</span>
-      </button><button class="quick-worktree-run" data-action="${isTask ? "open-task-run" : "open-todo-run"}" data-id="${esc(item.id)}" aria-label="${isTask ? "Task" : "Todo"} 워크트리 빠른 실행 · ${esc(item.title)}" title="워크트리 빠른 실행" ${runDisabled ? "disabled" : ""}>⚡</button></div>`;
+      </button><button class="quick-worktree-run" data-action="${isTask ? "open-task-run" : "open-todo-run"}" data-id="${esc(item.id)}" aria-label="${isTask ? "Task" : "Todo"} 워크트리 빠른 실행 · ${esc(item.title)}" title="워크트리 빠른 실행" ${runDisabled ? "disabled" : ""}>${runPreparing ? "…" : "⚡"}</button></div>`;
     }).join("")}
   </section>`;
   }).join("");
@@ -3046,15 +3125,25 @@ async function chooseBridge(): Promise<void> {
 }
 
 async function sendBridge<T = unknown>(payload: unknown): Promise<T | undefined> {
-  if (isWideMode && wideApi) {
-    const response = await fetch(wideApi, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const result = await response.json() as { ok?: boolean; error?: string; value?: T };
-    if (!response.ok || !result.ok) throw new Error(result.error ?? `브리지 요청 실패 (${response.status})`);
-    return result.value;
+  if (responseBridgeApi) {
+    let response: Response | undefined;
+    try {
+      response = await fetch(responseBridgeApi, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (error) {
+      if (isWideMode || !store.bridgeTerminalId) throw error;
+      // A restarted bridge has a new loopback port/token. Fall through once to
+      // the terminal channel; the bootstrap reload below discovers the new API.
+      responseBridgeApi = undefined;
+    }
+    if (response) {
+      const result = await response.json() as { ok?: boolean; error?: string; value?: T };
+      if (!response.ok || !result.ok) throw new Error(result.error ?? `브리지 요청 실패 (${response.status})`);
+      return result.value;
+    }
   }
   if (!store.bridgeTerminalId) throw new Error("먼저 브리지 터미널을 선택하십시오.");
   const frames = encodeBridgeFrames(payload);
@@ -3065,7 +3154,29 @@ async function sendBridge<T = unknown>(payload: unknown): Promise<T | undefined>
     // bridge strips the trailing control character before parsing it.
     await hostCall("terminal.sendText", { terminalId: store.bridgeTerminalId, text: frame, enter: true });
   }
+  try { window.sessionStorage.setItem(pendingBridgeSyncKey, new Date().toISOString()); } catch { /* optional WebView storage */ }
+  window.setTimeout(() => {
+    if (!window.closed) window.location.reload();
+  }, 750);
   return undefined;
+}
+
+function resumePendingTerminalBridgeSync(): void {
+  let pending = "";
+  try { pending = window.sessionStorage.getItem(pendingBridgeSyncKey) ?? ""; } catch { return; }
+  if (!pending || !responseBridgeApi) return;
+  void fetch(responseBridgeApi, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ type: "ping" }),
+  }).then(async (response) => {
+    const result = await response.json() as { ok?: boolean };
+    if (!response.ok || !result.ok) throw new Error("bridge sync failed");
+    try { window.sessionStorage.removeItem(pendingBridgeSyncKey); } catch { /* optional WebView storage */ }
+    window.location.reload();
+  }).catch(() => {
+    window.setTimeout(resumePendingTerminalBridgeSync, 1_000);
+  });
 }
 
 function taskHasTargetProject(taskId: string): boolean {
@@ -3088,9 +3199,18 @@ async function loadTaskProjectContext(taskId: string): Promise<TaskProjectContex
     if (!result) return null;
     taskProjectContextState = result;
     currentOrcaProjectState = result.current;
-    selectedTaskProjectPaths.clear();
+    selectedTaskProjectPath = "";
+    selectedTaskProjectBranch = "";
     const connected = new Set(result.projects.map((project) => project.locator));
-    for (const project of result.recommended) if (!connected.has(project.path)) selectedTaskProjectPaths.add(project.path);
+    const unconnectedRecommendations = result.recommended.filter((project) => !connected.has(project.path));
+    const hasTargetProject = result.projects.some((project) => project.role === "target" && project.locatorKind === "folder");
+    const recommended = !hasTargetProject && unconnectedRecommendations.length === 1
+      ? unconnectedRecommendations[0]
+      : undefined;
+    if (recommended) {
+      selectedTaskProjectPath = recommended.path;
+      selectedTaskProjectBranch = preferredRegistryBranch(recommended);
+    }
     const task = store.tasks.find((item) => item.id === taskId);
     if (task) task.projects = result.projects;
     return result;
@@ -3121,34 +3241,36 @@ async function updateTaskProjectBranch(taskId: string, projectId: string, locato
 }
 
 async function connectSelectedTaskProjects(taskId: string): Promise<void> {
-  const paths = [...selectedTaskProjectPaths];
-  if (!paths.length) { toast("연결할 Orca 프로젝트를 선택하십시오."); return; }
+  const projectPath = selectedTaskProjectPath;
+  if (!projectPath) { toast("연결할 Orca 프로젝트를 선택하십시오."); return; }
   try {
     const modalBranch = view.modal?.kind === "task-run" && view.modal.itemKind === "task" && view.modal.itemId === taskId
       ? view.modal.routing.branch
       : taskProjectContextState?.current?.branch;
+    const branch = selectedTaskProjectBranch || (modalBranch ? shortBranch(modalBranch) : "");
     const result = await sendBridge<{ context: TaskProjectContext; store?: GraphStore }>({
-      type: "link-task-projects", taskId, paths,
-      ...(modalBranch ? { branch: shortBranch(modalBranch) } : {}),
+      type: "link-task-projects", taskId, paths: [projectPath],
+      ...(branch ? { branch } : {}),
     });
     if (!result) return;
     if (result.store) store = normalizeGraphStore(result.store);
     taskProjectContextState = result.context;
     const task = store.tasks.find((item) => item.id === taskId);
     if (task) task.projects = result.context.projects;
-    if (view.modal?.kind === "task-run" && view.modal.itemKind === "task" && view.modal.itemId === taskId && paths.length === 1) {
+    if (view.modal?.kind === "task-run" && view.modal.itemKind === "task" && view.modal.itemId === taskId) {
       const environmentId = routeEnvironmentId(view.modal.routing.environmentId);
       const project = targets.projects.find((item) => routeEnvironmentId(item.environmentId) === environmentId
-        && item.path === paths[0]);
+        && item.path === projectPath);
       const relation = result.context.projects.find((item) => item.role === "target"
-        && item.locatorKind === "folder" && item.locator === paths[0]);
+        && item.locatorKind === "folder" && item.locator === projectPath);
       if (project) {
         view.modal.routing.projectId = project.id;
         if (relation?.branch) view.modal.routing.branch = shortBranch(relation.branch);
         else if (project.branch) view.modal.routing.branch = shortBranch(project.branch);
       }
     }
-    selectedTaskProjectPaths.clear();
+    selectedTaskProjectPath = "";
+    selectedTaskProjectBranch = "";
     render();
     toast("Task 대상 프로젝트를 연결했습니다.");
   } catch (error) {
@@ -3163,6 +3285,55 @@ async function loadCurrentOrcaProject(): Promise<void> {
     if (result) currentOrcaProjectState = result;
   } catch (error) {
     toast(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function todoQuickRunIdempotencyKey(todo: LocalTodo): string {
+  const signature = `${todo.id}:${todo.version ?? 0}:${todo.title}:${todo.draft}`;
+  const current = todoQuickRunKeys.get(todo.id);
+  if (current?.signature === signature) return current.key;
+  const replay = { signature, key: `todo-worktree-${crypto.randomUUID()}` };
+  todoQuickRunKeys.set(todo.id, replay);
+  return replay.key;
+}
+
+async function openTodoQuickRun(todoId: string): Promise<void> {
+  const todo = store.todos.find((item) => item.id === todoId);
+  if (!todo) return;
+  if (["done", "cancelled"].includes(todo.status)) {
+    toast("완료되거나 취소된 Todo는 실행할 수 없습니다.");
+    return;
+  }
+  preparingTodoRuns.add(todo.id);
+  render();
+  try {
+    if (dataSource.config.mode === "structured") {
+      const idempotencyKey = todoQuickRunIdempotencyKey(todo);
+      const prepared = await sendBridge<{ taskId: string; store?: GraphStore }>({
+        type: "prepare-todo-quick-run", todoId: todo.id, idempotencyKey,
+      });
+      if (!prepared) {
+        // The side-panel terminal transport is intentionally fire-and-forget.
+        // Its confirm path reuses this key and lets the bridge prepare then run
+        // the bound Task in the selected worktree.
+        await loadCurrentOrcaProject();
+        openModal(createTodoRunModal(todo));
+        return;
+      }
+      if (prepared.store) store = normalizeGraphStore(prepared.store);
+      const task = store.tasks.find((item) => item.id === prepared.taskId);
+      if (!task) throw new Error(`Todo에서 만든 Task를 새 원천 스냅샷에서 찾지 못했습니다: ${prepared.taskId}`);
+      await loadTaskProjectContext(task.id);
+      openModal(createTaskRunModal(task));
+      return;
+    }
+    const { task } = createLocalTaskFromTodo(todo);
+    openModal(createTaskRunModal(task));
+  } catch (error) {
+    toast(error instanceof Error ? error.message : String(error));
+  } finally {
+    preparingTodoRuns.delete(todo.id);
+    render();
   }
 }
 
@@ -3557,12 +3728,13 @@ app.addEventListener("click", (event) => {
       if (taskId) void loadTaskProjectContext(taskId);
       break;
     }
-    case "toggle-task-project": {
-      const input = target as HTMLInputElement;
-      const projectPath = input.dataset.path;
+    case "select-task-project": {
+      const projectPath = target.dataset.path;
       if (!projectPath) return;
-      if (input.checked) selectedTaskProjectPaths.add(projectPath);
-      else selectedTaskProjectPaths.delete(projectPath);
+      const project = taskProjectContextState?.registry.find((item) => item.path === projectPath);
+      if (!project) return;
+      selectedTaskProjectPath = projectPath;
+      selectedTaskProjectBranch = preferredRegistryBranch(project);
       render();
       break;
     }
@@ -3683,32 +3855,7 @@ app.addEventListener("click", (event) => {
       const todo = store.todos.find((item) => item.id === target.dataset.id);
       if (!todo || !localWorkMutable()) return;
       const todoExpectedVersion = Number(todo.version ?? 0);
-      let task = todo.taskId ? store.tasks.find((item) => item.id === todo.taskId) : undefined;
-      let createdTask = false;
-      if (!task) {
-        createdTask = true;
-        const now = new Date().toISOString();
-        const taskId = newId("task");
-        const revisionIds = new Map(todo.promptRevisions.map((revision) => [revision.id, `${taskId}:${revision.kind}:${crypto.randomUUID()}`]));
-        task = {
-          id: taskId, title: todo.title, prompt: currentMetaRevision(todo)?.content || todo.draft,
-          ...(todo.domainId ? { domainId: todo.domainId } : {}),
-          ...(todo.milestoneId ? { milestoneId: todo.milestoneId } : {}),
-          draft: todo.draft,
-          ...(todo.metaDraft ? { metaDraft: todo.metaDraft } : {}),
-          promptRevisions: todo.promptRevisions.map((revision) => ({
-            ...revision,
-            id: revisionIds.get(revision.id)!,
-            ...(revision.basedOnId && revisionIds.get(revision.basedOnId) ? { basedOnId: revisionIds.get(revision.basedOnId)! } : {}),
-          })),
-          status: "backlog", priority: todo.priority, ...(todo.dueDate ? { dueDate: todo.dueDate } : {}),
-          tags: [...todo.tags], createdAt: now, updatedAt: now,
-          ...(dataSource.config.mode === "structured" ? { version: 0 } : {}),
-        };
-        store.tasks.push(task);
-        todo.taskId = task.id;
-        touchWorkItem(todo);
-      }
+      const { task, created: createdTask } = createLocalTaskFromTodo(todo);
       view.selectedTaskId = task.id;
       view.taskDetailOpen = true;
       view.mode = "tasks";
@@ -4120,12 +4267,7 @@ app.addEventListener("click", (event) => {
     case "open-todo-run": {
       const todo = store.todos.find((item) => item.id === target.dataset.id);
       if (!todo) return;
-      if (dataSource.config.mode === "structured") {
-        void loadCurrentOrcaProject().then(() => {
-          const current = store.todos.find((item) => item.id === todo.id);
-          if (current) openModal(createTodoRunModal(current));
-        });
-      } else openModal(createTodoRunModal(todo));
+      void openTodoQuickRun(todo.id);
       break;
     }
     case "confirm-task-run": {
@@ -4148,6 +4290,9 @@ app.addEventListener("click", (event) => {
         .then(() => sendBridge<{ sessionId?: string }>({
           type: itemKind === "task" ? "run-task" : "run-todo",
           ...(itemKind === "task" ? { taskId: itemId } : { todoId: itemId }),
+          ...(itemKind === "todo"
+            ? { idempotencyKey: todoQuickRunIdempotencyKey(store.todos.find((item) => item.id === itemId)!) }
+            : {}),
           routing,
           dryRun: false,
         }))
@@ -4290,6 +4435,10 @@ app.addEventListener("change", (event) => {
     const locator = input.dataset.locator;
     if (!taskId || !locator) return;
     void updateTaskProjectBranch(taskId, input.dataset.projectId ?? "", locator, input.value);
+    return;
+  } else if (scope === "task-project-candidate" && field === "branch") {
+    selectedTaskProjectBranch = input.value ? shortBranch(input.value) : "";
+    render();
     return;
   } else if (scope === "run-condition" && view.modal?.kind === "run") {
     const nodeId = input.dataset.nodeId;
@@ -4993,6 +5142,7 @@ window.addEventListener("keydown", (event) => {
 });
 
 render();
+resumePendingTerminalBridgeSync();
 const initialCanvas = app.querySelector<HTMLElement>("[data-canvas]");
 if (initialCanvas) {
   const initialFitObserver = new ResizeObserver(() => {

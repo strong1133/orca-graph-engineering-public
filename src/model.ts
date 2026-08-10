@@ -397,6 +397,8 @@ export interface Bootstrap {
   dataSource: DataSourceState;
   pluginRoot: string;
   builtAt: string;
+  /** Ephemeral loopback response bridge injected by the running local bridge. */
+  bridgeApiUrl?: string;
 }
 
 function normalizeRouting(value: RoutingTarget | undefined): RoutingTarget {
@@ -798,7 +800,7 @@ export function normalizeGraphStore(
 }
 
 export const NODE_WIDTH = 228;
-export const NODE_HEIGHT = 104;
+export const NODE_HEIGHT = 124;
 export const GRID = 16;
 
 export interface EngineeringFinding {

@@ -42,6 +42,7 @@ function panelBootstrapScript(value: unknown): string {
 async function mountPanel(
   wide: boolean,
   configure?: (bootstrap: { store: Record<string, any>; targets: Record<string, any> }) => void,
+  configureDom?: (window: DOMWindow) => void,
 ): Promise<JSDOM> {
   const [store, targets] = await Promise.all([
     readFile(path.join(root, "fixtures/default-store.json"), "utf8").then(JSON.parse),
@@ -67,7 +68,10 @@ async function mountPanel(
   const dom = new JSDOM(`<!doctype html>${panelBootstrapScript(bootstrap)}<main id="app"></main><script>${javascript.replaceAll("</script", "<\\/script")}</script>`, {
     runScripts: "dangerously",
     url: "http://127.0.0.1/panel",
-    beforeParse: configureWindow(wide),
+    beforeParse: (window) => {
+      configureWindow(wide)(window);
+      configureDom?.(window);
+    },
   });
   await Promise.resolve();
   return dom;
@@ -247,8 +251,9 @@ describe.each([
       detailQuickRun?.click();
 
       const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      expect(dialog?.textContent).toContain("Todo 워크트리 빠른 실행");
-      expect(dialog?.textContent).toContain("원천 Todo 상태는 자동으로 바뀌지 않습니다");
+      expect(dialog?.textContent).toContain("Task 워크트리 빠른 실행");
+      expect(dialog?.textContent).toContain("그래프 run이나 노드 claim을 만들지 않고");
+      expect(document.querySelector<HTMLSelectElement>('[data-scope="local-todo"][data-field="taskId"]')?.value).not.toBe("");
       expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="projectId"]')?.value)
         .toBe("repo:current-project");
       expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="branch"]')?.value)
@@ -519,6 +524,11 @@ describe.each([
       expect(document.querySelector('[data-edge-id="edge-loop"] .edge-label-badge')?.textContent).toContain("N");
       expect(document.querySelector(".canvas-shell")?.getAttribute("style")).toContain("--grid-major:");
       expect(document.querySelector(".minimap svg .mini-node.condition")).not.toBeNull();
+      const taskNode = document.querySelector<HTMLElement>(".node.task");
+      const taskBody = taskNode?.querySelector<HTMLElement>(".node-subtitle");
+      expect(dom.window.getComputedStyle(taskNode!).height).toBe("124px");
+      expect(dom.window.getComputedStyle(taskBody!).whiteSpace).toBe("normal");
+      expect(taskBody?.getAttribute("title")).toBe(taskBody?.textContent);
     } finally {
       dom.window.close();
     }
@@ -1088,6 +1098,233 @@ describe("work process and branch execution surface", () => {
 });
 
 describe("structured source work editing", () => {
+  it("refreshes an embedded side panel through the bridge response API", async () => {
+    const now = "2026-08-10T00:00:00.000Z";
+    const requests: any[] = [];
+    let refreshedStore: Record<string, any> | null = null;
+    const dom = await mountPanel(false, (bootstrap) => {
+      bootstrap.store.tasks = [{
+        id: "TASK-refresh", version: 3, title: "새로고침 전", prompt: "work", draft: "work",
+        promptRevisions: [], status: "backlog", priority: "medium", tags: [], createdAt: now, updatedAt: now,
+      }];
+      (bootstrap as typeof bootstrap & { bridgeApiUrl: string; dataSource: Record<string, unknown> }).bridgeApiUrl =
+        "http://127.0.0.1:61234/test/api";
+      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
+        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
+        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
+        capabilities: { taskMutation: true },
+      };
+      refreshedStore = structuredClone(bootstrap.store);
+      refreshedStore.tasks[0].title = "새로고침 후";
+      refreshedStore.tasks[0].version = 4;
+    }, (window) => {
+      Object.defineProperty(window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          const request = JSON.parse(String(init.body));
+          requests.push(request);
+          return Response.json({ ok: true, value: {
+            mode: "structured", status: "ready", catalog: [], store: refreshedStore,
+          } });
+        }),
+      });
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      expect(document.querySelector('[aria-label="Task 관리"]')?.textContent).toContain("새로고침 전");
+      document.querySelector<HTMLButtonElement>('.topbar [data-action="refresh-source"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(requests).toContainEqual({ type: "refresh-source", graphId: expect.any(String) });
+      expect(document.querySelector('[aria-label="Task 관리"]')?.textContent).toContain("새로고침 후");
+      expect(document.querySelector('.toast[role="status"]')?.textContent).toContain("데이터 원천을 새로고침했습니다");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("creates or reuses a Task before opening Todo quick run", async () => {
+    let preparedStore: Record<string, any> | null = null;
+    const dom = await mountPanel(true, (bootstrap) => {
+      const now = "2026-08-10T00:00:00.000Z";
+      bootstrap.store.tasks = [];
+      bootstrap.store.todos = [{
+        id: "TODO-quick", version: 8, title: "  원문 Todo  ", notes: "메모", draft: "  원문 Todo  ",
+        promptRevisions: [], status: "open", priority: "medium", tags: [],
+        createdAt: now, updatedAt: now,
+      }];
+      bootstrap.targets.projects = [{
+        id: "repo:work", name: "work", path: "/workspace/work", environmentId: "local",
+        worktreeId: "wt-main", branch: "refs/heads/main",
+      }];
+      bootstrap.targets.branches = [{
+        id: "branch:main", branch: "refs/heads/main", environmentId: "local",
+        projectId: "repo:work", repoId: "repo-work", worktreeId: "wt-main",
+      }];
+      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
+        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
+        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
+        capabilities: { taskMutation: true, todoMutation: true },
+      };
+      preparedStore = structuredClone(bootstrap.store);
+      preparedStore.tasks = [{
+        id: "TASK-from-todo", version: 1, title: "원문 Todo", prompt: "  원문 Todo  ", draft: "  원문 Todo  ",
+        promptRevisions: [], status: "backlog", priority: "medium", tags: [], createdAt: now, updatedAt: now,
+      }];
+      preparedStore.todos[0].taskId = "TASK-from-todo";
+    });
+    try {
+      const requests: any[] = [];
+      Object.defineProperty(dom.window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          const request = JSON.parse(String(init.body));
+          requests.push(request);
+          const value = request.type === "prepare-todo-quick-run"
+            ? { taskId: "TASK-from-todo", store: preparedStore }
+            : request.type === "task-project-context" ? {
+                taskId: "TASK-from-todo", taskVersion: 1, projects: [], registry: [], recommended: [],
+                environment: "정석맥1", current: null,
+              } : undefined;
+          return Response.json({ ok: true, value });
+        }),
+      });
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-todo-run"][data-id="TODO-quick"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const prepare = requests.find((request) => request.type === "prepare-todo-quick-run");
+      expect(prepare).toMatchObject({ type: "prepare-todo-quick-run", todoId: "TODO-quick" });
+      expect(prepare.idempotencyKey).toBe("todo-worktree-00000000-0000-4000-8000-000000000000");
+      expect(document.querySelector<HTMLElement>('[role="dialog"]')?.textContent).toContain("Task 워크트리 빠른 실행");
+      expect(document.querySelector<HTMLElement>('[role="dialog"]')?.textContent).toContain("TASK-from-todo");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("selects one registered Orca project and one actual worktree branch", async () => {
+    const dom = await mountPanel(true, (bootstrap) => {
+      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
+        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
+        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
+        capabilities: { taskMutation: true },
+      };
+    });
+    try {
+      const requests: any[] = [];
+      Object.defineProperty(dom.window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          const request = JSON.parse(String(init.body));
+          requests.push(request);
+          if (request.type === "task-project-context") {
+            return Response.json({ ok: true, value: {
+              taskId: request.taskId, taskVersion: 4, projects: [], environment: "정석맥1",
+              current: { repoId: "repo-a", path: "/workspace/a", branch: "refs/heads/main" },
+              recommended: [{
+                name: "Project A", path: "/workspace/a", environment: "정석맥1", repo_id: "repo-a",
+                worktrees: [
+                  { id: "wt-feature", path: "/workspace/a-feature", branch: "feature/review", display_name: "review" },
+                  { id: "wt-main", path: "/workspace/a", branch: "main", display_name: "main", is_main: true },
+                ],
+              }],
+              registry: [{
+                name: "Project A", path: "/workspace/a", environment: "정석맥1", repo_id: "repo-a",
+                worktrees: [
+                  { id: "wt-feature", path: "/workspace/a-feature", branch: "feature/review", display_name: "review" },
+                  { id: "wt-main", path: "/workspace/a", branch: "main", display_name: "main", is_main: true },
+                ],
+              }, {
+                name: "Project B", path: "/workspace/b", environment: "정석맥1", repo_id: "repo-b",
+                worktrees: [{ id: "wt-b", path: "/workspace/b", branch: "release", is_main: true }],
+              }],
+            } });
+          }
+          if (request.type === "link-task-projects") {
+            return Response.json({ ok: true, value: {
+              context: {
+                taskId: request.taskId, taskVersion: 5, registry: [], recommended: [], environment: "정석맥1", current: null,
+                projects: [{ role: "target", locatorKind: "folder", locator: request.paths[0], branch: request.branch, position: 0 }],
+              },
+            } });
+          }
+          return Response.json({ ok: true, value: undefined });
+        }),
+      });
+      const { document, Event } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const radios = [...document.querySelectorAll<HTMLButtonElement>('[role="radiogroup"] [role="radio"]')];
+      expect(radios).toHaveLength(2);
+      expect(radios[0]?.getAttribute("aria-checked")).toBe("true");
+      expect(radios[0]?.textContent).toContain("워크트리 2");
+      let branch = document.querySelector<HTMLSelectElement>('[data-scope="task-project-candidate"][data-field="branch"]');
+      expect(branch?.value).toBe("main");
+      expect([...(branch?.options ?? [])].map((item) => item.textContent)).toEqual([
+        "브랜치 지정 안 함", "main · 기본", "feature/review",
+      ]);
+
+      radios[1]?.click();
+      branch = document.querySelector<HTMLSelectElement>('[data-scope="task-project-candidate"][data-field="branch"]');
+      expect(branch?.value).toBe("release");
+      if (branch) {
+        branch.value = "";
+        branch.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      document.querySelector<HTMLButtonElement>('[data-action="connect-task-projects"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(requests.find((request) => request.type === "link-task-projects")).toMatchObject({
+        taskId: "task-design", paths: ["/workspace/b"],
+      });
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("does not auto-select a recommendation when the Task already has a target project", async () => {
+    const dom = await mountPanel(true, (bootstrap) => {
+      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
+        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
+        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
+        capabilities: { taskMutation: true },
+      };
+    });
+    try {
+      Object.defineProperty(dom.window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          const request = JSON.parse(String(init.body));
+          return Response.json({ ok: true, value: {
+            taskId: request.taskId, taskVersion: 4, environment: "정석맥1",
+            current: { repoId: "repo-current", path: "/workspace/current", branch: "main" },
+            projects: [{ role: "target", locatorKind: "folder", locator: "/workspace/already", position: 0 }],
+            recommended: [{
+              name: "Current", path: "/workspace/current", environment: "정석맥1", repo_id: "repo-current",
+              worktrees: [{ id: "wt-current", path: "/workspace/current", branch: "main", is_main: true }],
+            }],
+            registry: [{
+              name: "Current", path: "/workspace/current", environment: "정석맥1", repo_id: "repo-current",
+              worktrees: [{ id: "wt-current", path: "/workspace/current", branch: "main", is_main: true }],
+            }],
+          } });
+        }),
+      });
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(document.querySelector('[role="radiogroup"] [aria-checked="true"]')).toBeNull();
+      expect(document.querySelector('[data-scope="task-project-candidate"]')).toBeNull();
+    } finally {
+      dom.window.close();
+    }
+  });
+
   it("sends the last-read CAS version and full supported Task DTO", async () => {
     const dom = await mountPanel(true, (bootstrap) => {
       const now = "2026-08-09T00:00:00.000Z";

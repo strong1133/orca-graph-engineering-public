@@ -22,6 +22,7 @@ const {
   mapOrcaRepos,
   normalizeWorkBranch,
   taskProjectInput,
+  todoQuickTaskInput,
   workTasksClientFromEnvironment,
   workTasksEnvironment,
 } = await import(`./${["work", "tasks"].join("-")}-client.mjs`);
@@ -49,6 +50,7 @@ let queue = Promise.resolve();
 let inputBuffer = "";
 let wideServer = null;
 let wideUrl = null;
+let wideApiUrl = null;
 const wideToken = crypto.randomUUID();
 const workTasksClient = workTasksClientFromEnvironment();
 const workTasksEnvironmentKey = ["ORCA", "GRAPH", "WORK", "TASKS", "ENVIRONMENT"].join("_");
@@ -143,11 +145,15 @@ function projectRelation(value) {
 
 async function currentOrcaProject() {
   try {
-    const [value, processes] = await Promise.all([
-      runOrca(["worktree", "current"], 30_000, launchCwd),
-      runOrca(["worktree", "ps", "--limit", "300"], 30_000, root),
-    ]);
-    const worktree = (processes.worktrees ?? []).find((item) => item.isActive) ?? value?.worktree;
+    // The bridge launch directory is the strongest project signal. Orca's
+    // global isActive flag can point at whichever workspace the user clicked
+    // most recently and must not override this Task execution context.
+    const value = await runOrca(["worktree", "current"], 30_000, launchCwd);
+    let worktree = value?.worktree;
+    if (!worktree) {
+      const processes = await runOrca(["worktree", "ps", "--limit", "300"], 30_000, root);
+      worktree = (processes.worktrees ?? []).find((item) => item.isActive);
+    }
     if (!worktree) return null;
     return {
       ...(worktree.repoId ? { repoId: String(worktree.repoId) } : {}),
@@ -176,10 +182,17 @@ async function taskProjectContext(taskId, workspaceHint = "") {
     : []);
   const localRegistry = registry.filter((project) => project.environment === localWorkTasksEnvironment);
   const normalizedHint = String(workspaceHint || "").trim().toLocaleLowerCase("ko-KR");
-  const recommended = localRegistry.filter((project) =>
+  const exactCurrentMatches = localRegistry.filter((project) =>
     (current?.repoId && project.repo_id === current.repoId)
-    || (current?.path && (project.path === current.path || current.path.startsWith(`${project.path}${path.sep}`)))
-    || (normalizedHint && project.name.toLocaleLowerCase("ko-KR") === normalizedHint));
+    || (current?.path && project.path === current.path));
+  const ancestorCurrentMatches = localRegistry.filter((project) =>
+    current?.path && current.path.startsWith(`${project.path}${path.sep}`));
+  // Prefer the exact repository/worktree over broader parent folders. A
+  // parent folder may also be registered as an Orca project, but selecting it
+  // would send the Task to the wrong checkout.
+  const currentMatches = exactCurrentMatches.length ? exactCurrentMatches : ancestorCurrentMatches;
+  const recommended = currentMatches.length ? currentMatches : localRegistry.filter((project) =>
+    normalizedHint && project.name.toLocaleLowerCase("ko-KR") === normalizedHint);
   return {
     taskId,
     taskVersion: Number(taskPayload.item?.version || 0),
@@ -248,6 +261,41 @@ async function setTaskProjectBranch(taskId, projectId, locator, branchValue) {
   }
   const refreshed = await refreshConfiguredDataSource(undefined);
   return { context: await taskProjectContext(taskId), store: refreshed.store };
+}
+
+async function prepareStructuredTodoQuickRun(todoId, idempotencyKey) {
+  const config = await readDataSourceConfig();
+  if (config.mode !== "structured") throw new Error("Todo quick Task creation requires a structured data source");
+  const client = requireWorkTasks();
+  const detail = await client.get(`/todos/${encodeURIComponent(todoId)}`);
+  const todo = detail.item;
+  if (!todo?.id) throw new Error(`todo not found: ${todoId}`);
+  if (todo.archived_at) throw new Error(`archived todo cannot be executed: ${todoId}`);
+  if (["done", "cancelled"].includes(todo.status)) throw new Error(`closed todo cannot be executed: ${todoId}`);
+
+  let taskId = detail.task_binding?.id ? String(detail.task_binding.id) : "";
+  let idempotentReplay = true;
+  if (!taskId) {
+    const replayKey = String(idempotencyKey || "").trim();
+    if (!replayKey || replayKey.length > 200) throw new Error("Todo quick-run idempotency key is invalid");
+    try {
+      const created = await client.post(`/todos/${encodeURIComponent(todoId)}/task`, {
+        expected_todo_version: Number(todo.version),
+        idempotency_key: replayKey,
+        task: todoQuickTaskInput(todo),
+      });
+      taskId = String(created.task?.id || "");
+      idempotentReplay = Boolean(created.idempotent_replay);
+    } catch (error) {
+      // A stale Todo is never retried with an invented version. Re-read only so
+      // the next user action can start from the authoritative aggregate.
+      if (error?.status === 409) await client.get(`/todos/${encodeURIComponent(todoId)}`);
+      throw error;
+    }
+  }
+  if (!taskId) throw new Error(`Todo quick Task response did not include a Task id: ${todoId}`);
+  const refreshed = await refreshConfiguredDataSource(config);
+  return { todoId, taskId, idempotentReplay, store: refreshed.store };
 }
 
 async function enrichWorkProcessSource(cache) {
@@ -357,6 +405,7 @@ async function rebuild() {
     targets,
     dataSource,
     builtAt: new Date().toISOString(),
+    ...(wideApiUrl ? { bridgeApiUrl: wideApiUrl } : {}),
   });
 }
 
@@ -506,6 +555,7 @@ function sendJson(response, status, value) {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
+    "access-control-allow-origin": "*",
   });
   response.end(`${JSON.stringify(value)}\n`);
 }
@@ -539,6 +589,16 @@ async function ensureWideServer() {
         sendJson(response, 200, { ok: true, value });
         return;
       }
+      if (request.method === "OPTIONS" && request.url === apiRoute) {
+        response.writeHead(204, {
+          "cache-control": "no-store",
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "POST, OPTIONS",
+          "access-control-allow-headers": "content-type",
+        });
+        response.end();
+        return;
+      }
       sendJson(response, 404, { ok: false, error: "not found" });
     } catch (error) {
       sendJson(response, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
@@ -555,6 +615,7 @@ async function ensureWideServer() {
   }
   wideServer = server;
   wideUrl = `http://127.0.0.1:${address.port}${panelRoute}`;
+  wideApiUrl = `http://127.0.0.1:${address.port}${apiRoute}`;
   return wideUrl;
 }
 
@@ -564,6 +625,7 @@ async function openWideView() {
   const existing = Array.isArray(current.tabs) ? current.tabs.find((tab) => tab?.url === url) : null;
   if (existing?.browserPageId) {
     await runOrca(["tab", "switch", "--page", existing.browserPageId, "--focus"], 30_000, launchCwd);
+    await runOrca(["reload", "--page", existing.browserPageId], 30_000, launchCwd);
     return { url, reused: true };
   }
   await runOrca(["tab", "create", "--url", url], 30_000, launchCwd);
@@ -2128,6 +2190,26 @@ async function runStandaloneTask(taskId, requestedRouting, dryRun) {
   return runStandaloneWorkItem("task", taskId, requestedRouting, dryRun);
 }
 
+async function runTodoThroughQuickTask(todoId, requestedRouting, dryRun, idempotencyKey) {
+  const config = await readDataSourceConfig();
+  if (config.mode !== "structured") {
+    return runStandaloneWorkItem("todo", todoId, requestedRouting, dryRun);
+  }
+  if (dryRun) {
+    throw new Error("an unbound structured Todo cannot be planned without creating its Task; open the quick-run dialog instead");
+  }
+  const prepared = await prepareStructuredTodoQuickRun(todoId, idempotencyKey);
+  const routing = standaloneRouting(requestedRouting);
+  const targets = await readTargets();
+  const project = targets.projects.find((item) => item.id === routing.projectId
+    && targetEnvironmentId(item) === targetEnvironmentId({ environmentId: routing.environmentId }));
+  if (project?.path) {
+    await linkTaskProjects(prepared.taskId, [project.path], routing.branch);
+  }
+  const result = await runStandaloneTask(prepared.taskId, routing, false);
+  return { ...result, todoId, taskId: prepared.taskId };
+}
+
 async function handleMessage(message) {
   switch (message?.type) {
     case "save":
@@ -2149,6 +2231,8 @@ async function handleMessage(message) {
       }
     case "task-project-context":
       return taskProjectContext(String(message.taskId || ""), String(message.workspaceHint || ""));
+    case "prepare-todo-quick-run":
+      return prepareStructuredTodoQuickRun(String(message.todoId || ""), message.idempotencyKey);
     case "current-orca-project":
       return currentOrcaProject();
     case "link-task-projects":
@@ -2198,7 +2282,9 @@ async function handleMessage(message) {
     }
     case "run-todo": {
       const todoId = String(message.todoId || "");
-      const result = await runStandaloneWorkItem("todo", todoId, message.routing, Boolean(message.dryRun));
+      const result = await runTodoThroughQuickTask(
+        todoId, message.routing, Boolean(message.dryRun), message.idempotencyKey,
+      );
       console.log(`[bridge] todo ${todoId} ${message.dryRun ? "planned" : "executed"}`);
       return result;
     }
@@ -2271,6 +2357,14 @@ setInterval(() => {
 }, 30_000).unref();
 
 await mkdir(runtimeDir, { recursive: true });
+if (process.env.ORCA_GRAPH_SKIP_REBUILD !== "1") {
+  try {
+    await ensureWideServer();
+    await rebuild();
+  } catch (error) {
+    console.error(`[bridge] response bridge bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 console.log("Graph Engineering bridge ready");
 console.log(`root: ${root}`);
 console.log("Keep this terminal open while using the plugin panel.");

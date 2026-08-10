@@ -218,3 +218,16 @@ export function taskProjectInput(project) {
     position: Number(project.position) || 0,
   };
 }
+
+export function todoQuickTaskInput(todo) {
+  const content = typeof todo?.content === "string" ? todo.content : "";
+  if (!content.trim()) throw new WorkTasksClientError(`todo has no content: ${todo?.id || "unknown"}`);
+  return {
+    title: content.trim().slice(0, 300) || String(todo.id),
+    description: typeof todo.memo === "string" && todo.memo.trim() ? todo.memo : null,
+    due_on: todo.due_on ?? null,
+    priority: todo.priority,
+    // The Todo source text is the Task draft contract. Do not trim or normalize it.
+    draft: content,
+  };
+}
