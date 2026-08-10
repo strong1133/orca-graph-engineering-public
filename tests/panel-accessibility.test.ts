@@ -153,6 +153,43 @@ describe.each([
     }
   });
 
+  it("opens a standalone Task run dialog with one-off Orca routing", async () => {
+    const dom = await mountPanel(wide, ({ store, targets }) => {
+      store.bridgeWorkspace = "current-project";
+      targets.projects = [{ id: "repo:current-project", name: "current-project", worktreeId: "worktree-current-project" }];
+    });
+    try {
+      const { document, Event } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
+
+      const detail = document.querySelector<HTMLElement>('[aria-label="Task 상세"]');
+      const opener = detail?.querySelector<HTMLButtonElement>('[data-action="open-task-run"]');
+      expect(opener?.textContent).toContain("Task 실행");
+      opener?.click();
+
+      let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).toContain("Task 단건 실행");
+      expect(dialog?.textContent).toContain("그래프 run이나 노드 claim을 만들지 않고");
+      expect(dialog?.textContent).toContain("현재 브리지 작업공간 자동 선택");
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="projectId"]')?.value).toBe("repo:current-project");
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="model"]')?.value).toBe("gpt-5.6-sol");
+      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
+
+      const model = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="model"]');
+      if (model) {
+        model.value = "claude-opus-5";
+        model.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).toContain("Claude Opus 5");
+      expect([...dialog?.querySelectorAll<HTMLOptionElement>('[data-scope="task-run-routing"][data-field="reasoning"] option') ?? []]
+        .map((option) => option.value)).toEqual(["", "low", "medium", "high", "xhigh", "max"]);
+    } finally {
+      dom.window.close();
+    }
+  });
+
   it("shows active Todos by default while preserving completed and cancelled history", async () => {
     const dom = await mountPanel(wide, (bootstrap) => {
       const now = "2026-08-09T00:00:00.000Z";

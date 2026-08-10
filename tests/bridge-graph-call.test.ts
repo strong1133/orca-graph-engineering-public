@@ -202,6 +202,54 @@ const pureRouteFailures = [
 ] as const;
 
 describe("bridge graph calls", () => {
+  it("plans and executes one Task without creating a graph run", async () => {
+    const root = process.cwd();
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const store = JSON.parse(await readFile(path.join(root, "fixtures/default-store.json"), "utf8"));
+    const now = "2026-08-10T00:00:00.000Z";
+    store.tasks = [{
+      id: "TASK-standalone",
+      title: "단건 Task",
+      prompt: "단건 실행 프롬프트",
+      draft: "단건 실행 프롬프트",
+      promptRevisions: [],
+      status: "ready",
+      priority: "medium",
+      tags: [],
+      createdAt: now,
+      updatedAt: now,
+    }];
+    await writeFile(path.join(runtimeDirectory, "store.json"), `${JSON.stringify(store)}\n`, "utf8");
+    const fake = await installFakeOrca(runtimeDirectory);
+    const environment = { ORCA_CLI_COMMAND: fake.command, ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog };
+
+    await sendToBridge(
+      runtimeDirectory,
+      { type: "run-task", taskId: "TASK-standalone", routing: { projectId: "fake-project", model: "gpt-5.6-sol", reasoning: "high" }, dryRun: true },
+      "task TASK-standalone planned",
+      environment,
+    );
+    expect(await readCallLog(fake.callLog)).toBe("");
+
+    await sendToBridge(
+      runtimeDirectory,
+      { type: "run-task", taskId: "TASK-standalone", routing: { projectId: "fake-project", model: "gpt-5.6-sol", reasoning: "high" }, dryRun: false },
+      "task TASK-standalone executed",
+      environment,
+    );
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    const create = calls.find((args) => args[0] === "terminal" && args[1] === "create");
+    const send = calls.find((args) => args[0] === "terminal" && args[1] === "send");
+    expect(create).toEqual(expect.arrayContaining(["--worktree", "id:fake-worktree", "--title", "Task · 단건 Task"]));
+    expect(create?.join(" ")).toContain("codex --model");
+    expect(send?.join("\n")).toContain("Task: 단건 Task (TASK-standalone)");
+    expect(send?.join("\n")).toContain("단건 실행 프롬프트");
+    expect(send?.join("\n")).not.toContain("Graph:");
+    const after = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
+    expect(after.graphs.every((graph: { runs: unknown[] }) => graph.runs.length === 0)).toBe(true);
+  });
+
   it("plans a child graph recursively and records bidirectional run lineage", async () => {
     const root = process.cwd();
     const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));

@@ -667,6 +667,42 @@ function buildPrompt(graph, node, runId) {
   ].filter(Boolean).join("\n");
 }
 
+function standaloneRouting(value) {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error("standalone task routing must be an object");
+  const routing = {};
+  for (const key of ["projectId", "sessionId", "model", "reasoning"]) {
+    const candidate = value[key];
+    if (candidate === undefined || candidate === null || candidate === "") continue;
+    if (typeof candidate !== "string") throw new Error(`standalone task routing ${key} must be a string`);
+    const normalized = candidate.trim();
+    if (normalized) routing[key] = normalized;
+  }
+  return routing;
+}
+
+function buildStandaloneTaskPrompt(task, routing, scope) {
+  return [
+    "Execute this Task as a standalone assignment in the selected Orca project/session.",
+    `Task: ${task.title} (${task.id})`,
+    task.version !== undefined ? `Task version: ${task.version}` : null,
+    scope.domain ? `Domain: ${scope.domain.name} (${scope.domain.id})` : null,
+    scope.milestone ? `Milestone: ${scope.milestone.name} (${scope.milestone.id})` : null,
+    "",
+    "Task prompt:",
+    task.prompt,
+    "",
+    "Execution target:",
+    `- project: ${routing.projectId || "current"}`,
+    `- session: ${routing.sessionId || "new"}`,
+    `- model: ${routing.model || "agent default"}`,
+    `- reasoning: ${routing.reasoning || "agent default/current"}`,
+    "",
+    "Follow the target repository's instructions and complete only this Task.",
+    "Finish with a concise result and the verification performed.",
+  ].filter(Boolean).join("\n");
+}
+
 function findTerminalHandle(result) {
   return result?.terminal?.handle || result?.startupTerminal?.handle || result?.handle || null;
 }
@@ -787,8 +823,8 @@ async function attestExecutionPlan(plan) {
   for (const route of existingRoutes) await waitForExistingSessionIdle(route, evidence);
 }
 
-async function dispatchTask(graph, node, targets, runId) {
-  const prompt = buildPrompt(graph, node, runId);
+async function dispatchTask(graph, node, targets, runId, options = {}) {
+  const prompt = options.prompt || buildPrompt(graph, node, runId);
   const route = resolveTaskRoute(graph, node, targets);
   let handle = null;
   if (route.mode === "existing-session") {
@@ -799,7 +835,7 @@ async function dispatchTask(graph, node, targets, runId) {
     const created = await runOrca([
       "terminal", "create",
       "--worktree", `id:${route.project.worktreeId}`,
-      "--title", `${graph.name} · ${node.label || node.id}`,
+      "--title", options.title || `${graph.name} · ${node.label || node.id}`,
       "--command", commandForModel(route.model, route.routing.reasoning),
     ]);
     handle = findTerminalHandle(created);
@@ -1526,6 +1562,44 @@ async function runGraph(graphId, dryRun) {
   return executeGraph({ store, targets, graph, dryRun, context: { stack: [], depthLimit: plan.depthLimit } });
 }
 
+async function runStandaloneTask(taskId, requestedRouting, dryRun) {
+  const dataSourceConfig = await readDataSourceConfig();
+  const [store, targets] = await Promise.all([
+    readWorkingStore(dataSourceConfig),
+    readTargets(),
+  ]);
+  const task = (store.tasks ?? []).find((item) => item.id === taskId);
+  if (!task) throw new Error(`task not found: ${taskId}`);
+  if (task.status === "archived") throw new Error(`archived task cannot be executed: ${taskId}`);
+  const prompt = String(task.prompt || "").trim();
+  if (!prompt) throw new Error(`task has no executable prompt: ${taskId}`);
+  if (prompt.length > 500_000) throw new Error(`task prompt is too large: ${taskId}`);
+
+  const routing = standaloneRouting(requestedRouting);
+  const graph = { id: `standalone:${task.id}`, name: "Task 단건 실행", defaults: routing };
+  const node = {
+    id: `standalone:${task.id}`,
+    kind: "task",
+    label: task.title,
+    task: { id: task.id, title: task.title, prompt, ...(task.version !== undefined ? { version: task.version } : {}) },
+    routing: {},
+    engineering: { contextMode: "inherit", timeoutSeconds: 900 },
+  };
+  const route = resolveTaskRoute(graph, node, targets);
+  const plan = { dryRun, tasks: [{ route }] };
+  await attestExecutionPlan(plan);
+  const target = route.mode === "existing-session"
+    ? { mode: route.mode, sessionId: route.session.id, model: route.model?.id ?? null }
+    : { mode: route.mode, projectId: route.project.id, model: route.model.id };
+  if (dryRun) return { taskId, planned: true, target };
+
+  const dispatched = await dispatchTask(graph, node, targets, `task-${crypto.randomUUID().slice(0, 8)}`, {
+    prompt: buildStandaloneTaskPrompt({ ...task, prompt }, route.routing, scopeContext(store, task)),
+    title: `Task · ${task.title}`,
+  });
+  return { taskId, completed: true, sessionId: dispatched.sessionId, target };
+}
+
 async function handleMessage(message) {
   switch (message?.type) {
     case "save":
@@ -1562,6 +1636,12 @@ async function handleMessage(message) {
       await runGraph(String(message.graphId), Boolean(message.dryRun));
       console.log(`[bridge] graph ${message.graphId} ${message.dryRun ? "planned" : "executed"}`);
       return;
+    case "run-task": {
+      const taskId = String(message.taskId || "");
+      const result = await runStandaloneTask(taskId, message.routing, Boolean(message.dryRun));
+      console.log(`[bridge] task ${taskId} ${message.dryRun ? "planned" : "executed"}`);
+      return result;
+    }
     case "open-wide": {
       const result = await openWideView();
       console.log(`[bridge] wide view opened at ${result.url}`);
