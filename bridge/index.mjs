@@ -105,10 +105,28 @@ async function publishLocalOrcaProjects({ force = false } = {}) {
   if (!force && signature === publishedProjectSignature) {
     return { environment: localWorkTasksEnvironment, projects, changed: false };
   }
-  const response = await client.put(`/orca-projects/${encodeURIComponent(localWorkTasksEnvironment)}`, { projects });
-  publishedProjectSignature = signature;
+  let response;
+  let compatibility = null;
+  try {
+    response = await client.put(`/orca-projects/${encodeURIComponent(localWorkTasksEnvironment)}`, { projects });
+    publishedProjectSignature = signature;
+  } catch (error) {
+    const detail = JSON.stringify(error?.detail ?? "");
+    const olderRegistry = error?.status === 422 && detail.includes("extra_forbidden") && detail.includes("worktrees");
+    if (!olderRegistry) throw error;
+    // v31 servers reject the additive v32 worktree array. Publish the canonical
+    // project fields once so project recommendation keeps working during a
+    // rolling deployment; leave the signature unset so the next explicit
+    // target refresh probes the richer contract again.
+    const projectOnly = projects.map(({ worktrees: _worktrees, ...project }) => project);
+    response = await client.put(`/orca-projects/${encodeURIComponent(localWorkTasksEnvironment)}`, { projects: projectOnly });
+    compatibility = "project-only";
+  }
   publishedProjects = projects;
-  return { environment: localWorkTasksEnvironment, projects, changed: true, item: response.item };
+  return {
+    environment: localWorkTasksEnvironment, projects, changed: true, item: response.item,
+    ...(compatibility ? { compatibility } : {}),
+  };
 }
 
 function projectRelation(value) {
@@ -445,6 +463,17 @@ async function readWorkingStore(config = undefined) {
     throw new Error(`${config.mode} source has no valid snapshot; refresh the data source first`);
   }
   return mergeBridgeRuntime(cache.store, localStore);
+}
+
+async function adoptBridgeTerminal(terminalId) {
+  if (typeof terminalId !== "string" || !terminalId.trim()) throw new Error("bridge terminal id is required");
+  const shown = await runOrca(["terminal", "show", "--terminal", terminalId.trim()]);
+  if (!shown?.terminal?.connected || !shown.terminal.writable) throw new Error("bridge terminal is unavailable or read-only");
+  const store = await readJson(storePath, defaultStorePath);
+  store.bridgeTerminalId = terminalId.trim();
+  await atomicJson(storePath, store);
+  await rebuild();
+  return { terminalId: store.bridgeTerminalId, store };
 }
 
 async function runOrca(args, timeout = 30_000, cwd = root, environmentSelector = null) {
@@ -2088,6 +2117,11 @@ async function handleMessage(message) {
         console.log("[bridge] graph store saved");
         return result;
       }
+    case "adopt-terminal": {
+      const result = await adoptBridgeTerminal(message.terminalId);
+      console.log(`[bridge] adopted terminal ${result.terminalId}`);
+      return result;
+    }
     case "refresh":
       {
         const result = await refreshTargets();

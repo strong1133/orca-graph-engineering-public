@@ -8,11 +8,14 @@ const root = process.cwd();
 const [terminalId, operation = "ping"] = process.argv.slice(2);
 
 if (!terminalId) {
-  console.error("Usage: npm run bridge:client -- <terminal-handle> bootstrap|refresh|plan|ping|open-wide");
+  console.error("Usage: npm run bridge:client -- <terminal-handle> adopt|bootstrap|refresh|plan|ping|open-wide");
   process.exit(2);
 }
 
 async function payloadFor(name) {
+  if (name === "adopt") {
+    return { type: "adopt-terminal", terminalId };
+  }
   if (name === "bootstrap") {
     const store = JSON.parse(await readFile(path.join(root, "fixtures/default-store.json"), "utf8"));
     store.bridgeTerminalId = terminalId;

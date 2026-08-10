@@ -2049,11 +2049,15 @@ function renderModal(): string {
     const target = route.sessionId
       ? `기존 세션 · ${sessionName(route.sessionId, route.environmentId)}`
       : route.projectId ? `새 세션 · ${projectName(route.projectId, route.environmentId)}` : "실행 대상 미지정";
+    const selectedRouteProject = targets.projects.find((item) => item.id === route.projectId
+      && routeEnvironmentId(item.environmentId) === routeEnvironmentId(route.environmentId));
+    const willLinkTarget = dataSource.config.mode === "structured"
+      && !taskHasTargetProject(task.id) && Boolean(selectedRouteProject?.path);
     const problems = [
       ...(task.status === "archived" ? [`${task.title}: 보관된 Task는 실행할 수 없습니다.`] : []),
       ...(!task.prompt.trim() ? [`${task.title}: 실행할 Prompt가 없습니다.`] : []),
-      ...(dataSource.config.mode === "structured" && !taskHasTargetProject(task.id)
-        ? [`${task.title}: 실행 전에 Task 대상 프로젝트를 확인·연결하십시오.`] : []),
+      ...(dataSource.config.mode === "structured" && !taskHasTargetProject(task.id) && !selectedRouteProject?.path
+        ? [`${task.title}: 실행할 Orca 프로젝트를 하나 선택하십시오.`] : []),
       ...routingProblemMessages(task.title, route),
     ];
     const promptLabel = currentMetaRevision(task)?.status === "current" ? "현재 Meta Draft" : "현재 사람 Draft";
@@ -2062,9 +2066,9 @@ function renderModal(): string {
       <div class="modal-body">
         <section class="task-run-summary"><span class="badge">${esc(task.status)}</span><strong>${esc(task.title)}</strong><small>${esc(task.id)}</small></section>
         <p class="help">그래프 run이나 노드 claim을 만들지 않고 이 Task의 ${promptLabel}만 독립 실행합니다. 원천 Task 상태는 자동으로 바뀌지 않습니다.</p>
-        ${dataSource.config.mode === "structured" && !taskHasTargetProject(task.id) ? taskProjectSection(task) : ""}
         <section class="section run-defaults">
-          <div class="section-title">실행 대상 ${modal.suggestedProjectId && route.projectId === modal.suggestedProjectId ? '<span class="badge">현재 브리지 작업공간 자동 선택 · Orca 컨텍스트 추천</span>' : ""}</div>
+          <div class="section-title">실행 대상 ${modal.suggestedProjectId && route.projectId === modal.suggestedProjectId ? '<span class="badge">현재 브리지 작업공간 자동 선택 · Orca 컨텍스트 추천</span>' : ""}${willLinkTarget ? '<span class="badge good">실행 시 Task target 연결</span>' : ""}</div>
+          ${willLinkTarget ? '<p class="help">선택한 프로젝트 하나와 작업 브랜치를 실행 직전에 Task의 target · folder 관계로 CAS 저장합니다.</p>' : ""}
           <div class="run-routing-grid">
             <label class="field"><span>Orca 환경</span><select data-scope="task-run-routing" data-field="environmentId">${environmentOptions(route.environmentId)}</select></label>
             <label class="field"><span>프로젝트</span><select data-scope="task-run-routing" data-field="projectId">${projectOptions(route.projectId, false, route.environmentId)}</select></label>
