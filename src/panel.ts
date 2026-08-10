@@ -2127,6 +2127,10 @@ function workGroupLabel(item: LocalTask | LocalTodo, isTask: boolean): string {
   return "전체";
 }
 
+function workGroupKey(label: string, isTask: boolean): string {
+  return `${isTask ? "task" : "todo"}:${view.workGroup}:${label}`;
+}
+
 function renderWorkCards(items: Array<LocalTask | LocalTodo>, isTask: boolean, selectedId: string | undefined): string {
   const groups = new Map<string, Array<LocalTask | LocalTodo>>();
   for (const item of items) {
@@ -2134,7 +2138,7 @@ function renderWorkCards(items: Array<LocalTask | LocalTodo>, isTask: boolean, s
     groups.set(label, [...(groups.get(label) ?? []), item]);
   }
   return [...groups.entries()].map(([label, grouped]) => {
-    const groupKey = `${isTask ? "task" : "todo"}:${view.workGroup}:${label}`;
+    const groupKey = workGroupKey(label, isTask);
     const collapsible = view.workGroup !== "none";
     const collapsed = collapsible && view.collapsedWorkGroups.has(groupKey);
     return `<section class="work-group ${collapsed ? "collapsed" : ""}" aria-label="그룹 ${esc(label)}">
@@ -2181,6 +2185,9 @@ function renderLocalWorkManager(kind: "task" | "todo"): string {
   const countLabel = isTask
     ? `표시 ${items.length} · 전체 ${store.tasks.length}`
     : `표시 ${items.length} · 활성 ${activeTodoCount} · 전체 ${store.todos.length}`;
+  const visibleGroupKeys = [...new Set(items.map((item) => workGroupKey(workGroupLabel(item, isTask), isTask)))];
+  const allGroupsCollapsed = visibleGroupKeys.length > 0 && visibleGroupKeys.every((key) => view.collapsedWorkGroups.has(key));
+  const allGroupsExpanded = visibleGroupKeys.every((key) => !view.collapsedWorkGroups.has(key));
   return `<section class="work-manager" aria-label="${isTask ? "Task" : "Todo"} 관리">
     <header class="work-manager-header">
       <div><strong>${isTask ? "Task 관리" : "Todo 관리"}</strong><span>${countLabel}</span><span class="badge">${dataSource.config.mode === "structured" ? "구조화 원천 · 양방향" : dataSource.config.mode === "folder" ? "폴더 원천 · 저장형" : dataSource.config.mode === "unstructured" ? "로컬 + 외부 후보" : "로컬"}</span></div>
@@ -2193,6 +2200,7 @@ function renderLocalWorkManager(kind: "task" | "todo"): string {
         <select data-action="work-group" aria-label="목록 그룹화">${option("none", "그룹화 없음", view.workGroup)}${option("domain", "Domain별 그룹", view.workGroup)}${option("milestone", "Milestone별 그룹", view.workGroup)}${option("status", "상태별 그룹", view.workGroup)}${option("priority", "우선순위별 그룹", view.workGroup)}</select>
         <select data-action="work-sort" aria-label="업무 정렬">${option("updated-desc", "최근 수정순", view.workSort)}${option("due-asc", "마감 임박순", view.workSort)}${option("priority", "우선순위", view.workSort)}${option("title", "이름순", view.workSort)}</select>
       </div>
+      ${view.workGroup !== "none" && items.length ? `<span class="work-group-bulk-actions" aria-label="그룹 일괄 제어"><button data-action="collapse-all-work-groups" ${allGroupsCollapsed ? "disabled" : ""}>모두 접기</button><button data-action="expand-all-work-groups" ${allGroupsExpanded ? "disabled" : ""}>모두 펼치기</button></span>` : ""}
     </header>
     <div class="work-manager-body ${isTask ? "task-list-only" : ""} ${items.length ? "" : "empty"}">
       <div class="work-list">
@@ -2938,6 +2946,18 @@ app.addEventListener("click", (event) => {
       if (!groupKey) return;
       if (view.collapsedWorkGroups.has(groupKey)) view.collapsedWorkGroups.delete(groupKey);
       else view.collapsedWorkGroups.add(groupKey);
+      render();
+      break;
+    }
+    case "collapse-all-work-groups":
+    case "expand-all-work-groups": {
+      const groupKeys = [...app.querySelectorAll<HTMLElement>('[data-action="toggle-work-group"]')]
+        .map((item) => item.dataset.id)
+        .filter((key): key is string => Boolean(key));
+      for (const groupKey of groupKeys) {
+        if (action === "collapse-all-work-groups") view.collapsedWorkGroups.add(groupKey);
+        else view.collapsedWorkGroups.delete(groupKey);
+      }
       render();
       break;
     }

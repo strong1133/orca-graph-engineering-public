@@ -539,6 +539,7 @@ textarea { resize: vertical; min-height: 74px; line-height: 1.45; }
 .work-manager-header > .graph-search { grid-column: 1 / -1; }
 .work-manager-actions { display: flex; align-items: center; gap: 6px; }
 .work-controls { display: grid; grid-column: 1 / -1; grid-template-columns: minmax(220px, 1.4fr) repeat(5, minmax(118px, .7fr)); gap: 7px; }
+.work-group-bulk-actions { display: flex; grid-column: 1 / -1; justify-content: flex-end; gap: 6px; }
 .work-manager-body { display: grid; min-height: 0; flex: 1; grid-template-columns: minmax(280px, 38%) minmax(0, 1fr); overflow: hidden; }
 .work-manager-body.source-only { display: block; overflow-y: auto; }
 .work-manager-body.task-list-only { display: block; }

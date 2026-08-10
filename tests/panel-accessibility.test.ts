@@ -264,6 +264,21 @@ describe.each([
       expect(expandedToggle?.getAttribute("aria-expanded")).toBe("true");
       expect(expandedToggle?.closest(".work-group")?.querySelector(".work-card")).not.toBeNull();
 
+      const collapseAll = document.querySelector<HTMLButtonElement>('[data-action="collapse-all-work-groups"]');
+      expect(collapseAll?.disabled).toBe(false);
+      collapseAll?.click();
+      const collapsedGroups = [...document.querySelectorAll<HTMLButtonElement>('[data-action="toggle-work-group"]')];
+      expect(collapsedGroups.length).toBeGreaterThan(1);
+      expect(collapsedGroups.every((item) => item.getAttribute("aria-expanded") === "false")).toBe(true);
+      expect(document.querySelectorAll(".work-list .work-card")).toHaveLength(0);
+      expect(document.querySelector<HTMLButtonElement>('[data-action="collapse-all-work-groups"]')?.disabled).toBe(true);
+
+      document.querySelector<HTMLButtonElement>('[data-action="expand-all-work-groups"]')?.click();
+      const expandedGroups = [...document.querySelectorAll<HTMLButtonElement>('[data-action="toggle-work-group"]')];
+      expect(expandedGroups.every((item) => item.getAttribute("aria-expanded") === "true")).toBe(true);
+      expect(document.querySelectorAll(".work-list .work-card").length).toBeGreaterThan(0);
+      expect(document.querySelector<HTMLButtonElement>('[data-action="expand-all-work-groups"]')?.disabled).toBe(true);
+
       const search = document.querySelector<HTMLInputElement>('[data-action="work-search"]');
       if (search) {
         search.value = "v1 출시";

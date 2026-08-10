@@ -12,7 +12,7 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 T
 - 설계/실행 보기 분리, 기본·Task·실행·안전 Inspector 탭, 선택 문맥 툴바와 구조 Problems 패널
 - 그래프 호출 breadcrumb 탐색, 노드 검색, 단축키 도움말, 대형 그래프 드래그·이동 중 DOM 직접 갱신
 - Domain→Milestone→Task/Todo 업무 계층과 Domain·Milestone 독립 관리 화면
-- Task/Todo 목록의 Draft·Meta·Domain·Milestone 통합 검색, 범위·상태 필터, Domain/Milestone/상태/우선순위 그룹화·그룹 접기/펼치기와 정렬
+- Task/Todo 목록의 Draft·Meta·Domain·Milestone 통합 검색, 범위·상태 필터, Domain/Milestone/상태/우선순위 그룹화·개별/전체 접기·펼치기와 정렬
 - 사람 Draft와 Meta Draft의 분리 저장, revision lineage, stale 감지, 자체 포함형 Meta Prompt 생성
 - 독립적인 Task/Todo 상태·우선순위·마감일·태그 관리와 Todo→Task 전환
 - 하나의 Task를 여러 그래프 노드에 연결하고 관리 화면에서 연결 위치로 이동
