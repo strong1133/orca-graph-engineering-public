@@ -55,6 +55,8 @@ export interface GraphEngineeringPolicy {
 export interface RoutingTarget {
   environmentId?: string;
   projectId?: string;
+  /** Existing Orca-managed worktree branch used for new sessions. */
+  branch?: string;
   sessionId?: string;
   model?: string;
   reasoning?: string;
@@ -149,8 +151,20 @@ export interface LocalTask extends TaskPayload {
   priority: WorkPriority;
   dueDate?: string;
   tags: string[];
+  /** Work Tasks project relations. Structured sources may omit these and load them on demand. */
+  projects?: TaskProjectItem[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface TaskProjectItem {
+  id?: string;
+  role: "related" | "target";
+  locatorKind: "folder" | "git";
+  locator: string;
+  label?: string;
+  branch?: string;
+  position: number;
 }
 
 export interface LocalTodo {
@@ -263,6 +277,8 @@ export interface GraphRunRecord {
   startedAt: string;
   endedAt?: string;
   summary?: string;
+  /** Immutable work input captured for this process run. */
+  inputPrompt?: string;
   trigger?: "manual" | "plan" | "routine" | "loop" | "graph_call";
   parentRunId?: string;
   parentGraphId?: string;
@@ -280,6 +296,8 @@ export interface GraphDefinition {
   status: GraphStatus;
   version: number;
   pinned: boolean;
+  /** Reusable work-process template: structure is the method, each run supplies its work input. */
+  processEnabled: boolean;
   routineEnabled: boolean;
   routineSpec?: string;
   repeatMode: "none" | "loop";
@@ -306,6 +324,17 @@ export interface ProjectTarget {
   repoId?: string;
   worktreeId?: string;
   path?: string;
+  branch?: string;
+}
+
+export interface BranchTarget {
+  id: string;
+  branch: string;
+  environmentId?: string;
+  projectId?: string;
+  repoId?: string;
+  worktreeId: string;
+  path?: string;
 }
 
 export interface SessionTarget {
@@ -314,6 +343,7 @@ export interface SessionTarget {
   environmentId?: string;
   worktreeId: string;
   projectId?: string;
+  branch?: string;
   paneKey?: string;
   agentType?: string;
   agentState?: string;
@@ -341,6 +371,7 @@ export interface OrcaTargets {
   refreshedAt: string | null;
   environments?: EnvironmentTarget[];
   projects: ProjectTarget[];
+  branches?: BranchTarget[];
   sessions: SessionTarget[];
   models: ModelTarget[];
   error?: string;
@@ -372,6 +403,7 @@ function normalizeRouting(value: RoutingTarget | undefined): RoutingTarget {
   return {
     ...(value?.environmentId ? { environmentId: value.environmentId } : {}),
     ...(value?.projectId ? { projectId: value.projectId } : {}),
+    ...(value?.branch ? { branch: value.branch } : {}),
     ...(value?.sessionId ? { sessionId: value.sessionId } : {}),
     ...(value?.model ? { model: value.model } : {}),
     ...(value?.reasoning ? { reasoning: value.reasoning } : {}),
@@ -430,6 +462,7 @@ function normalizeGraph(graph: GraphDefinition): GraphDefinition {
     status: graph.status,
     version: graph.version,
     pinned: graph.pinned,
+    processEnabled: Boolean(graph.processEnabled),
     routineEnabled: graph.routineEnabled,
     ...(graph.routineSpec ? { routineSpec: graph.routineSpec } : {}),
     repeatMode: graph.repeatMode,
@@ -492,6 +525,7 @@ function normalizeGraph(graph: GraphDefinition): GraphDefinition {
       startedAt: run.startedAt,
       ...(run.endedAt ? { endedAt: run.endedAt } : {}),
       ...(run.summary ? { summary: run.summary } : {}),
+      ...(run.inputPrompt !== undefined ? { inputPrompt: run.inputPrompt } : {}),
       ...(run.trigger ? { trigger: run.trigger } : {}),
       ...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
       ...(run.parentGraphId ? { parentGraphId: run.parentGraphId } : {}),
@@ -660,6 +694,21 @@ export function normalizeGraphStore(
       priority: WORK_PRIORITIES.includes(task.priority) ? task.priority : "medium",
       ...(task.dueDate ? { dueDate: task.dueDate } : {}),
       tags: [...(task.tags ?? [])],
+      ...(Array.isArray(task.projects) ? { projects: task.projects.flatMap((project) => {
+        const raw = project as TaskProjectItem & { locator_kind?: "folder" | "git" };
+        const locatorKind = raw.locatorKind ?? raw.locator_kind;
+        if (!raw.locator || !locatorKind || !["folder", "git"].includes(locatorKind)
+          || !["related", "target"].includes(raw.role)) return [];
+        return [{
+          ...(raw.id ? { id: raw.id } : {}),
+          role: raw.role,
+          locatorKind,
+          locator: raw.locator,
+          ...(raw.label ? { label: raw.label } : {}),
+          ...(raw.branch ? { branch: raw.branch.replace(/^refs\/heads\//u, "") } : {}),
+          position: Number.isInteger(raw.position) && raw.position >= 0 ? raw.position : 0,
+        }];
+      }) } : {}),
       createdAt,
       updatedAt: task.updatedAt || createdAt,
     });
@@ -791,7 +840,7 @@ export const TOPOLOGY_TEMPLATES: Array<{ id: TopologyKind; label: string; help: 
   { id: "tool_bipartite", label: "도구 이분", help: "agent와 외부 tool 경계를 분리" },
 ];
 
-const ROUTING_KEYS: Array<keyof RoutingTarget> = ["environmentId", "projectId", "sessionId", "model", "reasoning"];
+const ROUTING_KEYS: Array<keyof RoutingTarget> = ["environmentId", "projectId", "branch", "sessionId", "model", "reasoning"];
 
 export function effectiveRouting(graph: GraphDefinition, node: GraphNode): EffectiveRouting {
   const result: EffectiveRouting = { sources: {} };

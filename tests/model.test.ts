@@ -10,6 +10,7 @@ function graph(): GraphDefinition {
     status: "draft",
     version: 1,
     pinned: false,
+    processEnabled: false,
     routineEnabled: false,
     repeatMode: "none",
     defaults: { projectId: "project-a", sessionId: "session-graph", model: "gpt-default", reasoning: "high" },
@@ -57,6 +58,32 @@ describe("routing inheritance", () => {
       sessionId: "node",
       model: "node",
       reasoning: "graph",
+    });
+  });
+
+  it("inherits the selected Orca worktree branch", () => {
+    const item = graph();
+    item.defaults.branch = "refs/heads/feature/default";
+    item.nodes[0]!.routing = { branch: "refs/heads/feature/node" };
+    expect(effectiveRouting(item, item.nodes[0]!).branch).toBe("refs/heads/feature/node");
+    expect(effectiveRouting(item, item.nodes[1]!).branch).toBe("refs/heads/feature/default");
+  });
+});
+
+describe("work process projection", () => {
+  it("preserves process identity and immutable run input through normalization", () => {
+    const item = graph();
+    item.processEnabled = true;
+    item.runs = [{
+      id: "run-process", runNo: 3, status: "running", startedAt: "2026-08-10T00:00:00Z",
+      inputPrompt: "  원문\n그대로  ",
+    }];
+    const normalized = normalizeGraphStore({
+      schemaVersion: 1, activeGraphId: item.id, graphs: [item], domains: [], milestones: [], tasks: [], todos: [],
+    });
+    expect(normalized.graphs[0]).toMatchObject({
+      processEnabled: true,
+      runs: [{ inputPrompt: "  원문\n그대로  " }],
     });
   });
 });

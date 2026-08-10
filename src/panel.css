@@ -481,6 +481,14 @@ textarea { resize: vertical; min-height: 74px; line-height: 1.45; }
 .run-card p { margin: 8px 0; }
 .run-card small { color: var(--muted-foreground); }
 .run-card details { margin-top: 8px; }
+.run-input { margin: 7px 0 0; padding: 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.run-input-history { margin-top: 8px; }
+.registry-project-list { display: grid; gap: 6px; max-height: 280px; overflow: auto; margin: 8px 0; }
+.registry-project { display: grid; grid-template-columns: auto 1fr; align-items: start; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--card); }
+.registry-project.recommended { border-color: var(--accent); }
+.registry-project span { display: grid; gap: 3px; min-width: 0; }
+.registry-project code { white-space: normal; overflow-wrap: anywhere; color: var(--muted-foreground); }
+.registry-project small { color: var(--muted-foreground); }
 
 .toast { position: fixed; z-index: 40; right: 12px; bottom: 38px; max-width: min(380px, calc(100vw - 24px)); border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; background: var(--popover); box-shadow: 0 10px 30px color-mix(in srgb, #000 24%, transparent); font-size: 11px; }
 

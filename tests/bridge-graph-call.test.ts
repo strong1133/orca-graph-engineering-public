@@ -81,6 +81,7 @@ if (args[0] === "environment" && args[1] === "list") {
     worktreeId: remote ? "remote-worktree" : "fake-worktree",
     repoId: remote ? "remote-repo" : "fake-repo",
     path: remote ? "/portable/remote-project" : "/portable/fake-project",
+    branch: "refs/heads/main",
     isArchived: false,
     isActive: true,
     isMainWorktree: true,
@@ -92,7 +93,17 @@ if (args[0] === "environment" && args[1] === "list") {
       lastAssistantMessage: process.env.ORCA_GRAPH_FAKE_ASSISTANT || '{"branch":"y","reason":"fake result selects y"}',
     }],
   };
-  result = { worktrees: mode === "missing-worktree" ? [] : [worktree] };
+  const branchWorktree = {
+    ...worktree,
+    worktreeId: "fake-feature-worktree",
+    path: "/portable/fake-project-feature",
+    branch: "refs/heads/feature/review",
+    isActive: false,
+    isMainWorktree: false,
+    liveTerminalCount: 0,
+    agents: [],
+  };
+  result = { worktrees: mode === "missing-worktree" ? [] : [worktree, ...(process.env.ORCA_GRAPH_FAKE_BRANCH === "1" && !remote ? [branchWorktree] : [])] };
 } else if (args[0] === "project" && args[1] === "list") {
   result = { projects: [remote
     ? { id: "remote-project", displayName: "Remote project", sourceRepoIds: ["remote-repo"] }
@@ -120,7 +131,8 @@ process.stdout.write(JSON.stringify({ ok: true, result }));
   await writeFile(path.join(runtimeDirectory, "targets.json"), `${JSON.stringify({
     refreshedAt: "2026-08-09T00:00:00.000Z",
     environments: [{ id: "local", name: "jsj1", local: true, connected: true }],
-    projects: [{ id: "fake-project", name: "Fake project", environmentId: "local", worktreeId: "fake-worktree", path: "/portable/fake-project" }],
+    projects: [{ id: "fake-project", name: "Fake project", environmentId: "local", worktreeId: "fake-worktree", path: "/portable/fake-project", branch: "refs/heads/main" }],
+    branches: [{ id: "main", branch: "refs/heads/main", environmentId: "local", projectId: "fake-project", repoId: "fake-repo", worktreeId: "fake-worktree", path: "/portable/fake-project" }],
     sessions: [{
       id: "fake-session",
       title: "Fake session",
@@ -179,6 +191,7 @@ function executionGraph(
     status: "active",
     version: 1,
     pinned: false,
+    processEnabled: false,
     routineEnabled: false,
     repeatMode: "none",
     defaults,
@@ -287,6 +300,42 @@ describe("bridge graph calls", () => {
       expect(args).toEqual(expect.arrayContaining(["--environment", "env-jsj2"]));
     }
     expect(calls.some((args) => args[0] === "terminal" && args[1] === "create" && args.includes("id:remote-worktree"))).toBe(true);
+  });
+
+  it("creates a new session in the selected existing Orca worktree branch", async () => {
+    const root = process.cwd();
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph("worktree-branch", [taskNode("branch-task")], [], {
+      projectId: "fake-project", branch: "feature/review", model: "gpt-5.6-sol",
+    });
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+    const targetsPath = path.join(runtimeDirectory, "targets.json");
+    const targets = JSON.parse(await readFile(targetsPath, "utf8"));
+    targets.branches.push({
+      id: "feature", branch: "refs/heads/feature/review", environmentId: "local",
+      projectId: "fake-project", repoId: "fake-repo", worktreeId: "fake-feature-worktree",
+      path: "/portable/fake-project-feature",
+    });
+    await writeFile(targetsPath, `${JSON.stringify(targets)}\n`, "utf8");
+
+    await sendToBridge(
+      runtimeDirectory,
+      { type: "run", graphId: graph.id, dryRun: false },
+      `graph ${graph.id} executed`,
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_BRANCH: "1",
+      },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    expect(calls.find((args) => args[0] === "terminal" && args[1] === "create"))
+      .toEqual(expect.arrayContaining(["--worktree", "id:fake-feature-worktree"]));
+    expect(calls.find((args) => args[0] === "terminal" && args[1] === "send")?.join("\n"))
+      .toContain("- branch: feature/review");
   });
 
   it("plans a child graph recursively and records bidirectional run lineage", async () => {

@@ -112,7 +112,7 @@ function storeFixture() {
     }],
     todos: [],
     graphs: [{
-      id: "graph-1", name: "Release graph", summary: "", status: "draft", version: 1, pinned: false, routineEnabled: false,
+      id: "graph-1", name: "Release graph", summary: "", status: "draft", version: 1, pinned: false, processEnabled: false, routineEnabled: false,
       repeatMode: "none", defaults: {}, runGuards: {}, nodes: [{
         id: "node-1", kind: "task", label: "Release check", x: 0, y: 0, status: "pending", joinMode: "all",
         task: { id: "task-1", title: "Release check", prompt: "Check the release" },

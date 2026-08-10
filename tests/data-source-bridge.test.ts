@@ -32,7 +32,7 @@ async function waitFor(child: ChildProcessWithoutNullStreams, output: () => stri
 function graph(version: number) {
   return {
     id: "graph-remote", name: "Remote", summary: "", status: "draft", version,
-    pinned: false, routineEnabled: false, repeatMode: "none", defaults: {}, runGuards: {},
+    pinned: false, processEnabled: false, routineEnabled: false, repeatMode: "none", defaults: {}, runGuards: {},
     nodes: [], edges: [], runs: [], createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
   };
 }

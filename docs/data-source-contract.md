@@ -115,6 +115,19 @@ Contract v1 does not add a separate presentation endpoint. Optional editor state
 
 `groupBy` is one of `none`, `domain`, `milestone`, `superstep`, or `loop`. Waypoints are finite canvas coordinates keyed by edge ID; clients cap each edge at 24 points. These fields do not affect execution semantics. A provider may ignore them, but a provider that claims lossless Graph aggregate round-tripping should preserve them unchanged in the canonical response and subsequent snapshot. Group membership is derived from existing Domain/Milestone relations or graph analysis and is not duplicated in the payload.
 
+### Optional process and device-project aggregate API
+
+Some structured providers expose an authenticated aggregate API beside contract v1. This additive surface does not change the four contract-v1 endpoints and older providers remain valid.
+
+- Graph payload: `process_enabled`; current and recent runs include nullable `input_prompt`.
+- Start a run: `POST /graphs/{graphId}/runs` with `{ expected_version, trigger_kind, input_prompt? }`.
+- Device repo registry: `PUT /orca-projects/{environment}` with the mapped `orca repo list --json` projects; `GET /orca-projects` reads all device mirrors.
+- Task target project: the existing Task project relation is used with `role=target`, `locator_kind=folder`, and the published local path. No plugin-owned duplicate relation is created.
+
+The plugin projects these source fields to portable `processEnabled` and `GraphRunRecord.inputPrompt`. A new process run requires a non-blank input, but the string sent in `input_prompt` is not trimmed or normalized by the client. A resume does not create another run and uses the stored input. Each local loop iteration carries the same run input.
+
+Registry publication is event-driven: bridge startup and explicit Orca target refresh are triggers, and an in-memory canonical payload comparison skips an unchanged second PUT. Linking a Task project begins by reading the latest Task aggregate, preserves every existing relation, appends confirmed folder targets, and patches with that exact version. HTTP 409 causes a canonical re-read and a visible conflict; it is not an automatic write retry.
+
 ### Remote execution capability
 
 A structured source owns execution state. A source that offers no execution capability keeps the original boundary: the local bridge fails closed for live execution and the user starts the run in the source workspace. A replaceable panel cache is never execution state.

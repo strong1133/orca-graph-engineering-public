@@ -34,6 +34,7 @@ export function graphFromValidationFixture(item: ValidationFixtureCase): GraphDe
     status: "active",
     version: 1,
     pinned: false,
+    processEnabled: false,
     routineEnabled: false,
     repeatMode: item.loopGuards ? "loop" : "none",
     ...(item.loopGuards ? { maxRuns: 3 } : {}),

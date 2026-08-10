@@ -18,6 +18,12 @@ import {
   refreshDataSource,
   structuredExecutionCapability,
 } from "./data-source.mjs";
+const {
+  mapOrcaRepos,
+  taskProjectInput,
+  workTasksClientFromEnvironment,
+  workTasksEnvironment,
+} = await import(`./${["work", "tasks"].join("-")}-client.mjs`);
 
 const execFileAsync = promisify(execFile);
 const launchCwd = process.cwd();
@@ -43,6 +49,14 @@ let inputBuffer = "";
 let wideServer = null;
 let wideUrl = null;
 const wideToken = crypto.randomUUID();
+const workTasksClient = workTasksClientFromEnvironment();
+const workTasksEnvironmentKey = ["ORCA", "GRAPH", "WORK", "TASKS", "ENVIRONMENT"].join("_");
+const localWorkTasksEnvironment = workTasksEnvironment(
+  process.env.ORCA_GRAPH_WORKSPACE_ENVIRONMENT || process.env[workTasksEnvironmentKey],
+  process.env.ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME || os.hostname(),
+);
+let publishedProjectSignature = null;
+let publishedProjects = [];
 
 async function readJson(primary, fallback) {
   try {
@@ -69,6 +83,173 @@ async function readTargets() {
       };
     }),
   };
+}
+
+function requireWorkTasks() {
+  if (!workTasksClient) throw new Error("the workspace API base URL is not configured in the bridge terminal");
+  if (!localWorkTasksEnvironment) {
+    throw new Error("the workspace execution environment must be 정석맥1, 정석맥2, or Hermes");
+  }
+  return workTasksClient;
+}
+
+async function publishLocalOrcaProjects({ force = false } = {}) {
+  const client = requireWorkTasks();
+  const result = await runOrca(["repo", "list"], 30_000, root);
+  const projects = mapOrcaRepos(result);
+  const signature = JSON.stringify(projects);
+  if (!force && signature === publishedProjectSignature) {
+    return { environment: localWorkTasksEnvironment, projects, changed: false };
+  }
+  const response = await client.put(`/orca-projects/${encodeURIComponent(localWorkTasksEnvironment)}`, { projects });
+  publishedProjectSignature = signature;
+  publishedProjects = projects;
+  return { environment: localWorkTasksEnvironment, projects, changed: true, item: response.item };
+}
+
+function projectRelation(value) {
+  return {
+    ...(value.id ? { id: value.id } : {}),
+    role: value.role,
+    locatorKind: value.locator_kind ?? value.locatorKind,
+    locator: value.locator,
+    ...(value.label ? { label: value.label } : {}),
+    ...(value.branch ? { branch: String(value.branch).replace(/^refs\/heads\//u, "") } : {}),
+    position: Number(value.position) || 0,
+  };
+}
+
+async function currentOrcaProject() {
+  try {
+    const [value, processes] = await Promise.all([
+      runOrca(["worktree", "current"], 30_000, launchCwd),
+      runOrca(["worktree", "ps", "--limit", "300"], 30_000, root),
+    ]);
+    const worktree = (processes.worktrees ?? []).find((item) => item.isActive) ?? value?.worktree;
+    if (!worktree) return null;
+    return {
+      ...(worktree.repoId ? { repoId: String(worktree.repoId) } : {}),
+      ...(worktree.path ? { path: String(worktree.path) } : {}),
+      ...(worktree.projectId ? { projectId: String(worktree.projectId) } : {}),
+      ...(worktree.branch ? { branch: String(worktree.branch) } : {}),
+      ...(worktree.worktreeId || worktree.id ? { worktreeId: String(worktree.worktreeId || worktree.id) } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function taskProjectContext(taskId, workspaceHint = "") {
+  const client = requireWorkTasks();
+  if (!publishedProjects.length) await publishLocalOrcaProjects();
+  const [taskPayload, registryPayload, current] = await Promise.all([
+    client.get(`/tasks/${encodeURIComponent(taskId)}`),
+    client.get("/orca-projects"),
+    currentOrcaProject(),
+  ]);
+  const taskProjects = Array.isArray(taskPayload.projects) ? taskPayload.projects.map(projectRelation) : [];
+  const registryItems = Array.isArray(registryPayload.items) ? registryPayload.items : [];
+  const registry = registryItems.flatMap((entry) => Array.isArray(entry?.projects)
+    ? entry.projects.map((project) => ({ ...project, environment: entry.environment, updatedAt: entry.updated_at }))
+    : []);
+  const localRegistry = registry.filter((project) => project.environment === localWorkTasksEnvironment);
+  const normalizedHint = String(workspaceHint || "").trim().toLocaleLowerCase("ko-KR");
+  const recommended = localRegistry.filter((project) =>
+    (current?.repoId && project.repo_id === current.repoId)
+    || (current?.path && (project.path === current.path || current.path.startsWith(`${project.path}${path.sep}`)))
+    || (normalizedHint && project.name.toLocaleLowerCase("ko-KR") === normalizedHint));
+  return {
+    taskId,
+    taskVersion: Number(taskPayload.item?.version || 0),
+    projects: taskProjects,
+    registry,
+    recommended,
+    environment: localWorkTasksEnvironment,
+    current,
+  };
+}
+
+async function linkTaskProjects(taskId, paths, branchValue) {
+  const client = requireWorkTasks();
+  const requested = [...new Set((Array.isArray(paths) ? paths : []).filter((value) => typeof value === "string" && value.trim()))];
+  if (!requested.length) throw new Error("연결할 프로젝트를 하나 이상 선택하십시오.");
+  const context = await taskProjectContext(taskId);
+  const branch = String(branchValue || context.current?.branch || "").trim().replace(/^refs\/heads\//u, "");
+  const registryByPath = new Map(context.registry.map((project) => [project.path, project]));
+  for (const locator of requested) if (!registryByPath.has(locator)) throw new Error(`게시된 Orca 프로젝트가 아닙니다: ${locator}`);
+  const existingInputs = context.projects.map(taskProjectInput);
+  let position = Math.max(-1, ...existingInputs.map((item) => Number(item.position) || 0)) + 1;
+  for (const locator of requested) {
+    const existing = existingInputs.find((item) => item.role === "target" && item.locator_kind === "folder" && item.locator === locator);
+    if (existing) {
+      if (branch) existing.branch = branch;
+      continue;
+    }
+    const project = registryByPath.get(locator);
+    existingInputs.push({
+      role: "target", locator_kind: "folder", locator,
+      ...(project?.name ? { label: project.name } : {}),
+      ...(branch ? { branch } : {}), position: position++,
+    });
+  }
+  try {
+    await client.patch(`/tasks/${encodeURIComponent(taskId)}`, {
+      expected_version: context.taskVersion,
+      projects: existingInputs,
+    });
+  } catch (error) {
+    if (error?.status === 409) await client.get(`/tasks/${encodeURIComponent(taskId)}`);
+    throw error;
+  }
+  const refreshed = await refreshConfiguredDataSource(undefined);
+  return { context: await taskProjectContext(taskId), store: refreshed.store };
+}
+
+async function enrichWorkProcessSource(cache) {
+  if (!workTasksClient || cache.mode !== "structured" || cache.status !== "ready" || !cache.store?.graphs?.length) return cache;
+  const listed = await workTasksClient.get("/graphs?include_archived=true&limit=500");
+  const sourceGraphs = new Map((listed.items ?? []).map((item) => [String(item.id), item]));
+  const processIds = cache.store.graphs
+    .filter((graph) => Boolean(sourceGraphs.get(graph.id)?.process_enabled))
+    .map((graph) => graph.id);
+  const details = await Promise.all(processIds.map(async (id) => [id, await workTasksClient.get(`/graphs/${encodeURIComponent(id)}`)]));
+  const detailById = new Map(details);
+  return {
+    ...cache,
+    store: {
+      ...cache.store,
+      graphs: cache.store.graphs.map((graph) => {
+        const source = sourceGraphs.get(graph.id);
+        const detail = detailById.get(graph.id);
+        const aggregateRuns = [
+          ...(detail?.item?.recent_runs ?? []),
+          ...(detail?.item?.current_run ? [detail.item.current_run] : []),
+        ];
+        const runInputs = new Map(aggregateRuns.map((run) => [String(run.id), run.input_prompt]));
+        return {
+          ...graph,
+          processEnabled: Boolean(source?.process_enabled),
+          runs: (graph.runs ?? []).map((run) => runInputs.has(String(run.id))
+            ? { ...run, inputPrompt: runInputs.get(String(run.id)) ?? undefined }
+            : run),
+        };
+      }),
+    },
+  };
+}
+
+async function setGraphProcess(graphId, expectedVersion, enabled) {
+  const client = requireWorkTasks();
+  try {
+    await client.patch(`/graphs/${encodeURIComponent(graphId)}`, {
+      expected_version: expectedVersion,
+      process_enabled: Boolean(enabled),
+    });
+  } catch (error) {
+    if (error?.status === 409) await client.get(`/graphs/${encodeURIComponent(graphId)}`);
+    throw error;
+  }
+  return refreshConfiguredDataSource(undefined, graphId);
 }
 
 async function atomicJson(filePath, value) {
@@ -159,7 +340,8 @@ async function readDataSourceConfig() {
 
 async function refreshConfiguredDataSource(config, preferredGraphId) {
   config ??= await readDataSourceConfig();
-  const cache = await refreshDataSource(config);
+  let cache = await refreshDataSource(config);
+  cache = await enrichWorkProcessSource(cache);
   if (cache.store?.graphs?.some((graph) => graph.id === preferredGraphId)) {
     cache.store.activeGraphId = preferredGraphId;
   }
@@ -179,7 +361,8 @@ async function configureDataSource(rawConfig, seedStore) {
   if (config.mode === "folder") {
     await initializeFolderDataSource(config, seedStore ?? await readJson(storePath, defaultStorePath));
   }
-  const cache = await refreshDataSource(config);
+  let cache = await refreshDataSource(config);
+  cache = await enrichWorkProcessSource(cache);
   await atomicJson(dataSourcePath, config);
   await atomicJson(sourceCachePath, cache);
   let result = cache;
@@ -330,6 +513,16 @@ async function openWideView() {
 
 async function refreshTargets() {
   const baseTargets = await readTargets();
+  let projectRegistry;
+  if (workTasksClient && localWorkTasksEnvironment) {
+    try { projectRegistry = await publishLocalOrcaProjects(); }
+    catch (error) {
+      projectRegistry = {
+        environment: localWorkTasksEnvironment, projects: [], changed: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
   let savedEnvironments = [];
   try {
     const result = await runOrca(["environment", "list"]);
@@ -366,18 +559,22 @@ async function refreshTargets() {
           error: error instanceof Error ? error.message : String(error),
         },
         projects: [],
+        branches: [],
         sessions: [],
       };
     }
   }));
   const projects = discovered.flatMap((item) => item.projects);
+  const branches = discovered.flatMap((item) => item.branches ?? []);
   const sessions = discovered.flatMap((item) => item.sessions);
   const targets = {
     refreshedAt: new Date().toISOString(),
     environments: discovered.map((item) => item.environment),
     projects,
+    branches,
     sessions,
     models: baseTargets.models ?? [],
+    ...(projectRegistry ? { projectRegistry } : {}),
   };
   await atomicJson(targetsPath, targets);
   const store = await readJson(storePath, defaultStorePath);
@@ -407,6 +604,7 @@ async function refreshEnvironmentTargets(environment) {
       ...(repoId ? { repoId } : {}),
       ...(worktree?.worktreeId ? { worktreeId: worktree.worktreeId } : {}),
       ...(worktree?.path ? { path: worktree.path } : {}),
+      ...(worktree?.branch ? { branch: worktree.branch } : {}),
     };
   });
   const projectByRepo = new Map();
@@ -415,6 +613,19 @@ async function refreshEnvironmentTargets(environment) {
     worktree.worktreeId,
     new Map((worktree.agents ?? []).filter((agent) => agent?.paneKey).map((agent) => [agent.paneKey, agent])),
   ]));
+  const branches = worktrees.flatMap((worktree) => {
+    const projectId = projectByRepo.get(worktree.repoId);
+    if (!projectId || !worktree.worktreeId || !worktree.branch || worktree.isArchived) return [];
+    return [{
+      id: `${environment.id}:${worktree.worktreeId}`,
+      branch: String(worktree.branch),
+      environmentId: environment.id,
+      projectId,
+      repoId: String(worktree.repoId),
+      worktreeId: String(worktree.worktreeId),
+      ...(worktree.path ? { path: String(worktree.path) } : {}),
+    }];
+  });
 
   const liveWorktrees = worktrees.filter((worktree) => Number(worktree.liveTerminalCount ?? 0) > 0).slice(0, 40);
   const sessionResults = await Promise.allSettled(
@@ -428,6 +639,7 @@ async function refreshEnvironmentTargets(environment) {
     for (const terminal of result.value.terminals ?? []) {
       const paneKey = terminal.tabId && terminal.leafId ? `${terminal.tabId}:${terminal.leafId}` : null;
       const agent = paneKey ? agentsByWorktree.get(terminal.worktreeId)?.get(paneKey) : null;
+      const terminalWorktree = worktrees.find((worktree) => worktree.worktreeId === terminal.worktreeId);
       if (!paneKey || !agent?.agentType) continue;
       sessions.push({
         id: terminal.handle,
@@ -437,6 +649,7 @@ async function refreshEnvironmentTargets(environment) {
         ...(projectByRepo.get(String(terminal.worktreeId).split("::")[0])
           ? { projectId: projectByRepo.get(String(terminal.worktreeId).split("::")[0]) }
           : {}),
+        ...(terminalWorktree?.branch ? { branch: terminalWorktree.branch } : {}),
         paneKey,
         agentType: agent.agentType,
         agentState: agent.state || "unknown",
@@ -445,12 +658,12 @@ async function refreshEnvironmentTargets(environment) {
       });
     }
   }
-  return { projects, sessions };
+  return { projects, branches, sessions };
 }
 
 function effectiveRouting(graph, node) {
   const routing = {};
-  for (const key of ["environmentId", "projectId", "sessionId", "model", "reasoning"]) {
+  for (const key of ["environmentId", "projectId", "branch", "sessionId", "model", "reasoning"]) {
     if (node.routing?.[key]) routing[key] = node.routing[key];
     else if (graph.defaults?.[key]) routing[key] = graph.defaults[key];
   }
@@ -685,7 +898,7 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
-function buildPrompt(graph, node, runId) {
+function buildPrompt(graph, node, runId, workInput) {
   const routing = effectiveRouting(graph, node);
   const engineering = node.engineering || {};
   return [
@@ -694,10 +907,12 @@ function buildPrompt(graph, node, runId) {
     `Node: ${node.label || node.id} (${node.id})`,
     "",
     node.task?.prompt || node.label || "Execute this graph node.",
+    ...(workInput !== undefined ? ["", "Work-process input for this run (verbatim):", workInput] : []),
     "",
     "Execution contract:",
     `- environment: ${routing.environmentId || "local"}`,
     `- project: ${routing.projectId || "current"}`,
+    `- branch: ${routing.branch || "selected project worktree"}`,
     `- session: ${routing.sessionId || "new"}`,
     `- model: ${routing.model || "agent default"}`,
     `- reasoning: ${routing.reasoning || "agent default/current"}`,
@@ -723,7 +938,7 @@ function standaloneRouting(value) {
   if (value === undefined || value === null) return {};
   if (typeof value !== "object" || Array.isArray(value)) throw new Error("standalone task routing must be an object");
   const routing = {};
-  for (const key of ["environmentId", "projectId", "sessionId", "model", "reasoning"]) {
+  for (const key of ["environmentId", "projectId", "branch", "sessionId", "model", "reasoning"]) {
     const candidate = value[key];
     if (candidate === undefined || candidate === null || candidate === "") continue;
     if (typeof candidate !== "string") throw new Error(`standalone task routing ${key} must be a string`);
@@ -747,6 +962,7 @@ function buildStandaloneTaskPrompt(task, routing, scope) {
     "Execution target:",
     `- environment: ${routing.environmentId || "local"}`,
     `- project: ${routing.projectId || "current"}`,
+    `- branch: ${routing.branch || "selected project worktree"}`,
     `- session: ${routing.sessionId || "new"}`,
     `- model: ${routing.model || "agent default"}`,
     `- reasoning: ${routing.reasoning || "agent default/current"}`,
@@ -778,6 +994,10 @@ function assertModelReasoning(model, reasoning) {
 
 function targetEnvironmentId(target) {
   return target?.environmentId || "local";
+}
+
+function workBranch(value) {
+  return String(value || "").trim().replace(/^refs\/heads\//u, "");
 }
 
 function resolveRoutingEnvironment(targets, routing) {
@@ -824,6 +1044,9 @@ function resolveTaskRoute(graph, node, targets) {
     if (routing.reasoning) {
       throw new Error(`existing session reasoning override is unsupported: ${routing.sessionId}; clear reasoning to keep the session's current effort`);
     }
+    if (routing.branch && workBranch(referencedSession.branch) !== workBranch(routing.branch)) {
+      throw new Error(`existing session branch mismatch: ${routing.sessionId} is ${workBranch(referencedSession.branch) || "unknown"}, requested ${workBranch(routing.branch)}`);
+    }
     return { mode: "existing-session", routing, session: referencedSession, model, ...environment };
   }
   const projectId = routing.projectId || referencedSession?.projectId;
@@ -832,9 +1055,18 @@ function resolveTaskRoute(graph, node, targets) {
     const target = routing.projectId || (routing.sessionId ? `session fallback ${routing.sessionId}` : "unset");
     throw new Error(`project has no available worktree: ${target}`);
   }
+  let executionProject = project;
+  if (routing.branch) {
+    const branch = (targets.branches ?? []).find((item) =>
+      item.projectId === project.id
+      && targetEnvironmentId(item) === environment.environmentId
+      && workBranch(item.branch) === workBranch(routing.branch));
+    if (!branch?.worktreeId) throw new Error(`branch has no available Orca worktree: ${routing.branch}`);
+    executionProject = { ...project, worktreeId: branch.worktreeId, ...(branch.path ? { path: branch.path } : {}), branch: branch.branch };
+  }
   const model = resolveModel(targets, routing.model, { required: true });
   assertModelReasoning(model, routing.reasoning);
-  return { mode: "new-session", routing, project, model, ...environment };
+  return { mode: "new-session", routing, project: executionProject, model, ...environment };
 }
 
 async function loadLiveRoutingEvidence(worktreeIds, terminalWorktreeIds = [], environmentSelector = null) {
@@ -910,7 +1142,7 @@ async function attestExecutionPlan(plan) {
 }
 
 async function dispatchTask(graph, node, targets, runId, options = {}) {
-  const prompt = options.prompt || buildPrompt(graph, node, runId);
+  const prompt = options.prompt || buildPrompt(graph, node, runId, options.workInput);
   const route = resolveTaskRoute(graph, node, targets);
   let handle = null;
   if (route.mode === "existing-session") {
@@ -987,7 +1219,7 @@ function parseConditionDecision(value, branches) {
   throw new Error(`condition evaluator must return one of: ${branches.join(", ")}`);
 }
 
-async function evaluateCondition(graph, node, targets, runId, nodeOutputs) {
+async function evaluateCondition(graph, node, targets, runId, nodeOutputs, workInput) {
   const branches = conditionBranches(graph, node);
   if (!branches.length) throw new Error(`${node.label || node.id}: condition has no labelled output branch`);
   const ancestors = conditionAncestorIds(graph, node.id);
@@ -1007,6 +1239,7 @@ async function evaluateCondition(graph, node, targets, runId, nodeOutputs) {
     "Decide this execution-graph condition from the completed upstream results.",
     "Return exactly one JSON object and no prose: {\"branch\":\"<allowed label>\",\"reason\":\"<short reason>\"}.",
     `Condition: ${node.conditionExpr || node.label || node.id}`,
+    ...(workInput !== undefined ? ["Work-process input for this run (verbatim):", workInput] : []),
     `Allowed branches: ${branches.join(", ")}`,
     `Branch targets JSON: ${JSON.stringify(branchRoutes)}`,
     `Upstream results JSON: ${JSON.stringify(upstreamResults)}`,
@@ -1279,6 +1512,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
     status: dryRun ? "planned" : "running",
     startedAt: now.toISOString(),
     trigger: context.parentRunId ? "graph_call" : dryRun ? "plan" : "manual",
+    ...(context.workInput !== undefined ? { inputPrompt: context.workInput } : {}),
     ...(context.parentRunId ? {
       parentRunId: context.parentRunId,
       parentGraphId: context.parentGraphId,
@@ -1355,7 +1589,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
           await persistRunProgress(store, `${graph.name} · ${node.label || node.id} 자동 판정 중 · Run #${run.runNo}`);
           run.stats.attempts += 1;
           try {
-            decision = await evaluateCondition(executionGraph, node, targets, run.id, nodeOutputs);
+            decision = await evaluateCondition(executionGraph, node, targets, run.id, nodeOutputs, context.workInput);
             branch = decision.branch;
             const runtimeCondition = executionGraph.nodes.find((item) => item.id === node.id);
             if (runtimeCondition) runtimeCondition.branchTaken = branch;
@@ -1401,6 +1635,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
               parentRunId: run.id,
               parentGraphId: graph.id,
               parentNodeId: node.id,
+              ...(context.workInput !== undefined ? { workInput: context.workInput } : {}),
             },
           });
           run.childRunIds.push(childRun.id);
@@ -1450,7 +1685,9 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
       for (attempt = 1; attempt <= maxAttempts; attempt += 1) {
         run.stats.attempts += 1;
         try {
-          const dispatched = await dispatchTask(executionGraph, node, targets, run.id);
+          const dispatched = await dispatchTask(executionGraph, node, targets, run.id, {
+            ...(context.workInput !== undefined ? { workInput: context.workInput } : {}),
+          });
           sessionId = dispatched.sessionId;
           resultSummary = dispatched.resultSummary;
           lastError = null;
@@ -1527,6 +1764,13 @@ async function structuredExecutionContract() {
 async function executeGraphRemotely({ config, store, targets, graph }) {
   const capability = await structuredExecutionContract();
   let frontier = await fetchStructuredExecution(config, graph.id);
+  const processRun = graph.processEnabled
+    ? graph.runs.find((run) => run.id === frontier.run?.id) ?? [...graph.runs].reverse().find((run) => run.status === "running")
+    : null;
+  const workInput = processRun?.inputPrompt;
+  if (graph.processEnabled && (workInput === undefined || !workInput.trim())) {
+    throw new Error("업무프로세스의 현재 run 입력을 원천에서 읽을 수 없습니다. 데이터 원천을 새로고침하십시오.");
+  }
   const blocked = frontier.nodes.filter((node) => node.executable === false
     && node.status === "pending" && !node.branchClosed);
   if (blocked.length) {
@@ -1563,7 +1807,7 @@ async function executeGraphRemotely({ config, store, targets, graph }) {
       let decision = null;
       if (!branch) {
         try {
-          decision = await evaluateCondition(graph, design, targets, frontier.run?.id ?? graph.id, nodeOutputs);
+          decision = await evaluateCondition(graph, design, targets, frontier.run?.id ?? graph.id, nodeOutputs, workInput);
           branch = decision.branch;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -1591,7 +1835,9 @@ async function executeGraphRemotely({ config, store, targets, graph }) {
       }
       await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} 실행 중 · 원격 run`);
       try {
-        const dispatched = await dispatchTask(graph, design, targets, frontier.run?.id ?? graph.id);
+        const dispatched = await dispatchTask(graph, design, targets, frontier.run?.id ?? graph.id, {
+          ...(workInput !== undefined ? { workInput } : {}),
+        });
         if (dispatched.resultSummary) nodeOutputs.set(runnable.id, dispatched.resultSummary);
         outcome = {
           result: "done",
@@ -1625,13 +1871,41 @@ async function executeGraphRemotely({ config, store, targets, graph }) {
   };
 }
 
-async function runGraph(graphId, dryRun) {
+async function runGraph(graphId, dryRun, inputPrompt, startNewRun = true) {
   const dataSourceConfig = await readDataSourceConfig();
   if (dataSourceConfig.mode === "structured") {
-    const store = await readWorkingStore(dataSourceConfig);
+    let store = await readWorkingStore(dataSourceConfig);
     const targets = await readTargets();
-    const graph = store.graphs.find((item) => item.id === graphId);
+    let graph = store.graphs.find((item) => item.id === graphId);
     if (!graph) throw new Error(`graph not found: ${graphId}`);
+    const activeRun = [...graph.runs].reverse().find((run) => run.status === "running");
+    if (graph.processEnabled) {
+      if (startNewRun || !activeRun) {
+        if (typeof inputPrompt !== "string" || !inputPrompt.trim()) {
+          throw new Error("업무프로세스의 새 run에는 업무 입력이 필요합니다.");
+        }
+        if (!dryRun) {
+          const client = requireWorkTasks();
+          try {
+            await client.post(`/graphs/${encodeURIComponent(graph.id)}/runs`, {
+              expected_version: graph.version,
+              trigger_kind: "manual",
+              // Do not normalize this value: it is immutable run history at the source.
+              input_prompt: inputPrompt,
+            });
+          } catch (error) {
+            if (error?.status === 409) await client.get(`/graphs/${encodeURIComponent(graph.id)}`);
+            throw error;
+          }
+          const refreshed = await refreshConfiguredDataSource(dataSourceConfig, graph.id);
+          store = refreshed.store;
+          graph = store.graphs.find((item) => item.id === graphId);
+          if (!graph) throw new Error(`graph vanished after starting its run: ${graphId}`);
+        }
+      } else if (!activeRun.inputPrompt?.trim()) {
+        throw new Error("재개할 업무프로세스 run의 저장된 업무 입력을 읽을 수 없습니다.");
+      }
+    }
     // 설계·라우팅 검증은 원격에 한 글자도 쓰기 전에, 로컬과 같은 규칙으로 한다.
     const plan = compileExecutionPlan(store, graph, targets, dryRun);
     await attestExecutionPlan(plan);
@@ -1643,9 +1917,15 @@ async function runGraph(graphId, dryRun) {
   const targets = await readTargets();
   const graph = store.graphs.find((item) => item.id === graphId);
   if (!graph) throw new Error(`graph not found: ${graphId}`);
+  if (graph.processEnabled && (typeof inputPrompt !== "string" || !inputPrompt.trim())) {
+    throw new Error("업무프로세스의 새 run에는 업무 입력이 필요합니다.");
+  }
   const plan = compileExecutionPlan(store, graph, targets, dryRun);
   await attestExecutionPlan(plan);
-  return executeGraph({ store, targets, graph, dryRun, context: { stack: [], depthLimit: plan.depthLimit } });
+  return executeGraph({
+    store, targets, graph, dryRun,
+    context: { stack: [], depthLimit: plan.depthLimit, ...(graph.processEnabled ? { workInput: inputPrompt } : {}) },
+  });
 }
 
 async function runStandaloneTask(taskId, requestedRouting, dryRun) {
@@ -1700,6 +1980,12 @@ async function handleMessage(message) {
         console.log("[bridge] Orca targets refreshed");
         return result;
       }
+    case "task-project-context":
+      return taskProjectContext(String(message.taskId || ""), String(message.workspaceHint || ""));
+    case "link-task-projects":
+      return linkTaskProjects(String(message.taskId || ""), message.paths, message.branch);
+    case "set-graph-process":
+      return setGraphProcess(String(message.graphId || ""), Number(message.expectedVersion), Boolean(message.enabled));
     case "configure-source": {
       const result = await configureDataSource(message.config, message.store);
       console.log(`[bridge] data source configured (${result.mode})`);
@@ -1721,7 +2007,11 @@ async function handleMessage(message) {
       return result;
     }
     case "run":
-      await runGraph(String(message.graphId), Boolean(message.dryRun));
+      await runGraph(
+        String(message.graphId), Boolean(message.dryRun),
+        typeof message.inputPrompt === "string" ? message.inputPrompt : undefined,
+        message.startNewRun !== false,
+      );
       console.log(`[bridge] graph ${message.graphId} ${message.dryRun ? "planned" : "executed"}`);
       return;
     case "run-task": {
@@ -1802,6 +2092,11 @@ await mkdir(runtimeDir, { recursive: true });
 console.log("Graph Engineering bridge ready");
 console.log(`root: ${root}`);
 console.log("Keep this terminal open while using the plugin panel.");
+if (workTasksClient && localWorkTasksEnvironment) {
+  void publishLocalOrcaProjects({ force: true })
+    .then((result) => console.log(`[bridge] published ${result.projects.length} Orca projects for ${result.environment}`))
+    .catch((error) => console.error(`[bridge] Orca project registry publish failed: ${error instanceof Error ? error.message : String(error)}`));
+}
 
 process.stdin.setEncoding("utf8");
 process.stdin.setRawMode?.(true);

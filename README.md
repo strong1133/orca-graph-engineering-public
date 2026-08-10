@@ -19,7 +19,9 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 T
 - sequence, blocks, informs, loop 엣지와 조건 분기, AND/OR join
 - 그래프 목록 검색, lifecycle·실행 단계 필터, 정렬, color dot, 상태 badge, 진행률
 - 그래프 생성, 복제, 보관, 초기화, pin, routine 메타데이터, JSON import/export
-- 그래프와 노드의 project, session, model, reasoning 라우팅
+- 🧭 업무프로세스 그래프, 실행별 원문 업무 입력과 회차별 입력 이력
+- 그래프와 노드의 project, Orca worktree branch, session, model, reasoning 라우팅
+- 장치의 Orca repo registry 게시와 Task 대상 folder 프로젝트 감지·확인 연결
 - path, diamond, router, star, cycle, tree, tool-bipartite topology template
 - superstep, critical path, 병렬 writer/reducer, loop guard, 예산, 권한, provenance 검사
 - retry, timeout, idempotency, compensation, human gate, 실행 이력
@@ -35,7 +37,7 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 T
 - Task/Todo 검색은 제목·ID·태그·사람 Draft·Meta Draft를 함께 찾고, Task는 Domain/Milestone, Todo는 그룹/하위그룹 이름까지 검색합니다. Task는 기본적으로 Domain→Milestone, Todo는 원천의 그룹→하위그룹별로 묶이며 상태와 우선순위 그룹으로 바꿀 수 있습니다. Todo 그룹 계층은 실행 scope인 Domain/Milestone과 독립적입니다. Todo는 원천 화면과 같은 활성 상태(할 일·진행 중)를 기본으로 표시하며, 완료·취소 이력은 `모든 상태` 또는 개별 상태 필터에서 확인할 수 있습니다.
 - 사람 Draft를 고치면 새 immutable revision을 추가하고 이전 Meta Draft는 삭제하지 않은 채 stale로 표시합니다. `Meta Prompt 만들기`는 선택된 Orca bridge worktree에 새 Codex 세션을 만들고 플러그인에 내장된 공개 prompt 계약으로 결과를 생성합니다. 결과가 고정 9개 섹션 계약을 통과하고 실행 중 사람 Draft revision이 바뀌지 않았을 때만 Meta Draft로 저장합니다.
 - 하나의 Task를 여러 Graph의 Task 노드에 재사용할 수 있습니다. 최신 Meta Draft가 있으면 실행 payload로 사용하고, 없거나 stale이면 현재 사람 Draft를 사용합니다. 제목이나 유효 실행 지시문이 바뀌면 연결된 모든 노드도 함께 갱신됩니다.
-- Task 상세 헤더의 `Task 실행`은 그래프를 만들지 않고도 현재 실행 Prompt를 단건으로 보냅니다. 실행 전에 연결된 Orca 환경, 그 환경의 project·기존 session, AI model, reasoning을 고르며 그래프 run·node claim이나 Task 상태 변경은 만들지 않습니다. 로컬 환경 이름은 `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME`으로 지정할 수 있고 저장된 원격 Orca 환경은 대상 갱신 때 자동으로 합쳐집니다.
+- Task 상세 헤더의 `Task 실행`은 그래프를 만들지 않고도 현재 실행 Prompt를 단건으로 보냅니다. 실행 전에 연결된 Orca 환경, 그 환경의 project·작업 branch·기존 session, AI model, reasoning을 고르며 그래프 run·node claim이나 Task 상태 변경은 만들지 않습니다. 구조화 Workspace Task에 target folder가 없으면 현재 Orca worktree/repository를 추천하고, 사용자가 확인한 경로만 기존 Task project 관계에 CAS로 추가합니다. 로컬 환경 이름은 `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME`으로 지정할 수 있고 저장된 원격 Orca 환경은 대상 갱신 때 자동으로 합쳐집니다.
 - Todo는 선택적으로 Task에 연결하거나 새 Task로 전환할 수 있습니다. 전환 뒤에도 원래 Todo는 보존되고 Domain·Milestone과 Prompt revision lineage도 새 Task에 복사됩니다.
 - hard delete 대신 Domain/Milestone 보관, 확인 창이 있는 `Task 삭제`(복원 가능한 보관), Todo 취소를 사용합니다. 활성 하위 Milestone·Task·Todo가 남은 Domain이나 Milestone은 보관할 수 없습니다.
 
@@ -43,13 +45,13 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 T
 
 ## 그래프 라우팅
 
-일반 Task 노드의 `project`, `session`, `model`, `reasoning`은 필드별로 계산합니다.
+일반 Task 노드의 `project`, `branch`, `session`, `model`, `reasoning`은 필드별로 계산합니다.
 
 1. 노드 값
 2. 그래프 기본값
 3. Orca 또는 에이전트 기본값
 
-기존 session은 실제 실행 위치를 결정합니다. 이때 model 값은 session agent family와의 호환성 제약으로만 검사하며 실행 중인 model을 바꾸지 않습니다. 기존 session의 현재 effort를 조회하거나 변경하는 공개 primitive가 없으므로 reasoning 값이 있으면 계획과 실행을 모두 사전 거절합니다. reasoning을 비우면 session의 현재 effort를 그대로 유지합니다. session 없이 project만 선택하면 그 프로젝트의 Orca worktree에 새 에이전트 terminal을 만듭니다.
+기존 session은 실제 실행 위치와 branch를 결정합니다. 이때 model 값은 session agent family와의 호환성 제약으로만 검사하며 실행 중인 model을 바꾸지 않습니다. 기존 session의 현재 effort를 조회하거나 변경하는 공개 primitive가 없으므로 reasoning 값이 있으면 계획과 실행을 모두 사전 거절합니다. reasoning을 비우면 session의 현재 effort를 그대로 유지합니다. session 없이 project와 branch를 선택하면 그 branch의 기존 Orca-managed worktree에 새 에이전트 terminal을 만듭니다. 아직 Orca worktree가 없는 임의 branch를 플러그인이 묵시적으로 만들지는 않습니다.
 
 새 session의 reasoning은 model catalog에 선언된 capability만 선택할 수 있습니다. Claude CLI는 `low`, `medium`, `high`, `xhigh`, `max`를 `--effort`로 받습니다. Codex는 Sol/Terra에서 `low`부터 `ultra`까지, Luna에서 `low`부터 `max`까지를 `model_reasoning_effort`로 받습니다. catalog에 없거나 model이 지원하지 않는 값은 terminal 생성 전에 fail-closed합니다.
 
@@ -95,6 +97,20 @@ Orca의 Settings → Plugins에서 Plugin system을 켜고 Development plugin �
 - `구조 없음`: 임의 JSON의 레코드 배열을 자동 탐색하거나 필드 경로를 지정해 읽기 전용 Task 후보로 사용합니다. 쓰기/CAS 계약이 없으므로 Graph 정본은 로컬에 남습니다.
 
 인증 토큰 값은 저장하지 않습니다. 브리지를 시작할 terminal에 토큰을 환경변수로 설정하고 UI에는 그 환경변수 이름만 입력합니다. 연결 snapshot은 교체 가능한 `runtime/source-cache.json`에 저장되며 Git과 배포 package에서 제외됩니다. 폴더 모드는 단일 사용자 파일 저장 방식이라 분산 CAS를 제공하지 않으며, 같은 파일을 여러 프로세스가 동시에 수정하지 않는 것을 전제로 합니다.
+
+### 호환 Workspace aggregate API
+
+업무프로세스 run과 장치별 repo registry, Task project 관계를 제공하는 호환 Workspace에 연결할 때 bridge terminal에 다음 공개 설정을 둡니다.
+
+```bash
+export ORCA_GRAPH_WORKSPACE_BASE_URL="https://your-workspace.ts.net"
+export ORCA_GRAPH_WORKSPACE_ENVIRONMENT="정석맥1" # 정석맥1 | 정석맥2 | Hermes
+export ORCA_GRAPH_WORKSPACE_CLIENT_ID="orca-graph-engineering"
+```
+
+기본 API prefix가 다른 호환 서버는 `ORCA_GRAPH_WORKSPACE_API_PATH`로 바꿀 수 있습니다. 브리지는 base page에서 짧은 session bootstrap을 얻고 값을 파일·Graph·로그에 남기지 않습니다. 기동 시 `orca repo list --json`의 repo ID, 표시 이름, 로컬 경로, kind, canonical remote를 `PUT /orca-projects/{environment}`에 전체 교체 게시합니다. 이후에는 사용자가 `대상 새로고침`을 실행한 변경 이벤트에서만 다시 비교하며 같은 payload는 보내지 않아 주기 polling을 만들지 않습니다.
+
+구조화 snapshot이 업무프로세스 확장을 아직 직접 투영하지 않더라도 aggregate Graph 조회의 `process_enabled`, `current_run.input_prompt`, `recent_runs[].input_prompt`를 같은 CAS 정본에서 보강합니다. 새 업무프로세스 run은 입력이 비어 있으면 시작할 수 없고, 재개는 저장된 입력을 읽기 전용으로 표시합니다. 클라이언트는 입력 문자열을 trim하거나 줄바꿈을 바꾸지 않고 요청 JSON에 그대로 넣습니다.
 
 ## 배포 artifact
 

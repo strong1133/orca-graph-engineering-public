@@ -999,6 +999,51 @@ describe.each([
   });
 });
 
+describe("work process and branch execution surface", () => {
+  it("shows the process badge, saved run input, and Orca worktree branches", async () => {
+    const dom = await mountPanel(true, (bootstrap) => {
+      const graph = bootstrap.store.graphs[0];
+      graph.processEnabled = true;
+      graph.status = "running";
+      graph.defaults = { projectId: "project-1", branch: "refs/heads/main", model: "gpt-5.6-sol" };
+      graph.runs = [{
+        id: "run-process", runNo: 7, status: "running", startedAt: "2026-08-10T00:00:00Z",
+        inputPrompt: "  고객 A\n계약서 검토  ",
+      }];
+      bootstrap.targets.environments = [{ id: "local", name: "jsj1", local: true, connected: true }];
+      bootstrap.targets.projects = [{
+        id: "project-1", name: "Work", environmentId: "local", repoId: "repo-1",
+        worktreeId: "repo-1::/work", path: "/work", branch: "refs/heads/main",
+      }];
+      bootstrap.targets.branches = [
+        { id: "main", branch: "refs/heads/main", environmentId: "local", projectId: "project-1", repoId: "repo-1", worktreeId: "repo-1::/work", path: "/work" },
+        { id: "feature", branch: "refs/heads/feature/review", environmentId: "local", projectId: "project-1", repoId: "repo-1", worktreeId: "repo-1::/feature", path: "/feature" },
+      ];
+    });
+    try {
+      const { document, Event } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="list"]')?.click();
+      expect(document.querySelector(".graph-list-row")?.textContent).toContain("🧭 업무프로세스");
+      document.querySelector<HTMLButtonElement>('[data-action="open-list-graph"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
+      expect(document.querySelector<HTMLSelectElement>('[data-scope="run-process"][data-field="startNewRun"]')?.value).toBe("resume");
+      expect(document.querySelector<HTMLTextAreaElement>('[data-scope="run-process"][data-field="inputPrompt"]')?.value).toBe("  고객 A\n계약서 검토  ");
+      expect(document.querySelector<HTMLTextAreaElement>('[data-scope="run-process"][data-field="inputPrompt"]')?.readOnly).toBe(true);
+      const branch = document.querySelector<HTMLSelectElement>('[data-scope="run-routing"][data-field="branch"]');
+      expect([...branch!.options].map((item) => item.textContent)).toContain("feature/review · /feature");
+      const mode = document.querySelector<HTMLSelectElement>('[data-scope="run-process"][data-field="startNewRun"]');
+      if (mode) { mode.value = "new"; mode.dispatchEvent(new Event("change", { bubbles: true })); }
+      expect(document.querySelector<HTMLTextAreaElement>('[data-scope="run-process"][data-field="inputPrompt"]')?.readOnly).toBe(false);
+      expect(document.querySelector(".process-run-input")?.textContent).toContain("업무 입력이 필요합니다");
+      document.querySelector<HTMLButtonElement>('[data-action="close-modal"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-history"]')?.click();
+      expect(document.querySelector(".run-input")?.textContent).toBe("  고객 A\n계약서 검토  ");
+    } finally {
+      dom.window.close();
+    }
+  });
+});
+
 describe("structured source work editing", () => {
   it("sends the last-read CAS version and full supported Task DTO", async () => {
     const dom = await mountPanel(true, (bootstrap) => {
@@ -1048,7 +1093,7 @@ describe("structured source work editing", () => {
         title.dispatchEvent(new Event("change", { bubbles: true }));
       }
       await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(requests[0]).toMatchObject({
+      expect(requests.find((request) => request.type === "mutate-source" && request.mutation?.kind === "task")).toMatchObject({
         type: "mutate-source",
         mutation: {
           kind: "task", expectedVersion: 4, relatedVersions: { "todo-source": 6 },
@@ -1064,7 +1109,7 @@ describe("structured source work editing", () => {
         subgroup.dispatchEvent(new Event("change", { bubbles: true }));
       }
       await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(requests[1]).toMatchObject({
+      expect(requests.find((request) => request.type === "mutate-source" && request.mutation?.kind === "todo")).toMatchObject({
         type: "mutate-source",
         mutation: {
           kind: "todo", expectedVersion: 6, relatedVersions: { "task-source": 4 },

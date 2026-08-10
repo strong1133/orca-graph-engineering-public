@@ -34,17 +34,19 @@ visible Orca shell terminal
 
 `GraphDefinition`은 다음 요소를 가집니다.
 
-- graph metadata: status, pinned, routine, repeat, guards, run history
+- graph metadata: status, pinned, process, routine, repeat, guards, run history
 - nodes: `task | condition | graph_call`
 - edges: `sequence | blocks | informs | loop`, optional branch label
 - execution structure: join mode, node status, condition decision
-- routing defaults: project, session, model, reasoning
+- routing defaults: project, Orca-managed worktree branch, session, model, reasoning
 - model targets: agent family와 새 session에 전달 가능한 `reasoningLevels`
 - graph engineering policy: topology, objective/questions, global/reserved budget, max parallelism, hop limit, checkpoint, provenance, human gate
 - node execution contract: role, reads/writes/reducer, context mode, retry/timeout/budget, idempotency, side effect/compensation, permissions, evidence
 - portable editor hints: `graph.engineering.editor.groupBy`, edge waypoint map, `node.engineering.layoutPinned`
 
 `GraphStore` v1은 Graph 목록과 함께 로컬 `domains`, `milestones`, `tasks`, `todos` 컬렉션을 가진다. 기존 v1 파일에 필드가 없어도 빈 scope 목록을 만들고 node의 embedded Task payload를 Task 목록과 최초 사람 Draft revision으로 자동 승격하므로 이전 저장 파일과 호환된다.
+
+`processEnabled=true`인 Graph는 재사용 흐름 템플릿이다. Graph 구조와 노드 Task Prompt는 방법을, `GraphRunRecord.inputPrompt`는 그 회차의 처리 대상을 나타낸다. 새 run의 입력은 필수이고 immutable이며, 재개는 현재 run의 입력을 다시 사용한다. 일반 Graph에는 이 규칙을 적용하지 않아 기존 단발 실행과 JSON의 의미를 유지한다.
 
 업무 scope는 `Domain 1:N Milestone`이다. Task/Todo의 `domainId`, `milestoneId`는 선택 사항이지만 Milestone이 있으면 그 Milestone의 Domain과 일치해야 한다. UI와 normalize 경계가 이 규칙을 강제하며, 하위 활성 Milestone·Task·Todo가 있는 scope는 archive할 수 없다. hard delete는 제공하지 않는다.
 
@@ -76,7 +78,9 @@ Orca plugin API v1의 panel contribution은 우측 activity bar의 sandboxed ifr
 
 상단의 고정 메뉴는 `그래프 목록`, `그래프 보기`, `Domain 관리`, `Milestone 관리`, `Task 관리`, `Todo 관리`를 명시적으로 전환한다. 목록 화면은 lifecycle status와 최신 run stage를 분리합니다. status는 badge, 실행 단계는 color dot와 별도 badge로 표시하며 이름·설명·ID 검색, 두 종류의 필터, 수정일·이름·상태 정렬을 클라이언트에서 수행합니다. Task/Todo 화면은 Draft·Meta·scope까지 통합 검색하고 상태·Domain·Milestone 필터, Domain/Milestone/상태/우선순위 그룹화, 우선순위·마감일·수정일 정렬을 제공한다. Task의 기본 그룹은 Domain→Milestone이고, Todo의 기본 그룹은 실행 scope와 독립적인 free-form `groupName`→`subgroupName` 계층이다. 활성 그룹화 모드의 각 그룹은 독립적으로 접고 펼칠 수 있으며, 현재 필터에 보이는 그룹 전체를 한 번에 접거나 펼칠 수도 있다. 그룹 항목 수와 접힘 상태는 유지한다. Todo의 기본 projection은 `open|in_progress`인 활성 항목이며, `done|cancelled` 이력은 삭제하지 않고 모든 상태 또는 개별 상태 필터로 노출한다. 헤더는 현재 표시 수·활성 수·전체 수를 분리해 원천 집계 의미를 보존한다.
 
-Task 상세의 고정 실행 버튼은 저장된 Task ID와 일회성 `environmentId/projectId/sessionId/model/reasoning`만 브리지에 보낸다. 대상 갱신은 현재 Orca와 `environment list`에 저장된 원격 Orca를 각각 조회하고 environment별 project/worktree/agent session을 한 snapshot에 합친다. UI는 환경을 먼저 고른 뒤 그 환경에 속한 project와 session만 보여 주며, 브리지는 선택된 원격 환경의 모든 CLI 호출에 공식 `--environment` selector를 적용한다. 브리지는 현재 GraphStore나 구조화 원천 snapshot에서 Task와 유효 실행 Prompt를 다시 읽고 그래프 실행과 같은 target allow-list, agent family, reasoning, live worktree/session attestation을 적용한다. 단건 실행은 그래프 run·node claim·Task lifecycle을 만들지 않으며 새 terminal을 생성하거나 증명된 idle agent session에 Prompt를 보내 완료까지 기다린다.
+Task 상세의 고정 실행 버튼은 저장된 Task ID와 일회성 `environmentId/projectId/branch/sessionId/model/reasoning`만 브리지에 보낸다. 대상 갱신은 현재 Orca와 `environment list`에 저장된 원격 Orca를 각각 조회하고 environment별 project/worktree branch/agent session을 한 snapshot에 합친다. UI는 환경을 먼저 고른 뒤 그 환경에 속한 project, 이미 checkout된 branch와 session만 보여 주며, 브리지는 선택된 원격 환경의 모든 CLI 호출에 공식 `--environment` selector를 적용한다. 브리지는 현재 GraphStore나 구조화 원천 snapshot에서 Task와 유효 실행 Prompt를 다시 읽고 그래프 실행과 같은 target allow-list, agent family, reasoning, live worktree/session attestation을 적용한다. 단건 실행은 그래프 run·node claim·Task lifecycle을 만들지 않으며 새 terminal을 생성하거나 증명된 idle agent session에 Prompt를 보내 완료까지 기다린다.
+
+호환 Workspace aggregate API를 설정하면 bridge 기동과 명시적 대상 갱신에서만 로컬 `orca repo list --json`을 읽어 장치별 registry를 전체 교체 게시한다. Task를 열거나 실행할 때 target folder 관계가 비어 있으면 현재/활성 Orca worktree를 repo ID와 경로로 registry에 대조한다. 한 후보면 추천하고 여러 후보면 사용자가 체크하게 하며, 확인 뒤에만 최신 Task version과 기존 project 관계 전체를 다시 읽어 `role=target`, `locatorKind=folder` 항목을 추가한다. 409에서는 최신 Task를 재조회하지만 stale version으로 쓰기를 자동 재시도하지 않는다.
 
 Task 상세의 `Task 삭제`는 확인 modal을 거쳐 lifecycle을 `archived`로 바꾸는 보존형 삭제다. Prompt revision과 연결된 graph node를 제거하지 않으며 보관된 Task는 같은 상세 화면의 `Task 복원`으로 backlog에 되돌린다. 구조화 원천에서는 기존 Task CAS version으로 mutation하고 충돌 시 최신 snapshot을 다시 읽는다.
 
