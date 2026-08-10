@@ -80,6 +80,7 @@ type ModalState =
 type EditorMode = "design" | "run";
 type InspectorTab = "basic" | "task" | "execution" | "safety";
 type GraphRunStage = "never" | "planned" | "running" | "stale" | "done" | "failed" | "cancelled";
+type WorkGroupMode = "none" | "domain" | "milestone" | "todo-group" | "status" | "priority";
 type GraphHistoryEntry = {
   graphId: string;
   label: string;
@@ -103,7 +104,8 @@ interface ViewState {
   todoStatusFilter: LocalTodoStatus | "active" | "all";
   workDomainFilter: string;
   workMilestoneFilter: string;
-  workGroup: "none" | "domain" | "milestone" | "status" | "priority";
+  taskWorkGroup: WorkGroupMode;
+  todoWorkGroup: WorkGroupMode;
   collapsedWorkGroups: Set<string>;
   workSort: "updated-desc" | "due-asc" | "priority" | "title";
   scopeQuery: string;
@@ -179,7 +181,8 @@ const view: ViewState = {
   todoStatusFilter: "active",
   workDomainFilter: "all",
   workMilestoneFilter: "all",
-  workGroup: "milestone",
+  taskWorkGroup: "milestone",
+  todoWorkGroup: "todo-group",
   collapsedWorkGroups: new Set(),
   workSort: "updated-desc",
   scopeQuery: "",
@@ -2091,6 +2094,7 @@ function todoInspector(todo: LocalTodo): string {
     <header><div><span class="badge priority-${todo.priority}">${priorityLabel[todo.priority]}</span><strong>${esc(todo.title)}</strong></div><small>${esc(todo.id)}</small></header>
     <div class="work-inspector-body">
       <label class="field"><span>제목</span><input data-scope="local-todo" data-field="title" value="${esc(todo.title)}"></label>
+      <div class="field-row"><label class="field"><span>그룹</span><input data-scope="local-todo" data-field="groupName" value="${esc(todo.groupName ?? "")}" placeholder="Todo 그룹"></label><label class="field"><span>하위그룹</span><input data-scope="local-todo" data-field="subgroupName" value="${esc(todo.subgroupName ?? "")}" placeholder="선택 사항"></label></div>
       ${scopeSelectors("local-todo", todo)}
       ${promptPairEditor("todo", todo)}
       <label class="field"><span>메모</span><textarea data-scope="local-todo" data-field="notes">${esc(todo.notes)}</textarea></label>
@@ -2118,17 +2122,26 @@ function workScopeMatches(item: LocalTask | LocalTodo): boolean {
   return true;
 }
 
+function selectedWorkGroup(isTask: boolean): WorkGroupMode {
+  return isTask ? view.taskWorkGroup : view.todoWorkGroup;
+}
+
 function workGroupLabel(item: LocalTask | LocalTodo, isTask: boolean): string {
   const scope = itemScope(item);
-  if (view.workGroup === "domain") return scope.domain?.name ?? "독립 항목";
-  if (view.workGroup === "milestone") return scope.milestone ? `${scope.domain?.name ?? "Domain"} / ${scope.milestone.name}` : scope.domain ? `${scope.domain.name} / Milestone 없음` : "독립 항목";
-  if (view.workGroup === "status") return isTask ? taskStatusLabel[(item as LocalTask).status] : todoStatusLabel[(item as LocalTodo).status];
-  if (view.workGroup === "priority") return `우선순위 · ${priorityLabel[item.priority]}`;
+  const groupMode = selectedWorkGroup(isTask);
+  if (groupMode === "domain") return scope.domain?.name ?? "독립 항목";
+  if (groupMode === "milestone") return scope.milestone ? `${scope.domain?.name ?? "Domain"} / ${scope.milestone.name}` : scope.domain ? `${scope.domain.name} / Milestone 없음` : "독립 항목";
+  if (groupMode === "todo-group" && !isTask) {
+    const todo = item as LocalTodo;
+    return todo.groupName ? `${todo.groupName}${todo.subgroupName ? ` / ${todo.subgroupName}` : " / 하위그룹 없음"}` : "미분류 Todo";
+  }
+  if (groupMode === "status") return isTask ? taskStatusLabel[(item as LocalTask).status] : todoStatusLabel[(item as LocalTodo).status];
+  if (groupMode === "priority") return `우선순위 · ${priorityLabel[item.priority]}`;
   return "전체";
 }
 
 function workGroupKey(label: string, isTask: boolean): string {
-  return `${isTask ? "task" : "todo"}:${view.workGroup}:${label}`;
+  return `${isTask ? "task" : "todo"}:${selectedWorkGroup(isTask)}:${label}`;
 }
 
 function renderWorkCards(items: Array<LocalTask | LocalTodo>, isTask: boolean, selectedId: string | undefined): string {
@@ -2139,7 +2152,7 @@ function renderWorkCards(items: Array<LocalTask | LocalTodo>, isTask: boolean, s
   }
   return [...groups.entries()].map(([label, grouped]) => {
     const groupKey = workGroupKey(label, isTask);
-    const collapsible = view.workGroup !== "none";
+    const collapsible = selectedWorkGroup(isTask) !== "none";
     const collapsed = collapsible && view.collapsedWorkGroups.has(groupKey);
     return `<section class="work-group ${collapsed ? "collapsed" : ""}" aria-label="그룹 ${esc(label)}">
     ${collapsible ? `<header><button class="work-group-toggle" data-action="toggle-work-group" data-id="${esc(groupKey)}" aria-expanded="${collapsed ? "false" : "true"}" aria-label="${esc(label)} 그룹 ${collapsed ? "펼치기" : "접기"}"><span class="work-group-chevron" aria-hidden="true">${collapsed ? "▸" : "▾"}</span><strong>${esc(label)}</strong><span>${grouped.length}</span></button></header>` : ""}
@@ -2161,6 +2174,7 @@ function renderWorkCards(items: Array<LocalTask | LocalTodo>, isTask: boolean, s
 
 function renderLocalWorkManager(kind: "task" | "todo"): string {
   const isTask = kind === "task";
+  const workGroup = selectedWorkGroup(isTask);
   const activeTodoCount = store.todos.filter((todo) => todo.status === "open" || todo.status === "in_progress").length;
   const tasks = sortWorkItems(store.tasks.filter((task) =>
     (view.taskStatusFilter === "all" || task.status === view.taskStatusFilter)
@@ -2169,7 +2183,7 @@ function renderLocalWorkManager(kind: "task" | "todo"): string {
     (view.todoStatusFilter === "all"
       || (view.todoStatusFilter === "active" && (todo.status === "open" || todo.status === "in_progress"))
       || todo.status === view.todoStatusFilter)
-    && workScopeMatches(todo) && workItemMatches(todo, `${todo.draft} ${todo.metaDraft ?? ""} ${todo.notes}`)));
+    && workScopeMatches(todo) && workItemMatches(todo, `${todo.draft} ${todo.metaDraft ?? ""} ${todo.notes} ${todo.groupName ?? ""} ${todo.subgroupName ?? ""}`)));
   const detailTask = isTask && view.taskDetailOpen
     ? store.tasks.find((task) => task.id === view.selectedTaskId)
     : undefined;
@@ -2193,14 +2207,14 @@ function renderLocalWorkManager(kind: "task" | "todo"): string {
       <div><strong>${isTask ? "Task 관리" : "Todo 관리"}</strong><span>${countLabel}</span><span class="badge">${dataSource.config.mode === "structured" ? "구조화 원천 · 양방향" : dataSource.config.mode === "folder" ? "폴더 원천 · 저장형" : dataSource.config.mode === "unstructured" ? "로컬 + 외부 후보" : "로컬"}</span></div>
       <span class="work-manager-actions"><button data-action="open-data-source">데이터 원천</button><button class="primary" data-action="${isTask ? "new-local-task" : "new-local-todo"}">＋ 새 ${isTask ? "Task" : "Todo"}</button></span>
       <div class="work-controls">
-        <label class="graph-search"><span>⌕</span><input data-action="work-search" value="${esc(view.workQuery)}" placeholder="제목, Draft, Meta, Domain, Milestone 검색" aria-label="${kind} 검색"></label>
+        <label class="graph-search"><span>⌕</span><input data-action="work-search" value="${esc(view.workQuery)}" placeholder="${isTask ? "제목, Draft, Meta, Domain, Milestone 검색" : "제목, Draft, Meta, 그룹, 하위그룹 검색"}" aria-label="${kind} 검색"></label>
         ${statusSelect}
         <select data-action="work-domain-filter" aria-label="Domain 필터">${option("all", "모든 Domain", view.workDomainFilter)}${option("standalone", "독립 항목", view.workDomainFilter)}${store.domains.map((domain) => option(domain.id, domain.name, view.workDomainFilter)).join("")}</select>
         <select data-action="work-milestone-filter" aria-label="Milestone 필터">${option("all", "모든 Milestone", view.workMilestoneFilter)}${option("none", "Milestone 없음", view.workMilestoneFilter)}${milestoneOptions.map((milestone) => option(milestone.id, milestone.name, view.workMilestoneFilter)).join("")}</select>
-        <select data-action="work-group" aria-label="목록 그룹화">${option("none", "그룹화 없음", view.workGroup)}${option("domain", "Domain별 그룹", view.workGroup)}${option("milestone", "Domain · Milestone별 그룹", view.workGroup)}${option("status", "상태별 그룹", view.workGroup)}${option("priority", "우선순위별 그룹", view.workGroup)}</select>
+        <select data-action="work-group" aria-label="목록 그룹화">${option("none", "그룹화 없음", workGroup)}${!isTask ? option("todo-group", "그룹 · 하위그룹별", workGroup) : ""}${option("domain", "Domain별 그룹", workGroup)}${option("milestone", "Domain · Milestone별 그룹", workGroup)}${option("status", "상태별 그룹", workGroup)}${option("priority", "우선순위별 그룹", workGroup)}</select>
         <select data-action="work-sort" aria-label="업무 정렬">${option("updated-desc", "최근 수정순", view.workSort)}${option("due-asc", "마감 임박순", view.workSort)}${option("priority", "우선순위", view.workSort)}${option("title", "이름순", view.workSort)}</select>
       </div>
-      ${view.workGroup !== "none" && items.length ? `<span class="work-group-bulk-actions" aria-label="그룹 일괄 제어"><button data-action="collapse-all-work-groups" ${allGroupsCollapsed ? "disabled" : ""}>모두 접기</button><button data-action="expand-all-work-groups" ${allGroupsExpanded ? "disabled" : ""}>모두 펼치기</button></span>` : ""}
+      ${workGroup !== "none" && items.length ? `<span class="work-group-bulk-actions" aria-label="그룹 일괄 제어"><button data-action="collapse-all-work-groups" ${allGroupsCollapsed ? "disabled" : ""}>모두 접기</button><button data-action="expand-all-work-groups" ${allGroupsExpanded ? "disabled" : ""}>모두 펼치기</button></span>` : ""}
     </header>
     <div class="work-manager-body ${isTask ? "task-list-only" : ""} ${items.length ? "" : "empty"}">
       <div class="work-list">
@@ -3698,7 +3712,8 @@ app.addEventListener("change", (event) => {
       if (milestone) { todo.domainId = milestone.domainId; todo.milestoneId = milestone.id; }
       else delete todo.milestoneId;
     } else if (field === "tags") todo.tags = input.value.split(",").map((item) => item.trim()).filter(Boolean);
-    else if (field === "dueDate" || field === "taskId") {
+    else if (field === "subgroupName") todo.subgroupName = input.value;
+    else if (field === "dueDate" || field === "taskId" || field === "groupName") {
       if (input.value) (todo as unknown as Record<string, unknown>)[field] = input.value;
       else delete (todo as unknown as Record<string, unknown>)[field];
     } else (todo as unknown as Record<string, unknown>)[field] = raw;
@@ -3886,7 +3901,11 @@ app.addEventListener("change", (event) => {
       view.workMilestoneFilter = "all";
       view.selectedTaskId = null; view.selectedTodoId = null; render(); break;
     case "work-milestone-filter": view.workMilestoneFilter = control.value; view.selectedTaskId = null; view.selectedTodoId = null; render(); break;
-    case "work-group": view.workGroup = control.value as ViewState["workGroup"]; render(); break;
+    case "work-group":
+      if (view.mode === "tasks") view.taskWorkGroup = control.value as WorkGroupMode;
+      else if (view.mode === "todos") view.todoWorkGroup = control.value as WorkGroupMode;
+      render();
+      break;
     case "work-sort": view.workSort = control.value as ViewState["workSort"]; render(); break;
     case "group-mode": {
       if (view.editorMode !== "design") { toast("캔버스 그룹은 설계 모드에서 바꿀 수 있습니다."); render(); break; }

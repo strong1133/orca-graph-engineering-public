@@ -313,6 +313,7 @@ describe("public store normalization", () => {
       graphs: [item],
       todos: [{
         id: "todo-1", title: "Review", notes: "Review the result", status: "open", priority: "high",
+        groupName: "Quality", subgroupName: "Review",
         draft: "Review the result", promptRevisions: [],
         tags: ["quality"], taskId: "ta", createdAt: item.createdAt, updatedAt: item.updatedAt,
       }],
@@ -321,7 +322,9 @@ describe("public store normalization", () => {
     expect(normalized.schemaVersion).toBe(1);
     expect(normalized.tasks.map((task) => task.id)).toEqual(["ta", "tb"]);
     expect(normalized.tasks[0]).toMatchObject({ title: "A", status: "ready", priority: "medium" });
-    expect(normalized.todos[0]).toMatchObject({ id: "todo-1", taskId: "ta", priority: "high" });
+    expect(normalized.todos[0]).toMatchObject({
+      id: "todo-1", taskId: "ta", priority: "high", groupName: "Quality", subgroupName: "Review",
+    });
   });
 
   it("normalizes Domain and Milestone scope and migrates Draft prompt history", () => {

@@ -12,7 +12,7 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 T
 - 설계/실행 보기 분리, 기본·Task·실행·안전 Inspector 탭, 선택 문맥 툴바와 구조 Problems 패널
 - 그래프 호출 breadcrumb 탐색, 노드 검색, 단축키 도움말, 대형 그래프 드래그·이동 중 DOM 직접 갱신
 - Domain→Milestone→Task/Todo 업무 계층과 Domain·Milestone 독립 관리 화면
-- Task/Todo 목록의 Draft·Meta·Domain·Milestone 통합 검색, 범위·상태 필터, 기본 Domain→Milestone 그룹화, 상태/우선순위 그룹화·개별/전체 접기·펼치기와 정렬
+- Task/Todo 목록의 Draft·Meta·Domain·Milestone 통합 검색, 범위·상태 필터, Task의 Domain→Milestone 및 Todo의 그룹→하위그룹 기본 계층, 상태/우선순위 그룹화·개별/전체 접기·펼치기와 정렬
 - 사람 Draft와 Meta Draft의 분리 저장, revision lineage, stale 감지, 자체 포함형 Meta Prompt 생성
 - 독립적인 Task/Todo 상태·우선순위·마감일·태그 관리와 Todo→Task 전환
 - 하나의 Task를 여러 그래프 노드에 연결하고 관리 화면에서 연결 위치로 이동
@@ -32,7 +32,7 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 T
 
 - Domain은 목표, 공통 메모, 제약사항과 owner를 가지며 여러 Milestone을 포함합니다. Milestone은 반드시 하나의 Domain에 속하고 목표, 성공 기준, 상태, 우선순위, 마감일을 가집니다.
 - Task와 Todo는 독립 항목일 수도 있고 Domain 또는 같은 Domain의 Milestone에 속할 수도 있습니다. Milestone을 선택하면 Domain이 자동으로 일치하며, 연결된 업무가 있는 Milestone의 Domain은 임의로 바꿀 수 없습니다.
-- Task/Todo 검색은 제목·ID·태그·사람 Draft·Meta Draft·Domain·Milestone을 함께 찾습니다. 목록은 기본적으로 Domain→Milestone별로 그룹화되며 상태와 우선순위 그룹으로 바꿀 수 있고, Domain/Milestone을 정확히 필터링할 수 있습니다. scope 관계가 없는 항목은 `독립 항목`으로 묶입니다. Todo는 원천 화면과 같은 활성 상태(할 일·진행 중)를 기본으로 표시하며, 완료·취소 이력은 `모든 상태` 또는 개별 상태 필터에서 확인할 수 있습니다.
+- Task/Todo 검색은 제목·ID·태그·사람 Draft·Meta Draft를 함께 찾고, Task는 Domain/Milestone, Todo는 그룹/하위그룹 이름까지 검색합니다. Task는 기본적으로 Domain→Milestone, Todo는 원천의 그룹→하위그룹별로 묶이며 상태와 우선순위 그룹으로 바꿀 수 있습니다. Todo 그룹 계층은 실행 scope인 Domain/Milestone과 독립적입니다. Todo는 원천 화면과 같은 활성 상태(할 일·진행 중)를 기본으로 표시하며, 완료·취소 이력은 `모든 상태` 또는 개별 상태 필터에서 확인할 수 있습니다.
 - 사람 Draft를 고치면 새 immutable revision을 추가하고 이전 Meta Draft는 삭제하지 않은 채 stale로 표시합니다. `Meta Prompt 만들기`는 선택된 Orca bridge worktree에 새 Codex 세션을 만들고 플러그인에 내장된 공개 prompt 계약으로 결과를 생성합니다. 결과가 고정 9개 섹션 계약을 통과하고 실행 중 사람 Draft revision이 바뀌지 않았을 때만 Meta Draft로 저장합니다.
 - 하나의 Task를 여러 Graph의 Task 노드에 재사용할 수 있습니다. 최신 Meta Draft가 있으면 실행 payload로 사용하고, 없거나 stale이면 현재 사람 Draft를 사용합니다. 제목이나 유효 실행 지시문이 바뀌면 연결된 모든 노드도 함께 갱신됩니다.
 - Todo는 선택적으로 Task에 연결하거나 새 Task로 전환할 수 있습니다. 전환 뒤에도 원래 Todo는 보존되고 Domain·Milestone과 Prompt revision lineage도 새 Task에 복사됩니다.

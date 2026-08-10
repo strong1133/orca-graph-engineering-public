@@ -59,7 +59,7 @@ Every response and mutation body carries `contractVersion: 1`. The snapshot retu
 }
 ```
 
-Mutation-capable providers include all four work collections. Older read-only v1 providers may omit them; the panel then fails closed for work edits. A Milestone always belongs to one Domain, and a Task/Todo `milestoneId` must resolve to the same `domainId`. Prompt revisions use `kind=draft|meta`; Meta revisions identify the human Draft they refine with `basedOnId` and are append-only.
+Mutation-capable providers include all four work collections. Older read-only v1 providers may omit them; the panel then fails closed for work edits. A Milestone always belongs to one Domain, and a Task/Todo `milestoneId` must resolve to the same `domainId`. Todo may additionally carry the provider-neutral free-form fields `groupName` and `subgroupName`; these describe the Todo list hierarchy and are independent of execution scope. Prompt revisions use `kind=draft|meta`; Meta revisions identify the human Draft they refine with `basedOnId` and are append-only.
 
 The plugin sends one full item through the common mutation boundary. `expectedVersion=0` creates an item; later writes send the exact last-read version. `relatedVersions` carries CAS values for coupled records in both directions: a Todo mutation carries its bound Task version, while a Task lifecycle mutation carries its bound Todo version. The server must never silently merge or retry a stale write. After every successful mutation the bridge discards its cache and fetches a canonical snapshot again.
 
@@ -74,6 +74,8 @@ The plugin sends one full item through the common mutation boundary. `expectedVe
     "id": "todo-id",
     "version": 7,
     "title": "Ship contract",
+    "groupName": "Delivery",
+    "subgroupName": "Release",
     "domainId": "domain-id",
     "milestoneId": "milestone-id",
     "draft": "Human-authored source",

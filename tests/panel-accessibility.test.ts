@@ -156,14 +156,6 @@ describe.each([
   it("shows active Todos by default while preserving completed and cancelled history", async () => {
     const dom = await mountPanel(wide, (bootstrap) => {
       const now = "2026-08-09T00:00:00.000Z";
-      bootstrap.store.domains = [{
-        id: "domain-product", name: "제품", summary: "", objectives: "", commonNotes: "", constraintNotes: "",
-        status: "active", owners: [], version: 1, createdAt: now, updatedAt: now,
-      }];
-      bootstrap.store.milestones = [{
-        id: "milestone-v1", domainId: "domain-product", name: "v1", summary: "", objectives: "", commonNotes: "", constraintNotes: "",
-        status: "active", priority: "medium", successCriteria: [], owners: [], version: 1, createdAt: now, updatedAt: now,
-      }];
       const statuses = [
         ...Array<"open">(21).fill("open"),
         ...Array<"in_progress">(2).fill("in_progress"),
@@ -180,7 +172,8 @@ describe.each([
         status,
         priority: "medium",
         tags: [],
-        ...(index === 0 ? { domainId: "domain-product", milestoneId: "milestone-v1" } : {}),
+        groupName: index < 15 ? "제품" : "운영",
+        subgroupName: index % 2 === 0 ? "v1" : "v2",
         createdAt: now,
         updatedAt: now,
       }));
@@ -191,7 +184,7 @@ describe.each([
 
       const filter = document.querySelector<HTMLSelectElement>('[data-action="todo-status-filter"]');
       expect(filter?.value).toBe("active");
-      expect(document.querySelector<HTMLSelectElement>('[data-action="work-group"]')?.value).toBe("milestone");
+      expect(document.querySelector<HTMLSelectElement>('[data-action="work-group"]')?.value).toBe("todo-group");
       expect([...document.querySelectorAll(".work-group > header strong")].some((item) => item.textContent === "제품 / v1")).toBe(true);
       expect(document.querySelector('[aria-label="Todo 관리"]')?.textContent).toContain("표시 23 · 활성 23 · 전체 30");
       expect(document.querySelectorAll(".work-list .work-card")).toHaveLength(23);
@@ -889,6 +882,7 @@ describe("structured source work editing", () => {
       }];
       bootstrap.store.todos = [{
         id: "todo-source", version: 6, title: "Bound Todo", notes: "", draft: "Bound Todo",
+        groupName: "Delivery", subgroupName: "Review",
         promptRevisions: [], status: "open", priority: "medium", tags: [], taskId: "task-source",
         createdAt: now, updatedAt: now,
       }];
@@ -928,6 +922,22 @@ describe("structured source work editing", () => {
         mutation: {
           kind: "task", expectedVersion: 4, relatedVersions: { "todo-source": 6 },
           item: { id: "task-source", title: "Changed in Orca", draft: "Human draft" },
+        },
+      });
+
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
+      const subgroup = document.querySelector<HTMLInputElement>('[data-scope="local-todo"][data-field="subgroupName"]');
+      expect(subgroup?.value).toBe("Review");
+      if (subgroup) {
+        subgroup.value = "Approval";
+        subgroup.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(requests[1]).toMatchObject({
+        type: "mutate-source",
+        mutation: {
+          kind: "todo", expectedVersion: 6, relatedVersions: { "task-source": 4 },
+          item: { id: "todo-source", groupName: "Delivery", subgroupName: "Approval" },
         },
       });
     } finally {

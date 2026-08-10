@@ -74,7 +74,7 @@ Orca plugin API v1의 panel contribution은 우측 activity bar의 sandboxed ifr
 
 `⛶`는 브리지에 `open-wide`를 보내 현재 worktree의 Orca 중앙 browser tab을 엽니다. 같은 화면이 이미 열려 있으면 그 탭을 다시 활성화합니다. 브리지는 임의 포트의 `127.0.0.1`에 추측하기 어려운 일회성 경로를 만들고, 최신 panel bundle과 같은 메시지 API를 제공합니다. CORS를 허용하지 않고 응답을 캐시하지 않으며 브리지가 종료되면 넓은 화면도 함께 종료됩니다. 넓은 화면의 Graph FAB는 목록과 편집 캔버스를 전환합니다. 이는 중앙 plugin contribution이 생길 때까지의 호환 계층입니다.
 
-상단의 고정 메뉴는 `그래프 목록`, `그래프 보기`, `Domain 관리`, `Milestone 관리`, `Task 관리`, `Todo 관리`를 명시적으로 전환한다. 목록 화면은 lifecycle status와 최신 run stage를 분리합니다. status는 badge, 실행 단계는 color dot와 별도 badge로 표시하며 이름·설명·ID 검색, 두 종류의 필터, 수정일·이름·상태 정렬을 클라이언트에서 수행합니다. Task/Todo 화면은 Draft·Meta·scope까지 통합 검색하고 상태·Domain·Milestone 필터, Domain/Milestone/상태/우선순위 그룹화, 우선순위·마감일·수정일 정렬을 제공한다. 기본 그룹은 Domain→Milestone이며 scope 관계가 없으면 `독립 항목`으로 묶는다. 활성 그룹화 모드의 각 그룹은 독립적으로 접고 펼칠 수 있으며, 현재 필터에 보이는 그룹 전체를 한 번에 접거나 펼칠 수도 있다. 그룹 항목 수와 접힘 상태는 유지한다. Todo의 기본 projection은 `open|in_progress`인 활성 항목이며, `done|cancelled` 이력은 삭제하지 않고 모든 상태 또는 개별 상태 필터로 노출한다. 헤더는 현재 표시 수·활성 수·전체 수를 분리해 원천 집계 의미를 보존한다.
+상단의 고정 메뉴는 `그래프 목록`, `그래프 보기`, `Domain 관리`, `Milestone 관리`, `Task 관리`, `Todo 관리`를 명시적으로 전환한다. 목록 화면은 lifecycle status와 최신 run stage를 분리합니다. status는 badge, 실행 단계는 color dot와 별도 badge로 표시하며 이름·설명·ID 검색, 두 종류의 필터, 수정일·이름·상태 정렬을 클라이언트에서 수행합니다. Task/Todo 화면은 Draft·Meta·scope까지 통합 검색하고 상태·Domain·Milestone 필터, Domain/Milestone/상태/우선순위 그룹화, 우선순위·마감일·수정일 정렬을 제공한다. Task의 기본 그룹은 Domain→Milestone이고, Todo의 기본 그룹은 실행 scope와 독립적인 free-form `groupName`→`subgroupName` 계층이다. 활성 그룹화 모드의 각 그룹은 독립적으로 접고 펼칠 수 있으며, 현재 필터에 보이는 그룹 전체를 한 번에 접거나 펼칠 수도 있다. 그룹 항목 수와 접힘 상태는 유지한다. Todo의 기본 projection은 `open|in_progress`인 활성 항목이며, `done|cancelled` 이력은 삭제하지 않고 모든 상태 또는 개별 상태 필터로 노출한다. 헤더는 현재 표시 수·활성 수·전체 수를 분리해 원천 집계 의미를 보존한다.
 
 ## Meta Prompt 생성 경계
 

@@ -157,6 +157,8 @@ export interface LocalTodo {
   version?: number;
   title: string;
   notes: string;
+  groupName?: string;
+  subgroupName?: string;
   domainId?: string;
   milestoneId?: string;
   draft: string;
@@ -697,6 +699,8 @@ export function normalizeGraphStore(
       ...(todo.version !== undefined ? { version: todo.version } : {}),
       title: todo.title || todo.id,
       notes: todo.notes ?? "",
+      ...(todo.groupName?.trim() ? { groupName: todo.groupName.trim() } : {}),
+      ...(todo.subgroupName?.trim() ? { subgroupName: todo.subgroupName.trim() } : {}),
       ...(domainId ? { domainId } : {}),
       ...(milestone ? { milestoneId: milestone.id } : {}),
       draft: pair.draft,
