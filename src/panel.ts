@@ -179,7 +179,7 @@ const view: ViewState = {
   todoStatusFilter: "active",
   workDomainFilter: "all",
   workMilestoneFilter: "all",
-  workGroup: "domain",
+  workGroup: "milestone",
   collapsedWorkGroups: new Set(),
   workSort: "updated-desc",
   scopeQuery: "",
@@ -2197,7 +2197,7 @@ function renderLocalWorkManager(kind: "task" | "todo"): string {
         ${statusSelect}
         <select data-action="work-domain-filter" aria-label="Domain 필터">${option("all", "모든 Domain", view.workDomainFilter)}${option("standalone", "독립 항목", view.workDomainFilter)}${store.domains.map((domain) => option(domain.id, domain.name, view.workDomainFilter)).join("")}</select>
         <select data-action="work-milestone-filter" aria-label="Milestone 필터">${option("all", "모든 Milestone", view.workMilestoneFilter)}${option("none", "Milestone 없음", view.workMilestoneFilter)}${milestoneOptions.map((milestone) => option(milestone.id, milestone.name, view.workMilestoneFilter)).join("")}</select>
-        <select data-action="work-group" aria-label="목록 그룹화">${option("none", "그룹화 없음", view.workGroup)}${option("domain", "Domain별 그룹", view.workGroup)}${option("milestone", "Milestone별 그룹", view.workGroup)}${option("status", "상태별 그룹", view.workGroup)}${option("priority", "우선순위별 그룹", view.workGroup)}</select>
+        <select data-action="work-group" aria-label="목록 그룹화">${option("none", "그룹화 없음", view.workGroup)}${option("domain", "Domain별 그룹", view.workGroup)}${option("milestone", "Domain · Milestone별 그룹", view.workGroup)}${option("status", "상태별 그룹", view.workGroup)}${option("priority", "우선순위별 그룹", view.workGroup)}</select>
         <select data-action="work-sort" aria-label="업무 정렬">${option("updated-desc", "최근 수정순", view.workSort)}${option("due-asc", "마감 임박순", view.workSort)}${option("priority", "우선순위", view.workSort)}${option("title", "이름순", view.workSort)}</select>
       </div>
       ${view.workGroup !== "none" && items.length ? `<span class="work-group-bulk-actions" aria-label="그룹 일괄 제어"><button data-action="collapse-all-work-groups" ${allGroupsCollapsed ? "disabled" : ""}>모두 접기</button><button data-action="expand-all-work-groups" ${allGroupsExpanded ? "disabled" : ""}>모두 펼치기</button></span>` : ""}

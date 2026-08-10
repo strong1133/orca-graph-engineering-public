@@ -156,6 +156,14 @@ describe.each([
   it("shows active Todos by default while preserving completed and cancelled history", async () => {
     const dom = await mountPanel(wide, (bootstrap) => {
       const now = "2026-08-09T00:00:00.000Z";
+      bootstrap.store.domains = [{
+        id: "domain-product", name: "제품", summary: "", objectives: "", commonNotes: "", constraintNotes: "",
+        status: "active", owners: [], version: 1, createdAt: now, updatedAt: now,
+      }];
+      bootstrap.store.milestones = [{
+        id: "milestone-v1", domainId: "domain-product", name: "v1", summary: "", objectives: "", commonNotes: "", constraintNotes: "",
+        status: "active", priority: "medium", successCriteria: [], owners: [], version: 1, createdAt: now, updatedAt: now,
+      }];
       const statuses = [
         ...Array<"open">(21).fill("open"),
         ...Array<"in_progress">(2).fill("in_progress"),
@@ -172,6 +180,7 @@ describe.each([
         status,
         priority: "medium",
         tags: [],
+        ...(index === 0 ? { domainId: "domain-product", milestoneId: "milestone-v1" } : {}),
         createdAt: now,
         updatedAt: now,
       }));
@@ -182,6 +191,8 @@ describe.each([
 
       const filter = document.querySelector<HTMLSelectElement>('[data-action="todo-status-filter"]');
       expect(filter?.value).toBe("active");
+      expect(document.querySelector<HTMLSelectElement>('[data-action="work-group"]')?.value).toBe("milestone");
+      expect([...document.querySelectorAll(".work-group > header strong")].some((item) => item.textContent === "제품 / v1")).toBe(true);
       expect(document.querySelector('[aria-label="Todo 관리"]')?.textContent).toContain("표시 23 · 활성 23 · 전체 30");
       expect(document.querySelectorAll(".work-list .work-card")).toHaveLength(23);
 
