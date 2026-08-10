@@ -37,6 +37,7 @@ const storePath = path.join(runtimeDir, "store.json");
 const targetsPath = path.join(runtimeDir, "targets.json");
 const dataSourcePath = path.join(runtimeDir, "data-source.json");
 const sourceCachePath = path.join(runtimeDir, "source-cache.json");
+const executionsPath = path.join(runtimeDir, "executions.json");
 const defaultStorePath = path.join(root, "fixtures/default-store.json");
 const defaultTargetsPath = path.join(root, "fixtures/default-targets.json");
 const defaultDataSourcePath = path.join(root, "fixtures/default-data-source.json");
@@ -47,6 +48,8 @@ const orcaCommand = process.env.ORCA_CLI_COMMAND ||
 
 const assemblies = new Map();
 let queue = Promise.resolve();
+let executionRegistryQueue = Promise.resolve();
+let rebuildQueue = Promise.resolve();
 let inputBuffer = "";
 let wideServer = null;
 let wideUrl = null;
@@ -68,6 +71,49 @@ async function readJson(primary, fallback) {
   } catch {
     return JSON.parse(await readFile(fallback, "utf8"));
   }
+}
+
+async function readExecutions() {
+  try {
+    const value = JSON.parse(await readFile(executionsPath, "utf8"));
+    return Array.isArray(value) ? value : [];
+  } catch {
+    return [];
+  }
+}
+
+function mutateExecutionRegistry(mutator, { rebuildPanel = false } = {}) {
+  const task = executionRegistryQueue.then(async () => {
+    const records = await readExecutions();
+    const value = await mutator(records);
+    records.sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")));
+    await atomicJson(executionsPath, records.slice(0, 200));
+    if (rebuildPanel) await rebuild();
+    return value;
+  });
+  executionRegistryQueue = task.catch(() => undefined);
+  return task;
+}
+
+async function settleInterruptedExecutions() {
+  await mutateExecutionRegistry((records) => {
+    const endedAt = new Date().toISOString();
+    for (const record of records) {
+      if (record.status !== "queued" && record.status !== "running") continue;
+      record.status = "failed";
+      record.updatedAt = endedAt;
+      record.endedAt = endedAt;
+      record.error = "Orca 브리지가 재시작되어 실행 추적이 중단되었습니다.";
+      for (const target of record.targets ?? []) {
+        if (target.status !== "queued" && target.status !== "running") continue;
+        target.status = "failed";
+        target.endedAt = endedAt;
+        target.error = record.error;
+      }
+      record.progress ||= { completed: 0, failed: 0, total: record.targets?.length ?? 1 };
+      record.progress.failed = Math.max(1, (record.targets ?? []).filter((item) => item.status === "failed").length);
+    }
+  });
 }
 
 async function readTargets() {
@@ -514,11 +560,12 @@ async function cacheWithBridgeRuntime(cache, localStore) {
   return { ...cache, store: mergeBridgeRuntime(cache.store, localStore) };
 }
 
-async function rebuild() {
+async function performRebuild() {
   if (process.env.ORCA_GRAPH_SKIP_REBUILD === "1") return;
-  const [localStore, targets, dataSourceConfig, sourceCache] = await Promise.all([
+  const [localStore, targets, executions, dataSourceConfig, sourceCache] = await Promise.all([
     readJson(storePath, defaultStorePath),
     readTargets(),
+    readExecutions(),
     readJson(dataSourcePath, defaultDataSourcePath),
     readJson(sourceCachePath, defaultSourceCachePath),
   ]);
@@ -542,10 +589,17 @@ async function rebuild() {
   await updatePanelBootstrap(path.join(root, "dist/panel.html"), {
     store,
     targets,
+    executions,
     dataSource,
     builtAt: new Date().toISOString(),
     ...(wideApiUrl ? { bridgeApiUrl: wideApiUrl } : {}),
   });
+}
+
+function rebuild() {
+  const task = rebuildQueue.then(() => performRebuild());
+  rebuildQueue = task.catch(() => undefined);
+  return task;
 }
 
 async function saveStore(store, message) {
@@ -724,7 +778,15 @@ async function ensureWideServer() {
       }
       if (request.method === "POST" && request.url === apiRoute) {
         const message = await readRequestJson(request);
-        const value = await enqueueMessage(message);
+        const value = message?.type === "execution-status"
+          ? await runtimeExecutionStatus()
+          : message?.type === "start-task-execution"
+            ? await startWorkItemExecution(message, "task")
+            : message?.type === "start-todo-execution"
+              ? await startWorkItemExecution(message, "todo")
+              : message?.type === "start-graph-execution"
+                ? await startGraphExecution(message)
+                : await enqueueMessage(message);
         sendJson(response, 200, { ok: true, value });
         return;
       }
@@ -1610,8 +1672,11 @@ async function evaluateCondition(graph, node, targets, runId, nodeOutputs, workI
   return { ...decision, sessionId: dispatched.sessionId, resultSummary: dispatched.resultSummary };
 }
 
-async function persistRunProgress(store, message) {
+async function persistRunProgress(store, message, executionId = undefined, graphId = undefined) {
   await saveStore(store, message);
+  if (executionId && graphId) {
+    await syncGraphRuntimeExecution(executionId, store.graphs.find((item) => item.id === graphId));
+  }
 }
 
 function nonLoopReachable(graph, start) {
@@ -1886,7 +1951,8 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
   const unresolved = new Set();
   const nodeOutputs = new Map();
   const planLines = [];
-  await persistRunProgress(store, `${graph.name} · ${dryRun ? "실행 계획" : "Run"} #${run.runNo} 시작`);
+  const runtimeExecutionId = context.parentRunId ? undefined : context.executionId;
+  await persistRunProgress(store, `${graph.name} · ${dryRun ? "실행 계획" : "Run"} #${run.runNo} 시작`, runtimeExecutionId, graph.id);
 
   try {
     for (const nodeId of order) {
@@ -1944,7 +2010,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
         let decision = null;
         if (!branch) {
           node.status = "running";
-          await persistRunProgress(store, `${graph.name} · ${node.label || node.id} 자동 판정 중 · Run #${run.runNo}`);
+          await persistRunProgress(store, `${graph.name} · ${node.label || node.id} 자동 판정 중 · Run #${run.runNo}`, runtimeExecutionId, graph.id);
           run.stats.attempts += 1;
           try {
             decision = await evaluateCondition(executionGraph, executionNode, targets, run.id, nodeOutputs, context.workInput);
@@ -1978,7 +2044,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
         planLines.push(`${node.label || node.id}: child graph ${child.name} (${node.graphCallRoutingMode || "child"})`);
         if (!dryRun) {
           node.status = "running";
-          await persistRunProgress(store, `${graph.name} → ${child.name} 호출 중`);
+          await persistRunProgress(store, `${graph.name} → ${child.name} 호출 중`, runtimeExecutionId, graph.id);
         }
         try {
           const childRun = await executeGraph({
@@ -2033,7 +2099,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
         continue;
       }
       node.status = "running";
-      await persistRunProgress(store, `${graph.name} · ${node.label || node.id} 실행 중 · Run #${run.runNo}`);
+      await persistRunProgress(store, `${graph.name} · ${node.label || node.id} 실행 중 · Run #${run.runNo}`, runtimeExecutionId, graph.id);
       const nodeStartedAt = Date.now();
       const maxAttempts = Math.max(1, Number(node.engineering?.maxAttempts || 1));
       let sessionId = null;
@@ -2053,7 +2119,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
         } catch (error) {
           lastError = error;
           if (attempt < maxAttempts) {
-            await persistRunProgress(store, `${graph.name} · ${node.label || node.id} 재시도 대기 · ${attempt}/${maxAttempts}`);
+            await persistRunProgress(store, `${graph.name} · ${node.label || node.id} 재시도 대기 · ${attempt}/${maxAttempts}`, runtimeExecutionId, graph.id);
             await new Promise((resolve) => setTimeout(resolve, retryDelay(attempt)));
           }
         }
@@ -2071,7 +2137,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
       run.stats.completed += 1;
       if (resultSummary) nodeOutputs.set(node.id, resultSummary);
       run.nodeResults.push({ nodeId, status: "done", sessionId, attempt: Math.min(attempt, maxAttempts), durationMs, ...(resultSummary ? { message: resultSummary.slice(0, 2_000) } : {}) });
-      await persistRunProgress(store, `${graph.name} · ${node.label || node.id} 완료 · Run #${run.runNo}`);
+      await persistRunProgress(store, `${graph.name} · ${node.label || node.id} 완료 · Run #${run.runNo}`, runtimeExecutionId, graph.id);
     }
     run.status = dryRun ? "planned" : "done";
     run.endedAt = new Date().toISOString();
@@ -2079,7 +2145,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
     run.stats.durationMs = Date.now() - now.getTime();
     run.summary = planLines.join("\n");
     if (!dryRun) graph.status = "done";
-    await persistRunProgress(store, `${graph.name} · ${dryRun ? "실행 계획" : "Run"} #${run.runNo} 완료`);
+    await persistRunProgress(store, `${graph.name} · ${dryRun ? "실행 계획" : "Run"} #${run.runNo} 완료`, runtimeExecutionId, graph.id);
     return run;
   } catch (error) {
     run.status = "failed";
@@ -2088,7 +2154,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
     run.stats.durationMs = Date.now() - now.getTime();
     run.summary = error instanceof Error ? error.message : String(error);
     graph.status = "active";
-    await persistRunProgress(store, `${graph.name} · Run #${run.runNo} 실패 · ${run.summary}`);
+    await persistRunProgress(store, `${graph.name} · Run #${run.runNo} 실패 · ${run.summary}`, runtimeExecutionId, graph.id);
     const failure = new Error(`${graph.name}: ${run.summary}`, { cause: error });
     failure.graphRunId = run.id;
     failure.graphId = graph.id;
@@ -2119,7 +2185,7 @@ async function structuredExecutionContract() {
    우리는 그 노드를 조용히 넘긴다. 우리가 도중에 죽으면 임대가 만료되어 원천이
    attempt를 수거하므로, 브리지가 남기는 로컬 run 이력은 없다 — 그것이 갈라짐의
    시작점이기 때문이다. */
-async function executeGraphRemotely({ config, store, targets, graph }) {
+async function executeGraphRemotely({ config, store, targets, graph, executionId = undefined }) {
   const capability = await structuredExecutionContract();
   let frontier = await fetchStructuredExecution(config, graph.id);
   const processRun = graph.processEnabled
@@ -2194,7 +2260,7 @@ async function executeGraphRemotely({ config, store, targets, graph }) {
         });
         throw new Error(`${runnable.label || runnable.id}: node is missing from the panel snapshot; refresh the data source`);
       }
-      await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} 실행 중 · 원격 run`);
+      await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} 실행 중 · 원격 run`, executionId, graph.id);
       try {
         const dispatched = await dispatchTask(graph, design, targets, frontier.run?.id ?? graph.id, {
           ...(workInput !== undefined ? { workInput } : {}),
@@ -2217,12 +2283,12 @@ async function executeGraphRemotely({ config, store, targets, graph }) {
       expectedVersion: claim.graph.version, ...outcome,
     });
     if (outcome.result === "done" && !closable) completed += 1;
-    await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} ${closable ? "건너뜀" : "완료"} · 원격 run`);
+    await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} ${closable ? "건너뜀" : "완료"} · 원격 run`, executionId, graph.id);
     frontier = Array.isArray(done.nodes)
       ? { ...frontier, graph: done.graph, run: done.run, nodes: done.nodes }
       : await fetchStructuredExecution(config, graph.id);
   }
-  await persistRunProgress(store, `${graph.name} · 원격 run · 완료 ${completed} · 건너뜀 ${skipped}`);
+  await persistRunProgress(store, `${graph.name} · 원격 run · 완료 ${completed} · 건너뜀 ${skipped}`, executionId, graph.id);
   // 캔버스가 실행 전 스냅샷을 계속 들고 있으면 방금 돈 run이 화면에 없는 것과 같다.
   // 원천을 다시 읽어 노드 상태와 run 이력을 정본에서 가져온다.
   const refreshed = await refreshConfiguredDataSource(config, graph.id);
@@ -2232,7 +2298,7 @@ async function executeGraphRemotely({ config, store, targets, graph }) {
   };
 }
 
-async function runGraph(graphId, dryRun, inputPrompt, startNewRun = true) {
+async function runGraph(graphId, dryRun, inputPrompt, startNewRun = true, executionId = undefined) {
   const dataSourceConfig = await readDataSourceConfig();
   if (dataSourceConfig.mode === "structured") {
     let store = await readWorkingStore(dataSourceConfig);
@@ -2272,7 +2338,7 @@ async function runGraph(graphId, dryRun, inputPrompt, startNewRun = true) {
     await attestExecutionPlan(plan);
     // dry-run은 Orca도 원천도 건드리지 않는다 — 순수 계획이 통과했다는 사실이 결과다.
     if (dryRun) return { mode: "structured", graphId, planned: true };
-    return executeGraphRemotely({ config: dataSourceConfig, store, targets, graph });
+    return executeGraphRemotely({ config: dataSourceConfig, store, targets, graph, executionId });
   }
   const store = await readWorkingStore(dataSourceConfig);
   const targets = await readTargets();
@@ -2285,8 +2351,218 @@ async function runGraph(graphId, dryRun, inputPrompt, startNewRun = true) {
   await attestExecutionPlan(plan);
   return executeGraph({
     store, targets, graph, dryRun,
-    context: { stack: [], depthLimit: plan.depthLimit, ...(graph.processEnabled ? { workInput: inputPrompt } : {}) },
+    context: { stack: [], depthLimit: plan.depthLimit, ...(graph.processEnabled ? { workInput: inputPrompt } : {}), ...(executionId ? { executionId } : {}) },
   });
+}
+
+function runtimeExecutionTarget(routingValue, targets, { id, label, locator } = {}) {
+  const routing = standaloneRouting(routingValue);
+  const environmentId = targetEnvironmentId({ environmentId: routing.environmentId });
+  const session = routing.sessionId
+    ? targets.sessions.find((item) => item.id === routing.sessionId && targetEnvironmentId(item) === environmentId)
+    : null;
+  const projectId = routing.projectId || session?.projectId;
+  const project = projectId
+    ? targets.projects.find((item) => item.id === projectId && targetEnvironmentId(item) === environmentId)
+    : null;
+  return {
+    id: id || `target-${crypto.randomUUID().slice(0, 8)}`,
+    label: label || project?.name || session?.title || "통합 실행",
+    status: "queued",
+    environmentId,
+    ...(projectId ? { projectId } : {}),
+    ...(project?.name ? { projectName: project.name } : {}),
+    ...(locator ? { locator } : {}),
+    ...(routing.branch || session?.branch ? { branch: normalizeWorkBranch(routing.branch || session.branch) } : {}),
+    ...(routing.sessionId ? { sessionId: routing.sessionId } : {}),
+    ...(routing.model ? { model: routing.model } : {}),
+  };
+}
+
+async function registerRuntimeExecution(record) {
+  return mutateExecutionRegistry((records) => {
+    const active = records.find((item) => item.itemKind === record.itemKind && item.itemId === record.itemId
+      && (item.status === "queued" || item.status === "running"));
+    if (active) return active;
+    records.unshift(record);
+    return record;
+  }, { rebuildPanel: true });
+}
+
+async function updateRuntimeExecution(executionId, mutate, { rebuildPanel = false } = {}) {
+  return mutateExecutionRegistry((records) => {
+    const record = records.find((item) => item.id === executionId);
+    if (!record) return null;
+    mutate(record);
+    record.updatedAt = new Date().toISOString();
+    return record;
+  }, { rebuildPanel });
+}
+
+async function setRuntimeExecutionTarget(executionId, index, status, values = {}) {
+  return updateRuntimeExecution(executionId, (record) => {
+    const target = record.targets[index];
+    if (!target) return;
+    target.status = status;
+    Object.assign(target, values);
+    if (status === "running" && !target.startedAt) target.startedAt = new Date().toISOString();
+    if (["completed", "failed", "cancelled"].includes(status) && !target.endedAt) target.endedAt = new Date().toISOString();
+    record.progress.completed = record.targets.filter((item) => item.status === "completed").length;
+    record.progress.failed = record.targets.filter((item) => item.status === "failed").length;
+  });
+}
+
+async function syncGraphRuntimeExecution(executionId, graph) {
+  if (!executionId || !graph) return;
+  await updateRuntimeExecution(executionId, (record) => {
+    const latest = [...(graph.runs ?? [])].reverse().find((run) => run.status === "running") ?? graph.runs?.at(-1);
+    const nodeResults = latest?.nodeResults ?? [];
+    const completed = nodeResults.filter((item) => item.status === "done" || item.status === "skipped").length;
+    const failed = nodeResults.filter((item) => item.status === "failed").length;
+    record.progress = { completed, failed, total: Math.max(record.progress.total, graph.nodes?.length ?? 0) };
+    const sessionIds = nodeResults.map((item) => item.sessionId).filter(Boolean);
+    if (sessionIds[0] && record.targets[0] && !record.targets[0].sessionId) record.targets[0].sessionId = sessionIds[0];
+  });
+}
+
+function scheduleRuntimeExecution(record, job) {
+  const task = queue.then(async () => {
+    const startedAt = new Date().toISOString();
+    await updateRuntimeExecution(record.id, (current) => {
+      current.status = "running";
+      current.startedAt ||= startedAt;
+      for (const target of current.targets) {
+        if (target.status === "queued") target.status = "running";
+        target.startedAt ||= startedAt;
+      }
+    });
+    try {
+      const result = await job();
+      const endedAt = new Date().toISOString();
+      await updateRuntimeExecution(record.id, (current) => {
+        current.status = "completed";
+        current.endedAt = endedAt;
+        current.error = undefined;
+        for (const target of current.targets) {
+          if (target.status === "queued" || target.status === "running") target.status = "completed";
+          target.endedAt ||= endedAt;
+        }
+        current.progress.completed = current.progress.total;
+        current.progress.failed = 0;
+      }, { rebuildPanel: true });
+      console.log(`[bridge] execution completed ${record.id}`);
+      return result;
+    } catch (error) {
+      const endedAt = new Date().toISOString();
+      const message = error instanceof Error ? error.message : String(error);
+      await updateRuntimeExecution(record.id, (current) => {
+        current.status = "failed";
+        current.endedAt = endedAt;
+        current.error = message.slice(0, 2_000);
+        for (const target of current.targets) {
+          if (target.status === "queued" || target.status === "running") {
+            target.status = "failed";
+            target.error = message.slice(0, 2_000);
+            target.endedAt = endedAt;
+          }
+        }
+        current.progress.failed = Math.max(1, current.targets.filter((item) => item.status === "failed").length);
+      }, { rebuildPanel: true });
+      console.error(`[bridge] ${record.itemKind} ${record.itemId} execution failed: ${message}`);
+      return undefined;
+    }
+  });
+  queue = task.catch(() => undefined);
+}
+
+async function startWorkItemExecution(message, itemKind) {
+  const itemId = String(itemKind === "task" ? message.taskId : message.todoId || "");
+  const config = await readDataSourceConfig();
+  const [store, targets] = await Promise.all([readWorkingStore(config), readTargets()]);
+  const item = (itemKind === "task" ? store.tasks : store.todos)?.find((candidate) => candidate.id === itemId);
+  if (!item) throw new Error(`${itemKind} not found: ${itemId}`);
+  const executionMode = itemKind === "task" && message.executionMode === "per_project" ? "per_project" : "single_session";
+  const requestedTargets = executionMode === "per_project" && Array.isArray(message.projectSessions)
+    ? message.projectSessions.map((entry, index) => runtimeExecutionTarget(entry.routing, targets, {
+        id: `project-${index + 1}`,
+        locator: String(entry.locator || ""),
+        label: item.projects?.find((project) => project.locator === entry.locator)?.label || path.basename(String(entry.locator || "")) || `프로젝트 ${index + 1}`,
+      }))
+    : [runtimeExecutionTarget(message.routing, targets)];
+  const now = new Date().toISOString();
+  const executionId = `exec-${crypto.randomUUID().slice(0, 12)}`;
+  const record = await registerRuntimeExecution({
+    id: executionId,
+    itemKind,
+    itemId,
+    title: item.title,
+    status: "queued",
+    executionMode,
+    createdAt: now,
+    updatedAt: now,
+    progress: { completed: 0, failed: 0, total: Math.max(1, requestedTargets.length) },
+    targets: requestedTargets,
+  });
+  if (record.id !== executionId || record.status !== "queued") return record;
+  scheduleRuntimeExecution(record, () => itemKind === "task"
+    ? runStandaloneTask(itemId, message.routing, false, executionMode, message.projectSessions, async (event) => {
+        await setRuntimeExecutionTarget(record.id, event.index, event.status, {
+          ...(event.sessionId ? { sessionId: event.sessionId } : {}),
+          ...(event.error ? { error: event.error } : {}),
+        });
+      })
+    : runTodoThroughQuickTask(itemId, message.routing, false, message.idempotencyKey, async (event) => {
+        await setRuntimeExecutionTarget(record.id, event.index, event.status, {
+          ...(event.sessionId ? { sessionId: event.sessionId } : {}),
+          ...(event.error ? { error: event.error } : {}),
+        });
+      }));
+  return record;
+}
+
+async function startGraphExecution(message) {
+  const graphId = String(message.graphId || "");
+  const config = await readDataSourceConfig();
+  const [store, targets] = await Promise.all([readWorkingStore(config), readTargets()]);
+  const graph = store.graphs.find((item) => item.id === graphId);
+  if (!graph) throw new Error(`graph not found: ${graphId}`);
+  const executionMode = message.executionMode === "per_project" ? "per_project" : "single_session";
+  const requestedTargets = executionMode === "per_project" && Array.isArray(message.projectSessions) && message.projectSessions.length
+    ? message.projectSessions.map((entry, index) => runtimeExecutionTarget(entry.routing, targets, {
+        id: `project-${index + 1}`,
+        locator: String(entry.locator || ""),
+        label: String(entry.label || path.basename(String(entry.locator || "")) || `프로젝트 ${index + 1}`),
+      }))
+    : [runtimeExecutionTarget(message.routing || graph.defaults, targets)];
+  const now = new Date().toISOString();
+  const executionId = `exec-${crypto.randomUUID().slice(0, 12)}`;
+  const record = await registerRuntimeExecution({
+    id: executionId,
+    itemKind: "graph",
+    itemId: graphId,
+    title: graph.name,
+    status: "queued",
+    executionMode,
+    createdAt: now,
+    updatedAt: now,
+    progress: { completed: 0, failed: 0, total: graph.nodes.length },
+    targets: requestedTargets,
+  });
+  if (record.id !== executionId || record.status !== "queued") return record;
+  scheduleRuntimeExecution(record, () => runGraph(
+    graphId,
+    false,
+    typeof message.inputPrompt === "string" ? message.inputPrompt : undefined,
+    message.startNewRun !== false,
+    record.id,
+  ));
+  return record;
+}
+
+async function runtimeExecutionStatus() {
+  const config = await readDataSourceConfig();
+  const [executions, store] = await Promise.all([readExecutions(), readWorkingStore(config)]);
+  return { executions, store };
 }
 
 function standaloneProjectSessions(value) {
@@ -2299,12 +2575,11 @@ function standaloneProjectSessions(value) {
     if (!locator || seen.has(locator)) throw new Error("standalone project session locators must be non-empty and unique");
     seen.add(locator);
     const routing = standaloneRouting(entry.routing);
-    if (routing.sessionId) throw new Error("per-project execution creates a new Orca session for every project");
     return { locator, routing };
   });
 }
 
-async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun, executionMode = "single_session", requestedProjectSessions = []) {
+async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun, executionMode = "single_session", requestedProjectSessions = [], onProgress = null) {
   if (!["task", "todo"].includes(itemKind)) throw new Error(`unsupported standalone work item kind: ${itemKind}`);
   if (!["single_session", "per_project"].includes(executionMode)) throw new Error(`unsupported standalone execution mode: ${executionMode}`);
   if (itemKind !== "task" && executionMode !== "single_session") throw new Error("per-project execution is only available for Tasks");
@@ -2383,30 +2658,37 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
   };
 
   const dispatched = await Promise.all(executions.map(async (execution, index) => {
-    const result = await dispatchTask(
-      execution.graph,
-      execution.node,
-      targets,
-      `task-${crypto.randomUUID().slice(0, 8)}`,
-      {
-        prompt: buildStandaloneWorkItemPrompt(
-          itemKind,
-          item,
-          prompt,
-          execution.route.routing,
-          scopeContext(store, item),
-          execution.project ? [execution.project] : undefined,
-        ),
-        title: `${itemKind === "task" ? "Task" : "Todo"} · ${item.title}${execution.project ? ` · ${execution.project.label || path.basename(execution.project.locator)}` : ""}`,
-      },
-    );
-    return {
-      locator: execution.project?.locator ?? null,
-      sessionId: result.sessionId,
-      resultSummary: result.resultSummary,
-      target: targetFor(execution.route),
-      position: index,
-    };
+    await onProgress?.({ index, status: "running" });
+    try {
+      const result = await dispatchTask(
+        execution.graph,
+        execution.node,
+        targets,
+        `task-${crypto.randomUUID().slice(0, 8)}`,
+        {
+          prompt: buildStandaloneWorkItemPrompt(
+            itemKind,
+            item,
+            prompt,
+            execution.route.routing,
+            scopeContext(store, item),
+            execution.project ? [execution.project] : undefined,
+          ),
+          title: `${itemKind === "task" ? "Task" : "Todo"} · ${item.title}${execution.project ? ` · ${execution.project.label || path.basename(execution.project.locator)}` : ""}`,
+        },
+      );
+      await onProgress?.({ index, status: "completed", sessionId: result.sessionId });
+      return {
+        locator: execution.project?.locator ?? null,
+        sessionId: result.sessionId,
+        resultSummary: result.resultSummary,
+        target: targetFor(execution.route),
+        position: index,
+      };
+    } catch (error) {
+      await onProgress?.({ index, status: "failed", error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
   }));
   return {
     itemKind, itemId, completed: true, executionMode,
@@ -2416,14 +2698,14 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
   };
 }
 
-async function runStandaloneTask(taskId, requestedRouting, dryRun, executionMode, projectSessions) {
-  return runStandaloneWorkItem("task", taskId, requestedRouting, dryRun, executionMode, projectSessions);
+async function runStandaloneTask(taskId, requestedRouting, dryRun, executionMode, projectSessions, onProgress = null) {
+  return runStandaloneWorkItem("task", taskId, requestedRouting, dryRun, executionMode, projectSessions, onProgress);
 }
 
-async function runTodoThroughQuickTask(todoId, requestedRouting, dryRun, idempotencyKey) {
+async function runTodoThroughQuickTask(todoId, requestedRouting, dryRun, idempotencyKey, onProgress = null) {
   const config = await readDataSourceConfig();
   if (config.mode !== "structured") {
-    return runStandaloneWorkItem("todo", todoId, requestedRouting, dryRun);
+    return runStandaloneWorkItem("todo", todoId, requestedRouting, dryRun, "single_session", [], onProgress);
   }
   if (dryRun) {
     throw new Error("an unbound structured Todo cannot be planned without creating its Task; open the quick-run dialog instead");
@@ -2436,12 +2718,32 @@ async function runTodoThroughQuickTask(todoId, requestedRouting, dryRun, idempot
   if (project?.path) {
     await linkTaskProjects(prepared.taskId, [project.path], routing.branch);
   }
-  const result = await runStandaloneTask(prepared.taskId, routing, false);
+  const result = await runStandaloneTask(prepared.taskId, routing, false, undefined, undefined, onProgress);
   return { ...result, todoId, taskId: prepared.taskId };
 }
 
 async function handleMessage(message) {
   switch (message?.type) {
+    case "execution-status":
+      return runtimeExecutionStatus();
+    case "start-task-execution":
+      {
+        const result = await startWorkItemExecution(message, "task");
+        console.log(`[bridge] execution queued ${result.id}`);
+        return result;
+      }
+    case "start-todo-execution":
+      {
+        const result = await startWorkItemExecution(message, "todo");
+        console.log(`[bridge] execution queued ${result.id}`);
+        return result;
+      }
+    case "start-graph-execution":
+      {
+        const result = await startGraphExecution(message);
+        console.log(`[bridge] execution queued ${result.id}`);
+        return result;
+      }
     case "save":
       {
         const result = await savePanelStore(message.store);
@@ -2611,6 +2913,7 @@ setInterval(() => {
 }, 30_000).unref();
 
 await mkdir(runtimeDir, { recursive: true });
+await settleInterruptedExecutions();
 if (process.env.ORCA_GRAPH_SKIP_REBUILD !== "1") {
   try {
     await ensureWideServer();

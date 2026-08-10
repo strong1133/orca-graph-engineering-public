@@ -294,6 +294,76 @@ describe("bridge graph calls", () => {
     expect(after.graphs.every((graph: { runs: unknown[] }) => graph.runs.length === 0)).toBe(true);
   });
 
+  it("starts a tracked Task asynchronously and persists commercial UI progress", async () => {
+    const root = process.cwd();
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const store = JSON.parse(await readFile(path.join(root, "fixtures/default-store.json"), "utf8"));
+    const now = "2026-08-10T00:00:00.000Z";
+    store.tasks = [{
+      id: "TASK-tracked", title: "추적 Task", prompt: "실행 상태를 추적한다", draft: "실행 상태를 추적한다",
+      promptRevisions: [], status: "ready", priority: "medium", tags: [],
+      projects: [{ id: "tracked-target", role: "target", locatorKind: "folder", locator: "/portable/fake-project", label: "Fake project", branch: "main", position: 0 }],
+      createdAt: now, updatedAt: now,
+    }];
+    await writeFile(path.join(runtimeDirectory, "store.json"), `${JSON.stringify(store)}\n`, "utf8");
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    await sendToBridge(
+      runtimeDirectory,
+      { type: "start-task-execution", taskId: "TASK-tracked", routing: { environmentId: "local", projectId: "fake-project", branch: "main", model: "gpt-5.6-sol" } },
+      "execution completed",
+      { ORCA_CLI_COMMAND: fake.command, ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog },
+    );
+
+    const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      itemKind: "task", itemId: "TASK-tracked", title: "추적 Task", status: "completed",
+      executionMode: "single_session", progress: { completed: 1, failed: 0, total: 1 },
+      targets: [{ status: "completed", environmentId: "local", projectId: "fake-project", branch: "main", model: "gpt-5.6-sol", sessionId: "fake-session" }],
+    });
+  });
+
+  it("starts a tracked Graph asynchronously and records node progress and its Orca session", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-tracked",
+      [taskNode("tracked-node", { projectId: "fake-project", model: "gpt-5.6-sol", reasoning: "high" })],
+      [],
+      { projectId: "fake-project", model: "gpt-5.6-sol", reasoning: "high" },
+    );
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: graph.id,
+        executionMode: "single_session",
+        routing: { environmentId: "local", projectId: "fake-project", branch: "main", model: "gpt-5.6-sol", reasoning: "high" },
+        startNewRun: true,
+      },
+      "execution completed",
+      { ORCA_CLI_COMMAND: fake.command, ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog },
+    );
+
+    const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      itemKind: "graph", itemId: "GRAPH-tracked", title: "GRAPH-tracked", status: "completed",
+      executionMode: "single_session", progress: { completed: 1, failed: 0, total: 1 },
+      targets: [{ status: "completed", environmentId: "local", projectId: "fake-project", branch: "main", model: "gpt-5.6-sol", sessionId: "fake-session" }],
+    });
+    const after = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
+    expect(after.graphs[0].runs.at(-1)).toMatchObject({
+      status: "done",
+      nodeResults: [{ nodeId: "tracked-node", status: "done", sessionId: "fake-session" }],
+    });
+  });
+
   it("attests all targets and executes one independent session per Task project with its own model", async () => {
     const root = process.cwd();
     const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));

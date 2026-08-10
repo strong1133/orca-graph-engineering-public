@@ -377,6 +377,43 @@ export interface OrcaTargets {
   error?: string;
 }
 
+export type ExecutionItemKind = "task" | "todo" | "graph";
+export type ExecutionStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type ExecutionMode = "single_session" | "per_project";
+
+export interface RuntimeExecutionTarget {
+  id: string;
+  label: string;
+  status: ExecutionStatus;
+  environmentId?: string;
+  projectId?: string;
+  projectName?: string;
+  locator?: string;
+  branch?: string;
+  sessionId?: string;
+  model?: string;
+  startedAt?: string;
+  endedAt?: string;
+  error?: string;
+}
+
+/** Machine-local execution activity. It is never committed to the portable graph source. */
+export interface RuntimeExecution {
+  id: string;
+  itemKind: ExecutionItemKind;
+  itemId: string;
+  title: string;
+  status: ExecutionStatus;
+  executionMode: ExecutionMode;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  endedAt?: string;
+  progress: { completed: number; failed: number; total: number };
+  targets: RuntimeExecutionTarget[];
+  error?: string;
+}
+
 export interface GraphStore {
   schemaVersion: 1;
   activeGraphId: string;
@@ -394,6 +431,7 @@ export interface GraphStore {
 export interface Bootstrap {
   store: GraphStore;
   targets: OrcaTargets;
+  executions?: RuntimeExecution[];
   dataSource: DataSourceState;
   pluginRoot: string;
   builtAt: string;
