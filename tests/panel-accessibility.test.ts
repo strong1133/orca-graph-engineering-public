@@ -177,13 +177,13 @@ describe.each([
 
       const detail = document.querySelector<HTMLElement>('[aria-label="Task 상세"]');
       const opener = detail?.querySelector<HTMLButtonElement>('[data-action="open-task-run"]');
-      expect(opener?.textContent).toContain("Task 실행");
+      expect(opener?.textContent).toContain("워크트리 빠른 실행");
       opener?.click();
 
       let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      expect(dialog?.textContent).toContain("Task 단건 실행");
+      expect(dialog?.textContent).toContain("Task 워크트리 빠른 실행");
       expect(dialog?.textContent).toContain("그래프 run이나 노드 claim을 만들지 않고");
-      expect(dialog?.textContent).toContain("현재 브리지 작업공간 자동 선택");
+      expect(dialog?.textContent).toContain("현재 Orca 워크트리 자동 선택");
       const environment = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="environmentId"]');
       expect(environment?.value).toBe("local");
       expect([...(environment?.options ?? [])].map((option) => option.textContent)).toEqual(["jsj1 · 이 Orca", "jsj2"]);
@@ -211,6 +211,49 @@ describe.each([
         .map((option) => option.textContent)).toEqual(["프로젝트 미지정", "remote-project"]);
       expect([...dialog?.querySelectorAll<HTMLOptionElement>('[data-scope="task-run-routing"][data-field="sessionId"] option') ?? []]
         .map((option) => option.textContent)).toEqual(["세션 미지정 · 새 세션", "Remote Codex · remote-project"]);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("opens Todo and Task quick-run buttons on an Orca worktree", async () => {
+    const dom = await mountPanel(wide, ({ store, targets }) => {
+      store.bridgeWorkspace = "current-project";
+      store.todos = [{
+        id: "todo-quick-run", title: "빠른 실행 Todo", notes: "", draft: "Todo 작업 실행",
+        promptRevisions: [], status: "open", priority: "medium", tags: [],
+        createdAt: "2026-08-10T00:00:00.000Z", updatedAt: "2026-08-10T00:00:00.000Z",
+      }];
+      targets.projects = [{
+        id: "repo:current-project", name: "current-project", environmentId: "local",
+        worktreeId: "worktree-current-project", branch: "refs/heads/feature/quick-run",
+      }];
+      targets.branches = [{
+        id: "branch:quick-run", branch: "refs/heads/feature/quick-run", environmentId: "local",
+        projectId: "repo:current-project", repoId: "repo-current-project", worktreeId: "worktree-current-project",
+      }];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      expect(document.querySelector<HTMLButtonElement>('[aria-label^="Task 워크트리 빠른 실행"]')).not.toBeNull();
+
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
+      const listQuickRun = document.querySelector<HTMLButtonElement>('[aria-label^="Todo 워크트리 빠른 실행"]');
+      expect(listQuickRun).not.toBeNull();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-todo"]')?.click();
+      const detailQuickRun = document.querySelector<HTMLButtonElement>('.work-inspector [data-action="open-todo-run"]');
+      expect(detailQuickRun?.textContent).toContain("워크트리 빠른 실행");
+      detailQuickRun?.click();
+
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).toContain("Todo 워크트리 빠른 실행");
+      expect(dialog?.textContent).toContain("원천 Todo 상태는 자동으로 바뀌지 않습니다");
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="projectId"]')?.value)
+        .toBe("repo:current-project");
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="branch"]')?.value)
+        .toBe("feature/quick-run");
+      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
     } finally {
       dom.window.close();
     }

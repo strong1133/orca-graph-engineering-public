@@ -1038,17 +1038,20 @@ function standaloneRouting(value) {
   return routing;
 }
 
-function buildStandaloneTaskPrompt(task, routing, scope) {
-  const projects = orderedTaskProjects(task);
+function buildStandaloneWorkItemPrompt(itemKind, item, prompt, routing, scope) {
+  const label = itemKind === "todo" ? "Todo" : "Task";
+  const projects = itemKind === "task" ? orderedTaskProjects(item) : [];
   return [
-    "Execute this Task as a standalone assignment in the selected Orca project/session.",
-    `Task: ${task.title} (${task.id})`,
-    task.version !== undefined ? `Task version: ${task.version}` : null,
+    `Execute this ${label} as a standalone assignment in the selected Orca worktree/session.`,
+    `${label}: ${item.title} (${item.id})`,
+    item.version !== undefined ? `${label} version: ${item.version}` : null,
+    itemKind === "todo" && item.groupName ? `Todo group: ${item.groupName}${item.subgroupName ? ` / ${item.subgroupName}` : ""}` : null,
     scope.domain ? `Domain: ${scope.domain.name} (${scope.domain.id})` : null,
     scope.milestone ? `Milestone: ${scope.milestone.name} (${scope.milestone.id})` : null,
     "",
-    "Task prompt:",
-    task.prompt,
+    `${label} prompt:`,
+    prompt,
+    ...(itemKind === "todo" && item.notes ? ["", "Todo notes:", item.notes] : []),
     ...(projects.length ? ["", "Task project context:", ...projects.map((project) =>
       `- ${project.role} · ${project.locatorKind}: ${project.locator}${project.branch ? ` · branch ${project.branch}` : ""}`)] : []),
     "",
@@ -1060,9 +1063,18 @@ function buildStandaloneTaskPrompt(task, routing, scope) {
     `- model: ${routing.model || "agent default"}`,
     `- reasoning: ${routing.reasoning || "agent default/current"}`,
     "",
-    "Follow the target repository's instructions and complete only this Task.",
+    `Follow the target repository's instructions and complete only this ${label}.`,
     "Finish with a concise result and the verification performed.",
   ].filter(Boolean).join("\n");
+}
+
+function executableWorkItemPrompt(itemKind, item) {
+  const currentMeta = Array.isArray(item.promptRevisions)
+    ? item.promptRevisions.find((revision) => revision?.kind === "meta" && revision.status === "current")
+    : null;
+  return String(itemKind === "task"
+    ? item.prompt || currentMeta?.content || item.metaDraft || item.draft || ""
+    : currentMeta?.content || item.metaDraft || item.draft || item.notes || "");
 }
 
 function findTerminalHandle(result) {
@@ -2066,47 +2078,54 @@ async function runGraph(graphId, dryRun, inputPrompt, startNewRun = true) {
   });
 }
 
-async function runStandaloneTask(taskId, requestedRouting, dryRun) {
+async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun) {
+  if (!["task", "todo"].includes(itemKind)) throw new Error(`unsupported standalone work item kind: ${itemKind}`);
   const dataSourceConfig = await readDataSourceConfig();
   const [store, targets] = await Promise.all([
     readWorkingStore(dataSourceConfig),
     readTargets(),
   ]);
-  const task = (store.tasks ?? []).find((item) => item.id === taskId);
-  if (!task) throw new Error(`task not found: ${taskId}`);
-  if (task.status === "archived") throw new Error(`archived task cannot be executed: ${taskId}`);
-  const prompt = String(task.prompt || "").trim();
-  if (!prompt) throw new Error(`task has no executable prompt: ${taskId}`);
-  if (prompt.length > 500_000) throw new Error(`task prompt is too large: ${taskId}`);
+  const collection = itemKind === "task" ? store.tasks : store.todos;
+  const item = (collection ?? []).find((candidate) => candidate.id === itemId);
+  if (!item) throw new Error(`${itemKind} not found: ${itemId}`);
+  if (itemKind === "task" && item.status === "archived") throw new Error(`archived task cannot be executed: ${itemId}`);
+  if (itemKind === "todo" && item.status === "cancelled") throw new Error(`cancelled todo cannot be executed: ${itemId}`);
+  const prompt = executableWorkItemPrompt(itemKind, item);
+  if (!prompt.trim()) throw new Error(`${itemKind} has no executable prompt: ${itemId}`);
+  if (prompt.length > 500_000) throw new Error(`${itemKind} prompt is too large: ${itemId}`);
 
   const routing = standaloneRouting(requestedRouting);
-  const graph = { id: `standalone:${task.id}`, name: "Task 단건 실행", defaults: routing };
+  const graph = { id: `standalone:${itemKind}:${item.id}`, name: `${itemKind === "task" ? "Task" : "Todo"} 단건 실행`, defaults: routing };
   const node = {
-    id: `standalone:${task.id}`,
+    id: `standalone:${itemKind}:${item.id}`,
     kind: "task",
-    label: task.title,
+    label: item.title,
     task: {
-      id: task.id, title: task.title, prompt,
-      ...(task.version !== undefined ? { version: task.version } : {}),
-      ...(Array.isArray(task.projects) ? { projects: orderedTaskProjects(task) } : {}),
+      id: item.id, title: item.title, prompt,
+      ...(item.version !== undefined ? { version: item.version } : {}),
+      ...(itemKind === "task" && Array.isArray(item.projects) ? { projects: orderedTaskProjects(item) } : {}),
     },
     routing: {},
     engineering: { contextMode: "inherit", timeoutSeconds: 900 },
   };
-  const executionNode = taskProjectExecutionNode(store, graph, node, targets);
+  const executionNode = itemKind === "task" ? taskProjectExecutionNode(store, graph, node, targets) : node;
   const route = resolveTaskRoute(graph, executionNode, targets);
   const plan = { dryRun, tasks: [{ route }] };
   await attestExecutionPlan(plan);
   const target = route.mode === "existing-session"
     ? { mode: route.mode, environmentId: route.environmentId, sessionId: route.session.id, model: route.model?.id ?? null }
     : { mode: route.mode, environmentId: route.environmentId, projectId: route.project.id, model: route.model.id };
-  if (dryRun) return { taskId, planned: true, target };
+  if (dryRun) return { itemKind, itemId, planned: true, target };
 
   const dispatched = await dispatchTask(graph, executionNode, targets, `task-${crypto.randomUUID().slice(0, 8)}`, {
-    prompt: buildStandaloneTaskPrompt({ ...task, prompt }, route.routing, scopeContext(store, task)),
-    title: `Task · ${task.title}`,
+    prompt: buildStandaloneWorkItemPrompt(itemKind, item, prompt, route.routing, scopeContext(store, item)),
+    title: `${itemKind === "task" ? "Task" : "Todo"} · ${item.title}`,
   });
-  return { taskId, completed: true, sessionId: dispatched.sessionId, target };
+  return { itemKind, itemId, completed: true, sessionId: dispatched.sessionId, target };
+}
+
+async function runStandaloneTask(taskId, requestedRouting, dryRun) {
+  return runStandaloneWorkItem("task", taskId, requestedRouting, dryRun);
 }
 
 async function handleMessage(message) {
@@ -2130,6 +2149,8 @@ async function handleMessage(message) {
       }
     case "task-project-context":
       return taskProjectContext(String(message.taskId || ""), String(message.workspaceHint || ""));
+    case "current-orca-project":
+      return currentOrcaProject();
     case "link-task-projects":
       return linkTaskProjects(String(message.taskId || ""), message.paths, message.branch);
     case "set-task-project-branch":
@@ -2173,6 +2194,12 @@ async function handleMessage(message) {
       const taskId = String(message.taskId || "");
       const result = await runStandaloneTask(taskId, message.routing, Boolean(message.dryRun));
       console.log(`[bridge] task ${taskId} ${message.dryRun ? "planned" : "executed"}`);
+      return result;
+    }
+    case "run-todo": {
+      const todoId = String(message.todoId || "");
+      const result = await runStandaloneWorkItem("todo", todoId, message.routing, Boolean(message.dryRun));
+      console.log(`[bridge] todo ${todoId} ${message.dryRun ? "planned" : "executed"}`);
       return result;
     }
     case "open-wide": {

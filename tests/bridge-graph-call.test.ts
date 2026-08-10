@@ -280,6 +280,62 @@ describe("bridge graph calls", () => {
     expect(after.graphs.every((graph: { runs: unknown[] }) => graph.runs.length === 0)).toBe(true);
   });
 
+  it("executes one Todo directly in the selected Orca worktree", async () => {
+    const root = process.cwd();
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const store = JSON.parse(await readFile(path.join(root, "fixtures/default-store.json"), "utf8"));
+    const now = "2026-08-10T00:00:00.000Z";
+    store.todos = [{
+      id: "TODO-standalone",
+      title: "빠른 실행 Todo",
+      notes: "검증 메모",
+      groupName: "플러그인",
+      subgroupName: "실행",
+      draft: "사람 Todo Draft",
+      metaDraft: "  현재 Todo Meta Draft  \n두번째 줄\n",
+      promptRevisions: [
+        { id: "todo-draft", kind: "draft", revision: 1, content: "사람 Todo Draft", status: "current", generator: "human", createdAt: now },
+        { id: "todo-meta", kind: "meta", revision: 2, content: "  현재 Todo Meta Draft  \n두번째 줄\n", status: "current", basedOnId: "todo-draft", generator: "meta-prompt-agent", createdAt: now },
+      ],
+      status: "open",
+      priority: "medium",
+      tags: [],
+      createdAt: now,
+      updatedAt: now,
+    }];
+    await writeFile(path.join(runtimeDirectory, "store.json"), `${JSON.stringify(store)}\n`, "utf8");
+    const fake = await installFakeOrca(runtimeDirectory);
+    const environment = { ORCA_CLI_COMMAND: fake.command, ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog };
+
+    await sendToBridge(
+      runtimeDirectory,
+      { type: "run-todo", todoId: "TODO-standalone", routing: { projectId: "fake-project", model: "gpt-5.6-sol", reasoning: "medium" }, dryRun: true },
+      "todo TODO-standalone planned",
+      environment,
+    );
+    expect(await readCallLog(fake.callLog)).toBe("");
+
+    await sendToBridge(
+      runtimeDirectory,
+      { type: "run-todo", todoId: "TODO-standalone", routing: { projectId: "fake-project", model: "gpt-5.6-sol", reasoning: "medium" }, dryRun: false },
+      "todo TODO-standalone executed",
+      environment,
+    );
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    const create = calls.find((args) => args[0] === "terminal" && args[1] === "create");
+    const send = calls.find((args) => args[0] === "terminal" && args[1] === "send");
+    expect(create).toEqual(expect.arrayContaining(["--worktree", "id:fake-worktree", "--title", "Todo · 빠른 실행 Todo"]));
+    expect(send?.join("\n")).toContain("Todo: 빠른 실행 Todo (TODO-standalone)");
+    expect(send?.join("\n")).toContain("Todo prompt:\n  현재 Todo Meta Draft  \n두번째 줄\n\n");
+    expect(send?.join("\n")).toContain("Todo group: 플러그인 / 실행");
+    expect(send?.join("\n")).toContain("Todo notes:\n검증 메모");
+    expect(send?.join("\n")).not.toContain("사람 Todo Draft");
+    const after = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
+    expect(after.todos.find((todo: { id: string }) => todo.id === "TODO-standalone")?.status).toBe("open");
+    expect(after.graphs.every((graph: { runs: unknown[] }) => graph.runs.length === 0)).toBe(true);
+  });
+
   it("executes one Task through the selected remote Orca environment", async () => {
     const root = process.cwd();
     const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));

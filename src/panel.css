@@ -573,8 +573,11 @@ textarea { resize: vertical; min-height: 74px; line-height: 1.45; }
 .work-group-toggle strong { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .work-group-toggle span { color: var(--muted-foreground); font-size: 9px; }
 .work-group-toggle .work-group-chevron { width: 10px; color: var(--foreground); font-size: 10px; }
-.work-group .work-card { border-width: 0 0 1px; border-radius: 0; margin: 0; }
-.work-group .work-card:last-child { border-bottom: 0; }
+.work-card-row { display: grid; grid-template-columns: minmax(0, 1fr) 38px; border-bottom: 1px solid var(--border); }
+.work-card-row:last-child { border-bottom: 0; }
+.work-group .work-card { border: 0; border-radius: 0; margin: 0; }
+.quick-worktree-run { border-width: 0 0 0 1px; border-radius: 0; border-color: var(--border); background: color-mix(in srgb, var(--accent) 38%, var(--card)); color: var(--primary); font-size: 15px; }
+.quick-worktree-run:hover { background: color-mix(in srgb, var(--primary) 16%, var(--card)); }
 .work-card { display: flex; width: 100%; min-height: 82px; flex-direction: column; align-items: stretch; gap: 7px; border-radius: 9px; margin-bottom: 7px; padding: 9px 10px; background: var(--card); text-align: left; }
 .work-card:hover, .work-card.selected { border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); background: color-mix(in srgb, var(--card) 86%, var(--accent)); }
 .work-card-head { display: flex; min-width: 0; align-items: center; gap: 7px; }
