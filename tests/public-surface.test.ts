@@ -109,4 +109,16 @@ describe("public plugin surface", () => {
     expect(panel).toContain("로컬 브리지는 loop 재진입을 아직 실행하지 않습니다");
     expect(bridge).toContain("live loop re-entry is not supported by the local bridge");
   });
+
+  it("keeps the complete panel type scale on D2Coding at the enlarged sizes", async () => {
+    const css = await readFile(path.join(root, "src/panel.css"), "utf8");
+    const families = [...css.matchAll(/font-family:\s*([^;]+);/gu)].map((match) => match[1]?.trim());
+    expect(families).toEqual(['"D2Coding", monospace', '"D2Coding", monospace']);
+
+    const sizes = [...css.matchAll(/font-size:\s*(\d+)px/gu)].map((match) => Number(match[1]));
+    expect(Object.fromEntries([...new Set(sizes)].sort((left, right) => left - right)
+      .map((size) => [size, sizes.filter((value) => value === size).length]))).toEqual({
+      9: 1, 10: 8, 11: 24, 12: 46, 13: 4, 14: 1, 15: 1, 16: 1, 17: 3, 18: 5,
+    });
+  });
 });
