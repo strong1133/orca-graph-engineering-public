@@ -20,6 +20,7 @@ import {
 } from "./data-source.mjs";
 const {
   mapOrcaRepos,
+  normalizeWorkBranch,
   taskProjectInput,
   workTasksClientFromEnvironment,
   workTasksEnvironment,
@@ -95,8 +96,11 @@ function requireWorkTasks() {
 
 async function publishLocalOrcaProjects({ force = false } = {}) {
   const client = requireWorkTasks();
-  const result = await runOrca(["repo", "list"], 30_000, root);
-  const projects = mapOrcaRepos(result);
+  const [repos, worktrees] = await Promise.all([
+    runOrca(["repo", "list"], 30_000, root),
+    runOrca(["worktree", "list"], 30_000, root),
+  ]);
+  const projects = mapOrcaRepos(repos, worktrees);
   const signature = JSON.stringify(projects);
   if (!force && signature === publishedProjectSignature) {
     return { environment: localWorkTasksEnvironment, projects, changed: false };
@@ -174,7 +178,7 @@ async function linkTaskProjects(taskId, paths, branchValue) {
   const requested = [...new Set((Array.isArray(paths) ? paths : []).filter((value) => typeof value === "string" && value.trim()))];
   if (!requested.length) throw new Error("연결할 프로젝트를 하나 이상 선택하십시오.");
   const context = await taskProjectContext(taskId);
-  const branch = String(branchValue || context.current?.branch || "").trim().replace(/^refs\/heads\//u, "");
+  const branch = normalizeWorkBranch(branchValue || context.current?.branch || "");
   const registryByPath = new Map(context.registry.map((project) => [project.path, project]));
   for (const locator of requested) if (!registryByPath.has(locator)) throw new Error(`게시된 Orca 프로젝트가 아닙니다: ${locator}`);
   const existingInputs = context.projects.map(taskProjectInput);
@@ -205,8 +209,34 @@ async function linkTaskProjects(taskId, paths, branchValue) {
   return { context: await taskProjectContext(taskId), store: refreshed.store };
 }
 
+async function setTaskProjectBranch(taskId, projectId, locator, branchValue) {
+  const client = requireWorkTasks();
+  const context = await taskProjectContext(taskId);
+  const inputs = context.projects.map(taskProjectInput);
+  const project = inputs.find((item) => (projectId && item.id === projectId)
+    || (!projectId && locator && item.locator === locator));
+  if (!project) throw new Error("Task 프로젝트 연결을 찾을 수 없습니다.");
+  const branch = normalizeWorkBranch(branchValue);
+  if (branch) project.branch = branch;
+  else delete project.branch;
+  try {
+    await client.patch(`/tasks/${encodeURIComponent(taskId)}`, {
+      expected_version: context.taskVersion,
+      projects: inputs,
+    });
+  } catch (error) {
+    if (error?.status === 409) await client.get(`/tasks/${encodeURIComponent(taskId)}`);
+    throw error;
+  }
+  const refreshed = await refreshConfiguredDataSource(undefined);
+  return { context: await taskProjectContext(taskId), store: refreshed.store };
+}
+
 async function enrichWorkProcessSource(cache) {
   if (!workTasksClient || cache.mode !== "structured" || cache.status !== "ready" || !cache.store?.graphs?.length) return cache;
+  // Contract v1 now projects these fields directly. Keep the aggregate fallback
+  // only for older adapters so refresh does not fan out into redundant requests.
+  if (cache.store.graphs.every((graph) => typeof graph.processEnabled === "boolean")) return cache;
   const listed = await workTasksClient.get("/graphs?include_archived=true&limit=500");
   const sourceGraphs = new Map((listed.items ?? []).map((item) => [String(item.id), item]));
   const processIds = cache.store.graphs
@@ -757,6 +787,10 @@ function scopeContext(store, item) {
 }
 
 function buildMetaPromptRequest(store, kind, item, revision) {
+  const projects = kind === "task" ? orderedTaskProjects(item) : [];
+  const targetGuidance = projects.some((project) => project.role === "target")
+    ? "Task의 role='target' 프로젝트 locator는 확인된 작업 대상입니다. # 작업 컨텍스트의 확인된 사실에 locator 원문을 그대로 명시하고 미확정으로 남기지 마십시오."
+    : null;
   return [
     "당신은 사람의 작업 초안을 실행 가능한 Meta Prompt로 편집하는 prompt architect입니다.",
     "다음 입력을 의미 손실 없이 구체적이고 검증 가능한 Meta Prompt로 변환하십시오.",
@@ -765,10 +799,31 @@ function buildMetaPromptRequest(store, kind, item, revision) {
     "응답에는 서문이나 부록 없이 다음 9개 H1 섹션만 정확한 순서로 출력하십시오.",
     ...META_PROMPT_HEADINGS.map((heading) => `# ${heading}`),
     "작업 컨텍스트에는 확인된 사실, 가정, 미확인 사항을 구분하고 실행 절차와 품질 기준은 결과를 검증할 수 있을 만큼 구체적으로 작성하십시오.",
+    targetGuidance,
     "",
-    `<item_context_json>${JSON.stringify({ kind, id: item.id, title: item.title, scope: scopeContext(store, item) })}</item_context_json>`,
+    `<item_context_json>${JSON.stringify({ kind, id: item.id, title: item.title, scope: scopeContext(store, item), projects })}</item_context_json>`,
     `<human_draft_json>${JSON.stringify({ revisionId: revision.id, content: revision.content })}</human_draft_json>`,
-  ].join("\n");
+  ].filter((line) => line !== null).join("\n");
+}
+
+function orderedTaskProjects(task) {
+  return (Array.isArray(task?.projects) ? task.projects : [])
+    .map(projectRelation)
+    .filter((project) => project.locator && ["target", "related"].includes(project.role)
+      && ["folder", "git"].includes(project.locatorKind))
+    .sort((left, right) => left.position - right.position || String(left.id || "").localeCompare(String(right.id || "")));
+}
+
+function ensureMetaPromptProjectPaths(generated, projects) {
+  const targets = projects.filter((project) => project.role === "target" && project.locator);
+  if (!targets.length || targets.every((project) => generated.includes(project.locator))) return generated;
+  const lines = targets.map((project) => {
+    const label = project.label || path.basename(project.locator) || project.locator;
+    return `- ${label}: \`${project.locator}\`${project.locatorKind === "git" ? " (git)" : ""}${project.branch ? ` · branch \`${project.branch}\`` : ""}`;
+  });
+  const marker = /^# 요구사항\s*$/mu;
+  if (!marker.test(generated)) return generated;
+  return generated.replace(marker, `## 대상 프로젝트\n${lines.join("\n")}\n\n# 요구사항`);
 }
 
 function validateMetaPromptOutput(value) {
@@ -841,7 +896,10 @@ async function generateMetaPrompt({ itemKind, itemId, draftRevisionId }) {
     await runOrca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "90000"], 100_000);
     await runOrca(["terminal", "send", "--terminal", handle, "--text", buildMetaPromptRequest(initialStore, itemKind, item, revision), "--enter"]);
     await runOrca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "240000"], 250_000);
-    const metaDraft = validateMetaPromptOutput(await terminalAgentMessage(handle));
+    const metaDraft = ensureMetaPromptProjectPaths(
+      validateMetaPromptOutput(await terminalAgentMessage(handle)),
+      itemKind === "task" ? orderedTaskProjects(item) : [],
+    );
 
     const currentStore = await readWorkingStore(dataSourceConfig);
     const currentItem = promptItem(currentStore, itemKind, itemId);
@@ -901,6 +959,7 @@ function shellQuote(value) {
 function buildPrompt(graph, node, runId, workInput) {
   const routing = effectiveRouting(graph, node);
   const engineering = node.engineering || {};
+  const projects = orderedTaskProjects(node.task);
   return [
     `Graph: ${graph.name} (${graph.id})`,
     `Run: ${runId}`,
@@ -908,6 +967,8 @@ function buildPrompt(graph, node, runId, workInput) {
     "",
     node.task?.prompt || node.label || "Execute this graph node.",
     ...(workInput !== undefined ? ["", "Work-process input for this run (verbatim):", workInput] : []),
+    ...(projects.length ? ["", "Task project context:", ...projects.map((project) =>
+      `- ${project.role} · ${project.locatorKind}: ${project.locator}${project.branch ? ` · branch ${project.branch}` : ""}`)] : []),
     "",
     "Execution contract:",
     `- environment: ${routing.environmentId || "local"}`,
@@ -949,6 +1010,7 @@ function standaloneRouting(value) {
 }
 
 function buildStandaloneTaskPrompt(task, routing, scope) {
+  const projects = orderedTaskProjects(task);
   return [
     "Execute this Task as a standalone assignment in the selected Orca project/session.",
     `Task: ${task.title} (${task.id})`,
@@ -958,6 +1020,8 @@ function buildStandaloneTaskPrompt(task, routing, scope) {
     "",
     "Task prompt:",
     task.prompt,
+    ...(projects.length ? ["", "Task project context:", ...projects.map((project) =>
+      `- ${project.role} · ${project.locatorKind}: ${project.locator}${project.branch ? ` · branch ${project.branch}` : ""}`)] : []),
     "",
     "Execution target:",
     `- environment: ${routing.environmentId || "local"}`,
@@ -1000,6 +1064,42 @@ function workBranch(value) {
   return String(value || "").trim().replace(/^refs\/heads\//u, "");
 }
 
+function taskProjectExecutionNode(store, graph, node, targets) {
+  if (!node?.task?.id) return node;
+  const task = (store.tasks ?? []).find((item) => item.id === node.task.id) ?? node.task;
+  const projects = orderedTaskProjects(task);
+  if (!projects.length) return node;
+  const enriched = { ...node, task: { ...node.task, projects } };
+  const target = projects.find((project) => project.role === "target" && project.locatorKind === "folder");
+  if (!target) return enriched;
+  const routing = effectiveRouting(graph, node);
+  if (routing.sessionId) return enriched;
+  const environmentId = routing.environmentId
+    || targets.environments?.find((item) => item.local)?.id
+    || "local";
+  const selectedProject = routing.projectId
+    ? targets.projects.find((item) => item.id === routing.projectId && targetEnvironmentId(item) === environmentId)
+    : null;
+  if (selectedProject) {
+    if (selectedProject.path === target.locator && !routing.branch && target.branch) {
+      enriched.routing = { ...(node.routing || {}), branch: target.branch };
+    }
+    return enriched;
+  }
+  if (routing.projectId) return enriched;
+  const project = targets.projects.find((item) => targetEnvironmentId(item) === environmentId && item.path === target.locator);
+  if (!project) {
+    enriched.targetProjectError = `Task target project is unavailable in Orca environment ${environmentId}: ${target.locator}`;
+    return enriched;
+  }
+  enriched.routing = {
+    ...(node.routing || {}),
+    projectId: project.id,
+    ...(target.branch ? { branch: target.branch } : project.branch ? { branch: workBranch(project.branch) } : {}),
+  };
+  return enriched;
+}
+
 function resolveRoutingEnvironment(targets, routing) {
   let environmentId = routing.environmentId;
   if (!environmentId && routing.sessionId) {
@@ -1023,6 +1123,7 @@ function resolveRoutingEnvironment(targets, routing) {
 }
 
 function resolveTaskRoute(graph, node, targets) {
+  if (node.targetProjectError) throw new Error(node.targetProjectError);
   const routing = effectiveRouting(graph, node);
   const environment = resolveRoutingEnvironment(targets, routing);
   routing.environmentId = environment.environmentId;
@@ -1433,7 +1534,11 @@ function compileExecutionPlan(store, rootGraph, targets, dryRun) {
       problems.push(`graph-call depth limit exceeded (${configuredDepthLimit}): ${[...stack, graph.id].join(" -> ")}`);
       return;
     }
-    const executionGraph = defaults ? { ...graph, defaults } : graph;
+    const baseGraph = defaults ? { ...graph, defaults } : graph;
+    const executionGraph = {
+      ...baseGraph,
+      nodes: baseGraph.nodes.map((node) => taskProjectExecutionNode(store, baseGraph, node, targets)),
+    };
     try {
       preflightGraph(executionGraph, { live: !dryRun });
     } catch (error) {
@@ -1541,6 +1646,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
       }
       const node = graph.nodes.find((item) => item.id === nodeId);
       if (!node) continue;
+      const executionNode = taskProjectExecutionNode(store, executionGraph, node, targets);
       const readiness = nodeReadiness(executionGraph, node, completed, closed, unresolved);
       if (!readiness.ready) {
         const status = readiness.state === "branch_closed" ? "skipped" : "waiting";
@@ -1589,7 +1695,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
           await persistRunProgress(store, `${graph.name} · ${node.label || node.id} 자동 판정 중 · Run #${run.runNo}`);
           run.stats.attempts += 1;
           try {
-            decision = await evaluateCondition(executionGraph, node, targets, run.id, nodeOutputs, context.workInput);
+            decision = await evaluateCondition(executionGraph, executionNode, targets, run.id, nodeOutputs, context.workInput);
             branch = decision.branch;
             const runtimeCondition = executionGraph.nodes.find((item) => item.id === node.id);
             if (runtimeCondition) runtimeCondition.branchTaken = branch;
@@ -1667,7 +1773,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
         }
         continue;
       }
-      const routing = effectiveRouting(executionGraph, node);
+      const routing = effectiveRouting(executionGraph, executionNode);
       planLines.push(`${node.label || node.id}: ${routing.sessionId ? `session ${routing.sessionId}` : `project ${routing.projectId || "unset"} / new session`} / ${routing.model || "default model"}`);
       if (dryRun) {
         run.nodeResults.push({ nodeId, status: "pending", message: planLines.at(-1) });
@@ -1685,7 +1791,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
       for (attempt = 1; attempt <= maxAttempts; attempt += 1) {
         run.stats.attempts += 1;
         try {
-          const dispatched = await dispatchTask(executionGraph, node, targets, run.id, {
+          const dispatched = await dispatchTask(executionGraph, executionNode, targets, run.id, {
             ...(context.workInput !== undefined ? { workInput: context.workInput } : {}),
           });
           sessionId = dispatched.sessionId;
@@ -1777,7 +1883,10 @@ async function executeGraphRemotely({ config, store, targets, graph }) {
     const names = blocked.map((node) => `${node.label || node.id} (${node.kind})`).join(", ");
     throw new Error(`the source executes these node kinds itself; run this graph in the source workspace: ${names}`);
   }
-  const localNode = (nodeId) => graph.nodes.find((node) => node.id === nodeId);
+  const localNode = (nodeId) => {
+    const node = graph.nodes.find((item) => item.id === nodeId);
+    return node ? taskProjectExecutionNode(store, graph, node, targets) : undefined;
+  };
   const nodeOutputs = new Map();
   let completed = 0;
   let skipped = 0;
@@ -1947,11 +2056,16 @@ async function runStandaloneTask(taskId, requestedRouting, dryRun) {
     id: `standalone:${task.id}`,
     kind: "task",
     label: task.title,
-    task: { id: task.id, title: task.title, prompt, ...(task.version !== undefined ? { version: task.version } : {}) },
+    task: {
+      id: task.id, title: task.title, prompt,
+      ...(task.version !== undefined ? { version: task.version } : {}),
+      ...(Array.isArray(task.projects) ? { projects: orderedTaskProjects(task) } : {}),
+    },
     routing: {},
     engineering: { contextMode: "inherit", timeoutSeconds: 900 },
   };
-  const route = resolveTaskRoute(graph, node, targets);
+  const executionNode = taskProjectExecutionNode(store, graph, node, targets);
+  const route = resolveTaskRoute(graph, executionNode, targets);
   const plan = { dryRun, tasks: [{ route }] };
   await attestExecutionPlan(plan);
   const target = route.mode === "existing-session"
@@ -1959,7 +2073,7 @@ async function runStandaloneTask(taskId, requestedRouting, dryRun) {
     : { mode: route.mode, environmentId: route.environmentId, projectId: route.project.id, model: route.model.id };
   if (dryRun) return { taskId, planned: true, target };
 
-  const dispatched = await dispatchTask(graph, node, targets, `task-${crypto.randomUUID().slice(0, 8)}`, {
+  const dispatched = await dispatchTask(graph, executionNode, targets, `task-${crypto.randomUUID().slice(0, 8)}`, {
     prompt: buildStandaloneTaskPrompt({ ...task, prompt }, route.routing, scopeContext(store, task)),
     title: `Task · ${task.title}`,
   });
@@ -1984,6 +2098,13 @@ async function handleMessage(message) {
       return taskProjectContext(String(message.taskId || ""), String(message.workspaceHint || ""));
     case "link-task-projects":
       return linkTaskProjects(String(message.taskId || ""), message.paths, message.branch);
+    case "set-task-project-branch":
+      return setTaskProjectBranch(
+        String(message.taskId || ""),
+        typeof message.projectId === "string" ? message.projectId : "",
+        typeof message.locator === "string" ? message.locator : "",
+        message.branch,
+      );
     case "set-graph-process":
       return setGraphProcess(String(message.graphId || ""), Number(message.expectedVersion), Boolean(message.enabled));
     case "configure-source": {

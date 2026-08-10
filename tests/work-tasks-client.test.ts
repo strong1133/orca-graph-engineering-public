@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 const {
   WorkTasksClient,
   mapOrcaRepos,
+  normalizeWorkBranch,
   taskProjectInput,
   validateWorkTasksBaseUrl,
   workTasksEnvironment,
@@ -61,12 +62,19 @@ describe("Work Tasks Hermes client", () => {
 });
 
 describe("Orca project registry mapping", () => {
-  it("maps the authoritative orca repo list fields without inventing values", () => {
+  it("maps the authoritative Orca repo and worktree list fields without inventing values", () => {
     expect(mapOrcaRepos({ repos: [{
       id: "repo-1", displayName: "work", path: "/workspace/work", kind: "git",
       gitRemoteIdentity: { canonicalKey: "github.com/acme/work" },
+    }] }, { worktrees: [{
+      id: "repo-1::/workspace/worktree", repoId: "repo-1", path: "/workspace/worktree",
+      branch: "refs/heads/feature/card-picker", displayName: "card picker", isMainWorktree: false,
     }] })).toEqual([{
       name: "work", path: "/workspace/work", kind: "git", repo_id: "repo-1", remote: "github.com/acme/work",
+      worktrees: [{
+        id: "repo-1::/workspace/worktree", path: "/workspace/worktree",
+        branch: "feature/card-picker", display_name: "card picker",
+      }],
     }]);
   });
 
@@ -83,5 +91,16 @@ describe("Orca project registry mapping", () => {
       id: "TP-1", role: "target", locator_kind: "folder", locator: "/workspace/work",
       label: "work", branch: "feature/task-42", position: 2,
     });
+    expect(normalizeWorkBranch("refs/heads/feature/task-42")).toBe("feature/task-42");
+    expect(() => normalizeWorkBranch("feature/bad branch")).toThrow("whitespace or control");
+    expect(() => normalizeWorkBranch("feature/bad\u0000branch")).toThrow("whitespace or control");
+  });
+
+  it("fails before publishing values outside the registry contract", () => {
+    expect(() => mapOrcaRepos({ repos: [{ displayName: "x".repeat(201), path: "/workspace/work" }] }))
+      .toThrow("displayName exceeds 200");
+    expect(() => mapOrcaRepos({ repos: Array.from({ length: 501 }, (_, index) => ({
+      id: `repo-${index}`, displayName: `repo-${index}`, path: `/workspace/${index}`,
+    })) })).toThrow("limit of 500");
   });
 });

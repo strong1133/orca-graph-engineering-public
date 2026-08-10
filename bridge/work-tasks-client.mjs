@@ -56,12 +56,46 @@ export function workTasksEnvironment(value, localName = "") {
   return null;
 }
 
-export function mapOrcaRepos(value) {
+export function mapOrcaRepos(value, worktreeValue = {}) {
   const repos = Array.isArray(value?.repos) ? value.repos : [];
-  return repos.flatMap((repo) => {
+  const worktrees = Array.isArray(worktreeValue?.worktrees) ? worktreeValue.worktrees : [];
+  if (worktrees.length > 5_000) throw new WorkTasksClientError("Orca worktree list exceeds the workspace registry limit of 5000 worktrees");
+  const worktreesByRepo = new Map();
+  for (const worktree of worktrees) {
+    if (worktree?.isArchived) continue;
+    const repoId = typeof worktree?.repoId === "string" ? worktree.repoId : "";
+    const id = typeof worktree?.id === "string" ? worktree.id : "";
+    const worktreePath = typeof worktree?.path === "string" ? worktree.path : "";
+    if (!repoId || !id || !worktreePath) continue;
+    if (id.length > 500) throw new WorkTasksClientError("Orca worktree id exceeds 500 characters");
+    if (worktreePath.length > 4096) throw new WorkTasksClientError("Orca worktree path exceeds 4096 characters");
+    if (typeof worktree.displayName === "string" && worktree.displayName.length > 200) {
+      throw new WorkTasksClientError("Orca worktree displayName exceeds 200 characters");
+    }
+    const branch = normalizeWorkBranch(worktree.branch);
+    const mapped = {
+      id,
+      path: worktreePath,
+      ...(branch ? { branch } : {}),
+      ...(typeof worktree.displayName === "string" && worktree.displayName ? { display_name: worktree.displayName } : {}),
+      ...(worktree.isMainWorktree === true ? { is_main: true } : {}),
+    };
+    const current = worktreesByRepo.get(repoId) ?? [];
+    if (current.length >= 500) throw new WorkTasksClientError(`Orca repository ${repoId} exceeds 500 worktrees`);
+    current.push(mapped);
+    worktreesByRepo.set(repoId, current);
+  }
+  const projects = repos.flatMap((repo) => {
     const name = typeof repo?.displayName === "string" ? repo.displayName : "";
     const repoPath = typeof repo?.path === "string" ? repo.path : "";
     if (!name || !repoPath) return [];
+    if (name.length > 200) throw new WorkTasksClientError("Orca repository displayName exceeds 200 characters");
+    if (repoPath.length > 4096) throw new WorkTasksClientError("Orca repository path exceeds 4096 characters");
+    if (typeof repo.kind === "string" && repo.kind.length > 40) throw new WorkTasksClientError("Orca repository kind exceeds 40 characters");
+    if (typeof repo.id === "string" && repo.id.length > 200) throw new WorkTasksClientError("Orca repository id exceeds 200 characters");
+    if (typeof repo.gitRemoteIdentity?.canonicalKey === "string" && repo.gitRemoteIdentity.canonicalKey.length > 500) {
+      throw new WorkTasksClientError("Orca repository remote identity exceeds 500 characters");
+    }
     return [{
       name,
       path: repoPath,
@@ -69,8 +103,23 @@ export function mapOrcaRepos(value) {
       ...(typeof repo.id === "string" && repo.id ? { repo_id: repo.id } : {}),
       ...(typeof repo.gitRemoteIdentity?.canonicalKey === "string" && repo.gitRemoteIdentity.canonicalKey
         ? { remote: repo.gitRemoteIdentity.canonicalKey } : {}),
+      ...((worktreesByRepo.get(repo.id) ?? []).length ? { worktrees: worktreesByRepo.get(repo.id) } : {}),
     }];
   });
+  if (projects.length > 500) throw new WorkTasksClientError("Orca repo list exceeds the workspace registry limit of 500 projects");
+  return projects;
+}
+
+export function normalizeWorkBranch(value) {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string") throw new WorkTasksClientError("Task project branch must be a string");
+  const branch = value.trim().replace(/^refs\/heads\//u, "");
+  if (!branch) return undefined;
+  if (branch.length > 255) throw new WorkTasksClientError("Task project branch exceeds 255 characters");
+  if (/[\s\u0000-\u001f\u007f]/u.test(branch)) {
+    throw new WorkTasksClientError("Task project branch must not contain whitespace or control characters");
+  }
+  return branch;
 }
 
 export class WorkTasksClient {
@@ -158,13 +207,14 @@ export function workTasksClientFromEnvironment(environment = process.env) {
 
 export function taskProjectInput(project) {
   const locatorKind = project.locator_kind ?? project.locatorKind;
+  const branch = normalizeWorkBranch(project.branch);
   return {
     ...(project.id ? { id: project.id } : {}),
     role: project.role,
     locator_kind: locatorKind,
     locator: project.locator,
     ...(project.label ? { label: project.label } : {}),
-    ...(project.branch ? { branch: String(project.branch).replace(/^refs\/heads\//u, "") } : {}),
+    ...(branch ? { branch } : {}),
     position: Number(project.position) || 0,
   };
 }

@@ -52,6 +52,11 @@ All claims are grounded.
 # 입력
 Use the supplied release scope.`;
 
+const META_RESULT_WITH_PROJECT = META_RESULT.replace(
+  "# 요구사항",
+  "## 대상 프로젝트\n- release-project: `/portable/release-project` · branch `feature/release`\n\n# 요구사항",
+);
+
 async function installFakeOrca(directory: string, malformed = false): Promise<{ command: string; log: string }> {
   const command = path.join(directory, "fake-orca.mjs");
   const log = path.join(directory, "orca-calls.jsonl");
@@ -104,6 +109,10 @@ function storeFixture() {
     }],
     tasks: [{
       id: "task-1", title: "Release check", prompt: "Check the release", domainId: "domain-1", milestoneId: "milestone-1",
+      projects: [{
+        id: "project-link-1", role: "target", locatorKind: "folder", locator: "/portable/release-project",
+        label: "release-project", branch: "feature/release", position: 0,
+      }],
       draft: "Check the release", promptRevisions: [{
         id: "draft-1", kind: "draft", revision: 1, content: "Check the release", status: "current", generator: "human", createdAt: now,
       }],
@@ -161,13 +170,13 @@ describe("Meta Prompt bridge", () => {
     const { calls } = await runBridge(directory);
     const store = JSON.parse(await readFile(path.join(directory, "store.json"), "utf8"));
     const task = store.tasks[0];
-    expect(task.metaDraft).toBe(META_RESULT);
-    expect(task.prompt).toBe(META_RESULT);
+    expect(task.metaDraft).toBe(META_RESULT_WITH_PROJECT);
+    expect(task.prompt).toBe(META_RESULT_WITH_PROJECT);
     expect(task.metaPromptRun).toBeUndefined();
     expect(task.promptRevisions.at(-1)).toMatchObject({
       kind: "meta", status: "current", basedOnId: "draft-1", generator: "meta-prompt-agent",
     });
-    expect(store.graphs[0].nodes[0].task.prompt).toBe(META_RESULT);
+    expect(store.graphs[0].nodes[0].task.prompt).toBe(META_RESULT_WITH_PROJECT);
     const create = calls.find((args) => args[0] === "terminal" && args[1] === "create");
     expect(create?.join(" ")).toContain("codex --model 'gpt-5.6-sol' -c model_reasoning_effort='medium'");
     const send = calls.find((args) => args[0] === "terminal" && args[1] === "send");
@@ -175,6 +184,9 @@ describe("Meta Prompt bridge", () => {
     expect(send?.join("\n")).toContain("# 역할");
     expect(send?.join("\n")).toContain('"content":"Check the release"');
     expect(send?.join("\n")).toContain('"domain":{"id":"domain-1","name":"Product"');
+    expect(send?.join("\n")).toContain('"locator":"/portable/release-project"');
+    expect(send?.join("\n")).toContain("role='target'");
+    expect((task.metaDraft.match(/^# /gmu) ?? [])).toHaveLength(9);
   });
 
   it("keeps the human Draft and records failure when the agent output violates the fixed section contract", async () => {

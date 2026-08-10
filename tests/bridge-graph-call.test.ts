@@ -205,10 +205,15 @@ function executionGraph(
   };
 }
 
-async function writeGraphStore(runtimeDirectory: string, graphs: Array<Record<string, unknown>>): Promise<void> {
+async function writeGraphStore(
+  runtimeDirectory: string,
+  graphs: Array<Record<string, unknown>>,
+  tasks: Array<Record<string, unknown>> = [],
+): Promise<void> {
   await writeFile(path.join(runtimeDirectory, "store.json"), `${JSON.stringify({
     schemaVersion: 1,
     activeGraphId: graphs[0]?.id,
+    tasks,
     graphs,
   })}\n`, "utf8");
 }
@@ -237,6 +242,10 @@ describe("bridge graph calls", () => {
       status: "ready",
       priority: "medium",
       tags: [],
+      projects: [{
+        id: "standalone-target", role: "target", locatorKind: "folder", locator: "/portable/fake-project",
+        label: "Fake project", branch: "main", position: 0,
+      }],
       createdAt: now,
       updatedAt: now,
     }];
@@ -246,7 +255,7 @@ describe("bridge graph calls", () => {
 
     await sendToBridge(
       runtimeDirectory,
-      { type: "run-task", taskId: "TASK-standalone", routing: { projectId: "fake-project", model: "gpt-5.6-sol", reasoning: "high" }, dryRun: true },
+      { type: "run-task", taskId: "TASK-standalone", routing: { model: "gpt-5.6-sol", reasoning: "high" }, dryRun: true },
       "task TASK-standalone planned",
       environment,
     );
@@ -254,7 +263,7 @@ describe("bridge graph calls", () => {
 
     await sendToBridge(
       runtimeDirectory,
-      { type: "run-task", taskId: "TASK-standalone", routing: { projectId: "fake-project", model: "gpt-5.6-sol", reasoning: "high" }, dryRun: false },
+      { type: "run-task", taskId: "TASK-standalone", routing: { model: "gpt-5.6-sol", reasoning: "high" }, dryRun: false },
       "task TASK-standalone executed",
       environment,
     );
@@ -265,6 +274,7 @@ describe("bridge graph calls", () => {
     expect(create?.join(" ")).toContain("codex --model");
     expect(send?.join("\n")).toContain("Task: 단건 Task (TASK-standalone)");
     expect(send?.join("\n")).toContain("단건 실행 프롬프트");
+    expect(send?.join("\n")).toContain("target · folder: /portable/fake-project · branch main");
     expect(send?.join("\n")).not.toContain("Graph:");
     const after = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
     expect(after.graphs.every((graph: { runs: unknown[] }) => graph.runs.length === 0)).toBe(true);
@@ -336,6 +346,51 @@ describe("bridge graph calls", () => {
       .toEqual(expect.arrayContaining(["--worktree", "id:fake-feature-worktree"]));
     expect(calls.find((args) => args[0] === "terminal" && args[1] === "send")?.join("\n"))
       .toContain("- branch: feature/review");
+  });
+
+  it("infers a graph node project and exact worktree branch from the Task target relation", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph("task-target-route", [taskNode("target-task")], [], {
+      model: "gpt-5.6-sol",
+    });
+    const now = "2026-08-10T00:00:00.000Z";
+    await writeGraphStore(runtimeDirectory, [graph], [{
+      id: "task-target-task", title: "target-task", prompt: "execute target-task",
+      draft: "execute target-task", promptRevisions: [], status: "ready", priority: "medium", tags: [],
+      projects: [{
+        id: "relation-1", role: "target", locatorKind: "folder", locator: "/portable/fake-project",
+        label: "Fake project", branch: "feature/review", position: 0,
+      }],
+      createdAt: now, updatedAt: now,
+    }]);
+    const fake = await installFakeOrca(runtimeDirectory);
+    const targetsPath = path.join(runtimeDirectory, "targets.json");
+    const targets = JSON.parse(await readFile(targetsPath, "utf8"));
+    targets.branches.push({
+      id: "feature", branch: "refs/heads/feature/review", environmentId: "local",
+      projectId: "fake-project", repoId: "fake-repo", worktreeId: "fake-feature-worktree",
+      path: "/portable/fake-project-feature",
+    });
+    await writeFile(targetsPath, `${JSON.stringify(targets)}\n`, "utf8");
+
+    await sendToBridge(
+      runtimeDirectory,
+      { type: "run", graphId: "task-target-route", dryRun: false },
+      "graph task-target-route executed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_BRANCH: "1",
+      },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    const create = calls.find((args) => args[0] === "terminal" && args[1] === "create");
+    const send = calls.find((args) => args[0] === "terminal" && args[1] === "send");
+    expect(create).toEqual(expect.arrayContaining(["--worktree", "id:fake-feature-worktree"]));
+    expect(send?.join("\n")).toContain("target · folder: /portable/fake-project · branch feature/review");
+    expect(send?.join("\n")).toContain("- branch: feature/review");
   });
 
   it("plans a child graph recursively and records bidirectional run lineage", async () => {

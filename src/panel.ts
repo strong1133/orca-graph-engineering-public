@@ -67,6 +67,7 @@ type RunModalState = {
   inputPrompt: string;
   startNewRun: boolean;
   suggestedProjectId?: string;
+  inferredProjectNodeIds?: string[];
 };
 
 type TaskRunModalState = {
@@ -783,11 +784,45 @@ function routingValue(value: RoutingTarget | undefined): RoutingTarget {
   };
 }
 
+function taskForGraphNode(node: GraphNode): LocalTask | undefined {
+  return node.task?.id ? store.tasks.find((task) => task.id === node.task?.id) : undefined;
+}
+
+function taskTargetForGraphNode(node: GraphNode): NonNullable<LocalTask["projects"]>[number] | undefined {
+  return taskForGraphNode(node)?.projects
+    ?.filter((project) => project.role === "target" && project.locatorKind === "folder")
+    .sort((left, right) => left.position - right.position)[0];
+}
+
+function inferredTaskNodeRouting(graph: GraphDefinition, node: GraphNode): RoutingTarget {
+  const target = taskTargetForGraphNode(node);
+  if (!target) return {};
+  const route = effectiveRouting(graph, node);
+  if (route.sessionId) return {};
+  const environmentId = routeEnvironmentId(route.environmentId);
+  if (route.projectId) {
+    const project = targets.projects.find((item) => item.id === route.projectId
+      && routeEnvironmentId(item.environmentId) === environmentId);
+    return project?.path === target.locator && !route.branch && target.branch
+      ? { branch: shortBranch(target.branch) }
+      : {};
+  }
+  const project = targets.projects.find((item) => routeEnvironmentId(item.environmentId) === environmentId
+    && item.path === target.locator);
+  if (!project) return {};
+  return {
+    projectId: project.id,
+    ...(target.branch ? { branch: shortBranch(target.branch) }
+      : project.branch ? { branch: shortBranch(project.branch) } : {}),
+  };
+}
+
 function createRunModal(live: boolean): RunModalState {
   const graph = activeGraph();
   const defaults = routingValue(graph.defaults);
   let suggestedProjectId: string | undefined;
-  if (!defaults.projectId && !defaults.sessionId && store.bridgeWorkspace) {
+  const hasTaskTarget = graph.nodes.some((node) => Boolean(taskTargetForGraphNode(node)));
+  if (!defaults.projectId && !defaults.sessionId && !hasTaskTarget && store.bridgeWorkspace) {
     const workspace = store.bridgeWorkspace.trim().toLocaleLowerCase("en-US");
     const matches = targets.projects.filter((item) => {
       const id = item.id.toLocaleLowerCase("en-US");
@@ -808,17 +843,24 @@ function createRunModal(live: boolean): RunModalState {
     if (branch) defaults.branch = shortBranch(branch);
   }
   const activeRun = [...graph.runs].reverse().find((run) => run.status === "running");
+  const inferredProjectNodeIds: string[] = [];
+  const nodeRouting = Object.fromEntries(graph.nodes.map((node) => {
+    const inferred = inferredTaskNodeRouting(graph, node);
+    if (inferred.projectId || inferred.branch) inferredProjectNodeIds.push(node.id);
+    return [node.id, { ...routingValue(node.routing), ...inferred }];
+  }));
   return {
     kind: "run",
     live,
     defaults,
-    nodeRouting: Object.fromEntries(graph.nodes.map((node) => [node.id, routingValue(node.routing)])),
+    nodeRouting,
     conditionBranches: Object.fromEntries(graph.nodes
       .filter((node) => node.kind === "condition")
       .map((node) => [node.id, node.branchTaken?.trim() ?? ""])),
     inputPrompt: "",
     startNewRun: !activeRun,
     ...(suggestedProjectId ? { suggestedProjectId } : {}),
+    ...(inferredProjectNodeIds.length ? { inferredProjectNodeIds } : {}),
   };
 }
 
@@ -1902,8 +1944,9 @@ function runNodeRoutingRows(graph: GraphDefinition, modal: RunModalState): strin
     const target = route.sessionId
       ? `기존 세션 · ${sessionName(route.sessionId)}`
       : route.projectId ? `새 세션 · ${projectName(route.projectId)}` : "실행 대상 미지정";
+    const inferred = modal.inferredProjectNodeIds?.includes(node.id);
     return `<article class="run-route-row ${!route.sessionId && !route.projectId ? "missing" : ""}" data-run-node-id="${esc(node.id)}">
-      <header><strong>${esc(node.label || node.id)}</strong><span class="badge">${esc(target)}</span><span class="badge">AI · ${esc(modelName(route.model))}</span></header>
+      <header><strong>${esc(node.label || node.id)}</strong><span class="badge">${esc(target)}</span><span class="badge">AI · ${esc(modelName(route.model))}</span>${inferred ? '<span class="badge good">Task 대상 자동 선택</span>' : ""}</header>
       <div class="run-node-route-grid">
         <label class="field"><span>프로젝트</span><select data-scope="run-node-routing" data-node-id="${esc(node.id)}" data-field="projectId">${projectOptions(modal.nodeRouting[node.id]?.projectId, true)}</select></label>
         <label class="field"><span>작업 브랜치</span><select data-scope="run-node-routing" data-node-id="${esc(node.id)}" data-field="branch">${branchOptions(route.projectId, modal.nodeRouting[node.id]?.branch, true, route.environmentId)}</select></label>
@@ -2300,18 +2343,16 @@ function taskProjectSection(task: LocalTask): string {
   if (taskProjectContextLoading) return '<section class="section task-projects"><div class="section-title">대상 프로젝트</div><p class="help">현재 Orca 컨텍스트와 프로젝트 레지스트리를 확인하는 중…</p></section>';
   if (taskProjectContextError) return `<section class="section task-projects"><div class="section-title">대상 프로젝트</div><p class="warning-list">${esc(taskProjectContextError)}</p><button data-action="reload-task-projects" data-id="${esc(task.id)}">다시 확인</button></section>`;
   if (!context) return `<section class="section task-projects"><div class="section-title">대상 프로젝트</div><button data-action="reload-task-projects" data-id="${esc(task.id)}">현재 Orca 프로젝트 감지</button></section>`;
-  const targets = context.projects.filter((project) => project.role === "target" && project.locatorKind === "folder");
-  if (targets.length) {
-    return `<section class="section task-projects"><div class="section-title">대상 프로젝트 · ${targets.length}</div>
-      <ul class="work-link-list">${targets.map((project) => `<li><span><strong>${esc(project.label ?? project.locator.split("/").at(-1) ?? project.locator)}</strong><code>${esc(project.locator)}</code></span></li>`).join("")}</ul>
-      <p class="help">Task 실행 시 이 로컬 경로와 일치하는 Orca 프로젝트를 우선 선택합니다.</p></section>`;
-  }
+  const taskProjects = [...context.projects].sort((left, right) => left.position - right.position);
+  const targetProjects = taskProjects.filter((project) => project.role === "target" && project.locatorKind === "folder");
   const localProjects = context.registry.filter((project) => project.environment === context.environment);
+  const connectedPaths = new Set(taskProjects.map((project) => project.locator));
+  const availableProjects = localProjects.filter((project) => !connectedPaths.has(project.path));
   const recommendedPaths = new Set(context.recommended.map((project) => project.path));
-  return `<section class="section task-projects"><div class="section-title">대상 프로젝트 없음 ${context.recommended.length ? '<span class="badge">현재 컨텍스트 추천</span>' : ""}</div>
-    <p class="help">확인 후 선택한 경로를 Work Tasks의 target · folder 프로젝트로 연결합니다.</p>
-    <div class="registry-project-list">${localProjects.map((project) => `<label class="registry-project ${recommendedPaths.has(project.path) ? "recommended" : ""}"><input type="checkbox" data-action="toggle-task-project" data-path="${esc(project.path)}" ${selectedTaskProjectPaths.has(project.path) ? "checked" : ""}><span><strong>${esc(project.name)}</strong><code>${esc(project.path)}</code><small>${esc(project.environment)}${recommendedPaths.has(project.path) ? " · 추천" : ""}</small></span></label>`).join("") || '<p class="warning-list">이 장치의 게시된 Orca 프로젝트가 없습니다. Orca 대상 새로고침을 실행하십시오.</p>'}</div>
-    <button class="primary" data-action="connect-task-projects" data-id="${esc(task.id)}" ${selectedTaskProjectPaths.size ? "" : "disabled"}>선택 프로젝트를 Task에 연결</button>
+  return `<section class="section task-projects"><div class="section-title">대상 프로젝트 · ${targetProjects.length} ${!targetProjects.length && context.recommended.length ? '<span class="badge">현재 컨텍스트 추천</span>' : ""}<button class="icon ghost" data-action="reload-task-projects" data-id="${esc(task.id)}" aria-label="프로젝트 다시 감지">↻</button></div>
+    ${taskProjects.length ? `<ul class="work-link-list task-project-list">${taskProjects.map((project) => `<li><span><strong>${esc(project.label ?? project.locator.split("/").at(-1) ?? project.locator)}</strong><code>${esc(project.locator)}</code><small>${project.role === "target" ? "대상" : "관련"} · ${project.locatorKind}</small></span><label class="task-project-branch"><span>작업 브랜치</span><input data-scope="task-project-branch" data-task-id="${esc(task.id)}" data-project-id="${esc(project.id ?? "")}" data-locator="${esc(project.locator)}" value="${esc(project.branch ?? "")}" placeholder="예: feature/task-42"></label></li>`).join("")}</ul>` : '<p class="help">연결된 대상 프로젝트가 없습니다.</p>'}
+    <p class="help">Task 실행 시 target · folder 경로와 작업 브랜치에 정확히 일치하는 Orca 워크트리를 우선 선택합니다.</p>
+    ${availableProjects.length ? `<details class="registry-project-picker" ${!targetProjects.length ? "open" : ""}><summary>이 장치의 프로젝트에서 추가</summary><div class="registry-project-list">${availableProjects.map((project) => `<label class="registry-project ${recommendedPaths.has(project.path) ? "recommended" : ""}"><input type="checkbox" data-action="toggle-task-project" data-path="${esc(project.path)}" ${selectedTaskProjectPaths.has(project.path) ? "checked" : ""}><span><strong>${esc(project.name)}</strong><code>${esc(project.path)}</code><small>${esc(project.environment)}${recommendedPaths.has(project.path) ? " · 추천" : ""}</small></span></label>`).join("")}</div><button class="primary" data-action="connect-task-projects" data-id="${esc(task.id)}" ${selectedTaskProjectPaths.size ? "" : "disabled"}>선택 프로젝트를 Task에 연결</button></details>` : (!localProjects.length ? '<p class="warning-list">이 장치의 게시된 Orca 프로젝트가 없습니다. Orca 대상 새로고침을 실행하십시오.</p>' : "")}
   </section>`;
 }
 
@@ -3006,7 +3047,8 @@ async function loadTaskProjectContext(taskId: string): Promise<TaskProjectContex
     if (!result) return null;
     taskProjectContextState = result;
     selectedTaskProjectPaths.clear();
-    for (const project of result.recommended) selectedTaskProjectPaths.add(project.path);
+    const connected = new Set(result.projects.map((project) => project.locator));
+    for (const project of result.recommended) if (!connected.has(project.path)) selectedTaskProjectPaths.add(project.path);
     const task = store.tasks.find((item) => item.id === taskId);
     if (task) task.projects = result.projects;
     return result;
@@ -3016,6 +3058,23 @@ async function loadTaskProjectContext(taskId: string): Promise<TaskProjectContex
   } finally {
     taskProjectContextLoading = false;
     if (view.selectedTaskId === taskId || view.modal?.kind === "task-run") render();
+  }
+}
+
+async function updateTaskProjectBranch(taskId: string, projectId: string, locator: string, branch: string): Promise<void> {
+  try {
+    const result = await sendBridge<{ context: TaskProjectContext; store?: GraphStore }>({
+      type: "set-task-project-branch", taskId, projectId, locator, branch,
+    });
+    if (result?.store) store = normalizeGraphStore(result.store);
+    if (result?.context) taskProjectContextState = result.context;
+    const task = store.tasks.find((item) => item.id === taskId);
+    if (task && result?.context) task.projects = result.context.projects;
+    render();
+    toast(branch.trim() ? `작업 브랜치를 ${shortBranch(branch)}로 저장했습니다.` : "Task 작업 브랜치를 비웠습니다.");
+  } catch (error) {
+    toast(error instanceof Error ? error.message : String(error));
+    await loadTaskProjectContext(taskId);
   }
 }
 
@@ -4137,6 +4196,11 @@ app.addEventListener("change", (event) => {
     const nodeId = input.dataset.nodeId;
     if (!nodeId || !graph.nodes.some((item) => item.id === nodeId)) return;
     const routing = view.modal.nodeRouting[nodeId] ??= {};
+    if (["projectId", "branch", "sessionId"].includes(field)) {
+      const remaining = view.modal.inferredProjectNodeIds?.filter((id) => id !== nodeId) ?? [];
+      if (remaining.length) view.modal.inferredProjectNodeIds = remaining;
+      else delete view.modal.inferredProjectNodeIds;
+    }
     if (raw) (routing as Record<string, unknown>)[field] = raw;
     else delete (routing as Record<string, unknown>)[field];
     if (field === "sessionId" && typeof raw === "string" && raw) {
@@ -4151,6 +4215,12 @@ app.addEventListener("change", (event) => {
       else delete routing.branch;
     }
     render();
+    return;
+  } else if (scope === "task-project-branch") {
+    const taskId = input.dataset.taskId;
+    const locator = input.dataset.locator;
+    if (!taskId || !locator) return;
+    void updateTaskProjectBranch(taskId, input.dataset.projectId ?? "", locator, input.value);
     return;
   } else if (scope === "run-condition" && view.modal?.kind === "run") {
     const nodeId = input.dataset.nodeId;

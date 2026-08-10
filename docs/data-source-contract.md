@@ -122,11 +122,11 @@ Some structured providers expose an authenticated aggregate API beside contract 
 - Graph payload: `process_enabled`; current and recent runs include nullable `input_prompt`.
 - Start a run: `POST /graphs/{graphId}/runs` with `{ expected_version, trigger_kind, input_prompt? }`.
 - Device repo registry: `PUT /orca-projects/{environment}` with the mapped `orca repo list --json` projects; `GET /orca-projects` reads all device mirrors.
-- Task target project: the existing Task project relation is used with `role=target`, `locator_kind=folder`, and the published local path. No plugin-owned duplicate relation is created.
+- Task target project: the existing Task project relation is used with `role=target`, `locator_kind=folder`, the published local path, and an optional normalized `branch`. No plugin-owned duplicate relation is created.
 
-The plugin projects these source fields to portable `processEnabled` and `GraphRunRecord.inputPrompt`. A new process run requires a non-blank input, but the string sent in `input_prompt` is not trimmed or normalized by the client. A resume does not create another run and uses the stored input. Each local loop iteration carries the same run input.
+The structured snapshot projects these source fields directly to portable `processEnabled`, `GraphRunRecord.inputPrompt`, and Task `projects`. The bridge accepts that projection without aggregate fan-out; its aggregate graph reads remain a compatibility fallback for older adapters. A new process run requires a non-blank input, but the string sent in `input_prompt` is not trimmed or normalized by the client. A resume does not create another run and uses the stored input. Each local loop iteration carries the same run input.
 
-Registry publication is event-driven: bridge startup and explicit Orca target refresh are triggers, and an in-memory canonical payload comparison skips an unchanged second PUT. Linking a Task project begins by reading the latest Task aggregate, preserves every existing relation, appends confirmed folder targets, and patches with that exact version. HTTP 409 causes a canonical re-read and a visible conflict; it is not an automatic write retry.
+Registry publication is event-driven: bridge startup and explicit Orca target refresh are triggers, and an in-memory canonical payload comparison skips an unchanged second PUT. The mapped registry is validated against the server's count and field-size bounds before PUT. Linking a Task project or changing its branch begins by reading the latest Task aggregate, preserves every existing relation, applies the confirmed change, and patches with that exact version. Branch values remove `refs/heads/` and reject whitespace, control characters, and values over 255 characters. HTTP 409 causes a canonical re-read and a visible conflict; it is not an automatic write retry.
 
 ### Remote execution capability
 

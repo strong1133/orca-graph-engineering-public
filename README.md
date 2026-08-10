@@ -21,7 +21,7 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 T
 - 그래프 생성, 복제, 보관, 초기화, pin, routine 메타데이터, JSON import/export
 - 🧭 업무프로세스 그래프, 실행별 원문 업무 입력과 회차별 입력 이력
 - 그래프와 노드의 project, Orca worktree branch, session, model, reasoning 라우팅
-- 장치의 Orca repo registry 게시와 Task 대상 folder 프로젝트 감지·확인 연결
+- 장치의 Orca repo registry 게시, Task 대상 folder 프로젝트 감지·확인 연결과 작업 브랜치 편집
 - path, diamond, router, star, cycle, tree, tool-bipartite topology template
 - superstep, critical path, 병렬 writer/reducer, loop guard, 예산, 권한, provenance 검사
 - retry, timeout, idempotency, compensation, human gate, 실행 이력
@@ -35,9 +35,9 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 T
 - Domain은 목표, 공통 메모, 제약사항과 owner를 가지며 여러 Milestone을 포함합니다. Milestone은 반드시 하나의 Domain에 속하고 목표, 성공 기준, 상태, 우선순위, 마감일을 가집니다.
 - Task와 Todo는 독립 항목일 수도 있고 Domain 또는 같은 Domain의 Milestone에 속할 수도 있습니다. Milestone을 선택하면 Domain이 자동으로 일치하며, 연결된 업무가 있는 Milestone의 Domain은 임의로 바꿀 수 없습니다.
 - Task/Todo 검색은 제목·ID·태그·사람 Draft·Meta Draft를 함께 찾고, Task는 Domain/Milestone, Todo는 그룹/하위그룹 이름까지 검색합니다. Task는 기본적으로 Domain→Milestone, Todo는 원천의 그룹→하위그룹별로 묶이며 상태와 우선순위 그룹으로 바꿀 수 있습니다. Todo 그룹 계층은 실행 scope인 Domain/Milestone과 독립적입니다. Todo는 원천 화면과 같은 활성 상태(할 일·진행 중)를 기본으로 표시하며, 완료·취소 이력은 `모든 상태` 또는 개별 상태 필터에서 확인할 수 있습니다.
-- 사람 Draft를 고치면 새 immutable revision을 추가하고 이전 Meta Draft는 삭제하지 않은 채 stale로 표시합니다. `Meta Prompt 만들기`는 선택된 Orca bridge worktree에 새 Codex 세션을 만들고 플러그인에 내장된 공개 prompt 계약으로 결과를 생성합니다. 결과가 고정 9개 섹션 계약을 통과하고 실행 중 사람 Draft revision이 바뀌지 않았을 때만 Meta Draft로 저장합니다.
+- 사람 Draft를 고치면 새 immutable revision을 추가하고 이전 Meta Draft는 삭제하지 않은 채 stale로 표시합니다. `Meta Prompt 만들기`는 선택된 Orca bridge worktree에 새 Codex 세션을 만들고 플러그인에 내장된 공개 prompt 계약으로 결과를 생성합니다. Task의 project 관계도 정렬된 context로 전달하며 target locator가 빠진 결과는 9개 H1 구조를 유지한 채 `작업 컨텍스트` 안에 결정적으로 보강합니다. 결과가 고정 9개 섹션 계약을 통과하고 실행 중 사람 Draft revision이 바뀌지 않았을 때만 Meta Draft로 저장합니다.
 - 하나의 Task를 여러 Graph의 Task 노드에 재사용할 수 있습니다. 최신 Meta Draft가 있으면 실행 payload로 사용하고, 없거나 stale이면 현재 사람 Draft를 사용합니다. 제목이나 유효 실행 지시문이 바뀌면 연결된 모든 노드도 함께 갱신됩니다.
-- Task 상세 헤더의 `Task 실행`은 그래프를 만들지 않고도 현재 실행 Prompt를 단건으로 보냅니다. 실행 전에 연결된 Orca 환경, 그 환경의 project·작업 branch·기존 session, AI model, reasoning을 고르며 그래프 run·node claim이나 Task 상태 변경은 만들지 않습니다. 구조화 Workspace Task에 target folder가 없으면 현재 Orca worktree/repository를 추천하고, 사용자가 확인한 경로만 기존 Task project 관계에 CAS로 추가합니다. 로컬 환경 이름은 `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME`으로 지정할 수 있고 저장된 원격 Orca 환경은 대상 갱신 때 자동으로 합쳐집니다.
+- Task 상세 헤더의 `Task 실행`은 그래프를 만들지 않고도 현재 실행 Prompt를 단건으로 보냅니다. 실행 전에 연결된 Orca 환경, 그 환경의 project·작업 branch·기존 session, AI model, reasoning을 고르며 그래프 run·node claim이나 Task 상태 변경은 만들지 않습니다. 구조화 Workspace Task에 target folder가 없으면 현재 Orca worktree/repository를 추천하고, 사용자가 확인한 경로만 기존 Task project 관계에 CAS로 추가합니다. 연결된 target folder와 branch는 단건 실행과 해당 Task를 쓰는 그래프 노드의 기본 추천이 되며, 정확한 기존 Orca worktree가 없으면 실행 전에 차단합니다. 로컬 환경 이름은 `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME`으로 지정할 수 있고 저장된 원격 Orca 환경은 대상 갱신 때 자동으로 합쳐집니다.
 - Todo는 선택적으로 Task에 연결하거나 새 Task로 전환할 수 있습니다. 전환 뒤에도 원래 Todo는 보존되고 Domain·Milestone과 Prompt revision lineage도 새 Task에 복사됩니다.
 - hard delete 대신 Domain/Milestone 보관, 확인 창이 있는 `Task 삭제`(복원 가능한 보관), Todo 취소를 사용합니다. 활성 하위 Milestone·Task·Todo가 남은 Domain이나 Milestone은 보관할 수 없습니다.
 

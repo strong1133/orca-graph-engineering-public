@@ -27,7 +27,7 @@ export function validateWorkTasksBaseUrl(
   options?: { allowInsecureLoopback?: boolean },
 ): string;
 export function workTasksEnvironment(value?: string, localName?: string): string | null;
-export function mapOrcaRepos(value: unknown): Array<Record<string, unknown>>;
+export function mapOrcaRepos(value: unknown, worktreeValue?: unknown): Array<Record<string, unknown>>;
 export function taskProjectInput(project: Record<string, unknown>): Record<string, unknown>;
 export function workTasksClientFromEnvironment(
   environment?: Record<string, string | undefined>,

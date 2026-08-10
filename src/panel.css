@@ -489,6 +489,13 @@ textarea { resize: vertical; min-height: 74px; line-height: 1.45; }
 .registry-project span { display: grid; gap: 3px; min-width: 0; }
 .registry-project code { white-space: normal; overflow-wrap: anywhere; color: var(--muted-foreground); }
 .registry-project small { color: var(--muted-foreground); }
+.registry-project-picker summary { cursor: pointer; margin-bottom: 10px; font-weight: 700; }
+.registry-project-picker .primary { margin-top: 10px; }
+.task-project-list li { display: flex; align-items: end; gap: 12px; }
+.task-project-list li > span { display: grid; min-width: 0; flex: 1; }
+.task-project-branch { display: grid; gap: 4px; min-width: 190px; }
+.task-project-branch span { color: var(--muted-foreground); font-size: 11px; }
+.task-project-branch input { width: 100%; }
 
 .toast { position: fixed; z-index: 40; right: 12px; bottom: 38px; max-width: min(380px, calc(100vw - 24px)); border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; background: var(--popover); box-shadow: 0 10px 30px color-mix(in srgb, #000 24%, transparent); font-size: 11px; }
 
