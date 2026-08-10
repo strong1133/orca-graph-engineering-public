@@ -29,6 +29,18 @@ async function waitFor(child: ChildProcessWithoutNullStreams, output: () => stri
   });
 }
 
+async function waitUntil(predicate: () => boolean, description: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`timed out waiting for ${description}`)), 5_000);
+    const interval = setInterval(() => {
+      if (!predicate()) return;
+      clearTimeout(timeout);
+      clearInterval(interval);
+      resolve();
+    }, 10);
+  });
+}
+
 function graph(version: number) {
   return {
     id: "graph-remote", name: "Remote", summary: "", status: "draft", version,
@@ -222,6 +234,120 @@ describe("bridge structured source boundary", () => {
     const cache = JSON.parse(await readFile(path.join(directory, "source-cache.json"), "utf8"));
     expect(cache.store.activeGraphId).toBe("GRAPH-quick");
     expect(cache.store.graphs.map((item: any) => item.id)).toContain("GRAPH-quick");
+    child.stdin.end();
+  });
+
+  it("creates a Todo Task with CAS and returns its predefined Graph memberships", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "orca-todo-task-bridge-"));
+    cleanup.push(() => rm(directory, { recursive: true, force: true }));
+    const requests: Array<{ method: string; url: string; body?: any }> = [];
+    let bound = false;
+    const worktreeGraph = { ...graph(6), id: "GRAPH-worktree", name: "워크트리 검수" };
+    const snapshotStore = {
+      schemaVersion: 1, activeGraphId: "GRAPH-worktree", graphs: [worktreeGraph], domains: [], milestones: [],
+      tasks: [{
+        id: "TASK-created", title: "원문 유지", prompt: "원문 유지\n둘째 줄", draft: "원문 유지\n둘째 줄",
+        promptRevisions: [], status: "backlog", priority: "high", tags: [], version: 1,
+        createdAt: "2026-08-10T00:00:00Z", updatedAt: "2026-08-10T00:00:00Z",
+      }],
+      todos: [{
+        id: "TODO-roundtrip", title: "원문 유지", notes: "1차 진행중", draft: "원문 유지\n둘째 줄",
+        promptRevisions: [], status: "open", priority: "high", tags: [], taskId: "TASK-created", version: 8,
+        createdAt: "2026-08-10T00:00:00Z", updatedAt: "2026-08-10T00:00:00Z",
+      }],
+    };
+    const server = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
+      requests.push({ method: request.method ?? "", url: request.url ?? "", ...(body ? { body } : {}) });
+      let status = 200;
+      let payload: unknown;
+      if (request.method === "GET" && request.url === "/") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end('<script>window.__HERMES_SESSION_TOKEN__="abcdefghijklmnopqrstuvwxyz012345"</script>');
+        return;
+      }
+      if (request.method === "GET" && request.url?.endsWith("/todos/TODO-roundtrip")) {
+        payload = {
+          item: {
+            id: "TODO-roundtrip", content: "원문 유지\n둘째 줄", memo: "1차 진행중", due_on: null,
+            priority: "high", status: "open", version: bound ? 8 : 7, archived_at: null,
+          },
+          task_binding: bound ? { id: "TASK-created" } : null,
+        };
+      } else if (request.method === "POST" && request.url?.endsWith("/todos/TODO-roundtrip/task")) {
+        expect(body).toEqual({
+          expected_todo_version: 7,
+          idempotency_key: "todo-task-roundtrip",
+          task: {
+            title: "원문 유지\n둘째 줄", description: "1차 진행중", due_on: null, priority: "high",
+            draft: "원문 유지\n둘째 줄",
+          },
+        });
+        bound = true;
+        status = 201;
+        payload = { task: { id: "TASK-created" }, idempotent_replay: false };
+      } else if (request.method === "GET" && request.url?.includes("/tasks?intake_method=all")) {
+        payload = { items: [{
+          id: "TASK-created", title: "원문 유지",
+          graph_memberships: [{ id: "GRAPH-worktree", name: "워크트리 검수", status: "active" }],
+        }] };
+      } else if (request.method === "GET" && request.url === "/orca-graph-source/v1/snapshot") {
+        payload = {
+          contractVersion: 1, source: { id: "workspace", name: `${["under", "joy"].join("")}-workspace` },
+          capabilities: { graphCommit: true, taskMutation: true, todoMutation: true },
+          store: snapshotStore, catalog: { tasks: [], todos: [] },
+        };
+      } else {
+        status = 404;
+        payload = { detail: "not found" };
+      }
+      response.writeHead(status, { "content-type": "application/json" });
+      response.end(JSON.stringify(payload));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    cleanup.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    await Promise.all([
+      writeFile(path.join(directory, "data-source.json"), JSON.stringify({ schemaVersion: 1, mode: "structured", url: `${baseUrl}/` })),
+      writeFile(path.join(directory, "source-cache.json"), JSON.stringify({ schemaVersion: 1, mode: "structured", status: "ready", store: snapshotStore, catalog: [] })),
+      writeFile(path.join(directory, "store.json"), JSON.stringify(snapshotStore)),
+    ]);
+    const child = spawn(process.execPath, [path.join(process.cwd(), "bridge/index.mjs")], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        ORCA_GRAPH_RUNTIME_DIR: directory,
+        ORCA_GRAPH_SKIP_REBUILD: "1",
+        ORCA_GRAPH_WORKSPACE_BASE_URL: baseUrl,
+        ORCA_GRAPH_WORKSPACE_ALLOW_INSECURE_LOOPBACK: "1",
+        [["ORCA", "GRAPH", "WORK", "TASKS", "ENVIRONMENT"].join("_")]: "Hermes",
+        ORCA_CLI_COMMAND: "/usr/bin/false",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    cleanup.push(async () => { if (child.exitCode === null) child.kill(); });
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.stderr.on("data", (chunk) => { output += chunk; });
+    await waitFor(child, () => output, "bridge ready");
+
+    child.stdin.write(frame({ type: "create-todo-task", todoId: "TODO-roundtrip", idempotencyKey: "todo-task-roundtrip" }));
+    await waitUntil(() => requests.some((item) => item.method === "POST" && item.url.endsWith("/todos/TODO-roundtrip/task")), "Todo Task creation");
+    await waitUntil(() => requests.some((item) => item.url === "/orca-graph-source/v1/snapshot"), "post-create source refresh");
+
+    child.stdin.write(frame({ type: "todo-graph-choices", todoId: "TODO-roundtrip" }));
+    await waitUntil(() => requests.some((item) => item.url.includes("/tasks?intake_method=all")), "Task Graph membership lookup");
+    expect(requests.filter((item) => item.url.endsWith("/todos/TODO-roundtrip")).length).toBeGreaterThanOrEqual(2);
+    expect(requests.some((item) => item.url.includes("include_archived=true&limit=500"))).toBe(true);
     child.stdin.end();
   });
 });

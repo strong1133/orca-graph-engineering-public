@@ -185,6 +185,8 @@ export interface LocalTodo {
   dueDate?: string;
   tags: string[];
   taskId?: string;
+  /** Optional archive marker for sources that include archived ToDos. */
+  archivedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -325,6 +327,8 @@ export interface ProjectTarget {
   worktreeId?: string;
   path?: string;
   branch?: string;
+  /** Active Orca worktree for this environment; used when a run leaves the project unselected. */
+  current?: boolean;
 }
 
 export interface BranchTarget {
@@ -816,6 +820,7 @@ export function normalizeGraphStore(
       ...(todo.dueDate ? { dueDate: todo.dueDate } : {}),
       tags: [...(todo.tags ?? [])],
       ...(todo.taskId ? { taskId: todo.taskId } : {}),
+      ...(todo.archivedAt ? { archivedAt: todo.archivedAt } : {}),
       createdAt,
       updatedAt: todo.updatedAt || createdAt,
     });

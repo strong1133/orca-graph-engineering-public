@@ -146,7 +146,9 @@ describe.each([
         todoTitle.value = "검수 Todo";
         todoTitle.dispatchEvent(new Event("change", { bubbles: true }));
       }
-      document.querySelector<HTMLButtonElement>('[data-action="promote-todo"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="create-task-for-todo"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
       expect(document.querySelector('[aria-label="Task 상세"]')).not.toBeNull();
       expect(document.querySelector('[aria-label="Task 관리"]')).toBeNull();
       document.querySelector<HTMLButtonElement>('[data-action="back-to-task-list"]')?.click();
@@ -246,7 +248,7 @@ describe.each([
       const environment = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="environmentId"]');
       expect(environment?.value).toBe("local");
       expect([...(environment?.options ?? [])].map((option) => option.textContent)).toEqual(["jsj1 · 이 Orca", "jsj2"]);
-      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="projectId"]')?.value).toBe("repo:current-project");
+      expect(dialog?.querySelector<HTMLInputElement>('[data-action="toggle-run-project"][data-project-id="repo:current-project"]')?.checked).toBe(true);
       expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="model"]')?.value).toBe("gpt-5.6-sol");
       expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
 
@@ -266,13 +268,9 @@ describe.each([
         rerenderedEnvironment.dispatchEvent(new Event("change", { bubbles: true }));
       }
       dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      expect([...dialog?.querySelectorAll<HTMLOptionElement>('[data-scope="task-run-routing"][data-field="projectId"] option') ?? []]
-        .map((option) => option.textContent)).toEqual(["프로젝트 미지정", "remote-project"]);
-      const remoteProject = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="projectId"]');
-      if (remoteProject) {
-        remoteProject.value = "repo:remote-project";
-        remoteProject.dispatchEvent(new Event("change", { bubbles: true }));
-      }
+      expect([...dialog?.querySelectorAll<HTMLElement>('.run-project-option strong') ?? []]
+        .map((option) => option.textContent)).toEqual(["remote-project"]);
+      dialog?.querySelector<HTMLInputElement>('[data-action="toggle-run-project"][data-project-id="repo:remote-project"]')?.click();
       const targetMode = document.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="targetMode"]');
       if (targetMode) {
         targetMode.value = "session";
@@ -281,6 +279,45 @@ describe.each([
       dialog = document.querySelector<HTMLElement>('[role="dialog"]');
       expect([...dialog?.querySelectorAll<HTMLOptionElement>('[data-scope="task-run-routing"][data-field="sessionId"] option') ?? []]
         .map((option) => option.textContent)).toEqual(["세션 미지정 · 새 세션", "Remote Codex · remote-project"]);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("allows zero or multiple project and worktree selections at run time", async () => {
+    const dom = await mountPanel(wide, ({ targets }) => {
+      targets.projects = [
+        { id: "project-api", name: "API", environmentId: "local", worktreeId: "wt-api", path: "/workspace/api", branch: "main" },
+        { id: "project-web", name: "Web", environmentId: "local", worktreeId: "wt-web", path: "/workspace/web", branch: "release" },
+      ];
+      targets.branches = [
+        { id: "branch-api", branch: "main", environmentId: "local", projectId: "project-api", worktreeId: "wt-api", path: "/workspace/api" },
+        { id: "branch-web", branch: "release", environmentId: "local", projectId: "project-web", worktreeId: "wt-web", path: "/workspace/web" },
+      ];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"]')?.click();
+
+      let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.querySelectorAll('[data-action="toggle-run-project"]:checked')).toHaveLength(0);
+      expect(dialog?.textContent).toContain("프로젝트 선택 안 함");
+      expect(dialog?.textContent).toContain("현재 Orca 컨텍스트");
+      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
+
+      dialog?.querySelector<HTMLInputElement>('[data-project-id="project-api"]')?.click();
+      document.querySelector<HTMLInputElement>('[data-project-id="project-web"]')?.click();
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.querySelectorAll('[data-action="toggle-run-project"]:checked')).toHaveLength(2);
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-mode"]')).not.toBeNull();
+
+      dialog?.querySelector<HTMLInputElement>('[data-project-id="project-api"]')?.click();
+      document.querySelector<HTMLInputElement>('[data-project-id="project-web"]')?.click();
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.querySelectorAll('[data-action="toggle-run-project"]:checked')).toHaveLength(0);
+      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
     } finally {
       dom.window.close();
     }
@@ -324,8 +361,8 @@ describe.each([
 
       const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
       expect(dialog?.querySelector<HTMLSelectElement>('[data-field="environmentId"]')?.value).toBe("local");
-      expect(dialog?.querySelector<HTMLSelectElement>('[data-field="projectId"]')?.value).toBe("repo-front");
-      expect(dialog?.querySelector<HTMLSelectElement>('[data-field="branch"]')?.value).toBe("feature/task");
+      expect([...dialog?.querySelectorAll<HTMLInputElement>('[data-action="toggle-run-project"]:checked') ?? []].map((input) => input.dataset.projectId)).toEqual(["repo-api", "repo-front"]);
+      expect([...dialog?.querySelectorAll<HTMLSelectElement>('[data-scope="task-run-project-routing"][data-field="branch"]') ?? []].map((select) => select.value)).toEqual(["feature/task", "feature/task"]);
       expect(dialog?.textContent).not.toContain("새 세션을 만들 프로젝트를 선택하십시오");
     } finally {
       dom.window.close();
@@ -394,22 +431,19 @@ describe.each([
     }
   });
 
-  it("opens Todo and Task quick-run buttons on an Orca worktree", async () => {
-    const dom = await mountPanel(wide, ({ store, targets }) => {
-      store.bridgeWorkspace = "current-project";
-      store.todos = [{
-        id: "todo-quick-run", title: "빠른 실행 Todo", notes: "", draft: "Todo 작업 실행",
-        promptRevisions: [], status: "open", priority: "medium", tags: [],
-        createdAt: "2026-08-10T00:00:00.000Z", updatedAt: "2026-08-10T00:00:00.000Z",
-      }];
-      targets.projects = [{
-        id: "repo:current-project", name: "current-project", environmentId: "local",
-        worktreeId: "worktree-current-project", branch: "refs/heads/feature/quick-run",
-      }];
-      targets.branches = [{
-        id: "branch:quick-run", branch: "refs/heads/feature/quick-run", environmentId: "local",
-        projectId: "repo:current-project", repoId: "repo-current-project", worktreeId: "worktree-current-project",
-      }];
+  it("creates or opens a Todo Task and selects its predefined worktree Graph", async () => {
+    const dom = await mountPanel(wide, ({ store }) => {
+      const now = "2026-08-10T00:00:00.000Z";
+      store.todos = [
+        {
+          id: "todo-unbound", title: "Task 없는 ToDo", notes: "1차 진행중", draft: "Task 생성 대상",
+          promptRevisions: [], status: "open", priority: "medium", tags: [], createdAt: now, updatedAt: now,
+        },
+        {
+          id: "todo-bound", title: "Graph 연결 ToDo", notes: "정지희 1차 후 정석진 작업 예정", draft: "Graph 선택 대상",
+          promptRevisions: [], status: "open", priority: "medium", tags: [], taskId: "task-design", createdAt: now, updatedAt: now,
+        },
+      ];
     });
     try {
       const { document } = dom.window;
@@ -417,22 +451,47 @@ describe.each([
       expect(document.querySelector<HTMLButtonElement>('[aria-label^="Task 실행"]')).not.toBeNull();
 
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
-      const listQuickRun = document.querySelector<HTMLButtonElement>('[aria-label^="Todo 실행"]');
-      expect(listQuickRun).not.toBeNull();
-      document.querySelector<HTMLButtonElement>('[data-action="select-local-todo"]')?.click();
-      const detailQuickRun = document.querySelector<HTMLButtonElement>('.work-inspector [data-action="open-todo-run"]');
-      expect(detailQuickRun?.textContent).toContain("실행");
-      detailQuickRun?.click();
+      const manager = document.querySelector<HTMLElement>('[aria-label="Todo 관리"]');
+      expect(manager?.querySelector('[placeholder]')).toBeNull();
+      expect(manager?.textContent).toContain("1차 진행중");
+      expect(manager?.textContent).toContain("정지희 1차 후 정석진 작업 예정");
+      expect(manager?.querySelector<HTMLButtonElement>('[data-action="create-task-for-todo"][data-id="todo-unbound"]')?.textContent).toContain("+ Task 생성");
+      const disabledGraph = manager?.querySelector<HTMLButtonElement>('[data-action="choose-todo-graph"][data-id="todo-unbound"]');
+      expect(disabledGraph?.disabled).toBe(true);
+      expect(disabledGraph?.title).toBe("먼저 Task를 생성하십시오");
+      expect(manager?.querySelector<HTMLButtonElement>('[data-action="open-linked-task"][data-id="task-design"]')?.textContent).toContain("Task 열기");
 
-      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      expect(dialog?.textContent).toContain("Task 실행");
-      expect(dialog?.textContent).toContain("프로젝트 · 브랜치 · Orca 세션");
-      expect(document.querySelector<HTMLSelectElement>('[data-scope="local-todo"][data-field="taskId"]')?.value).not.toBe("");
-      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="projectId"]')?.value)
-        .toBe("repo:current-project");
-      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="branch"]')?.value)
-        .toBe("feature/quick-run");
-      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
+      manager?.querySelector<HTMLButtonElement>('[data-action="choose-todo-graph"][data-id="todo-bound"]')?.click();
+      let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).toContain("워크트리 Graph 선택");
+      expect(dialog?.textContent).toContain("Orca 그래프 엔지니어링");
+      dialog?.querySelector<HTMLButtonElement>('[data-action="select-todo-graph"]')?.click();
+      expect(document.querySelector('[data-canvas]')).not.toBeNull();
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("keeps an archived Todo comment visible and read-only without placeholders", async () => {
+    const dom = await mountPanel(wide, ({ store }) => {
+      const now = "2026-08-10T00:00:00.000Z";
+      store.todos = [{
+        id: "todo-archived", title: "보관 ToDo", notes: "정지희 1차 후 정석진 작업 예정", draft: "보관 항목",
+        promptRevisions: [], status: "open", priority: "medium", tags: [], archivedAt: now, createdAt: now, updatedAt: now,
+      }];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
+      const manager = document.querySelector<HTMLElement>('[aria-label="Todo 관리"]');
+      expect(manager?.textContent).toContain("정지희 1차 후 정석진 작업 예정");
+      expect(manager?.querySelector('[placeholder]')).toBeNull();
+      expect(manager?.querySelector<HTMLButtonElement>('[data-action="select-local-todo"][aria-label="코멘트 보기"]')?.disabled).toBe(true);
+      manager?.querySelector<HTMLButtonElement>('[data-action="select-local-todo"][data-id="todo-archived"]:not(.todo-card-comment)')?.click();
+      const comment = document.querySelector<HTMLTextAreaElement>('[data-scope="local-todo"][data-field="notes"]');
+      expect(comment?.value).toBe("정지희 1차 후 정석진 작업 예정");
+      expect(comment?.disabled).toBe(true);
+      expect(comment?.hasAttribute("placeholder")).toBe(false);
     } finally {
       dom.window.close();
     }
@@ -918,7 +977,7 @@ describe.each([
       document.querySelector<HTMLButtonElement>('.topbar [data-action="open-run"]')?.click();
       let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
       expect(dialog?.textContent).toContain("현재 프로젝트 추천");
-      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="run-routing"][data-field="projectId"]')?.value).toBe("repo:current-project");
+      expect(dialog?.querySelector<HTMLInputElement>('[data-action="toggle-run-project"][data-project-id="repo:current-project"]')?.checked).toBe(true);
       expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="run-routing"][data-field="model"]')?.value).toBe("gpt-5.6-sol");
       expect(dialog?.querySelectorAll(".run-route-row")).toHaveLength(0);
       expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="run-condition"]')).toBeNull();
@@ -1375,7 +1434,7 @@ describe("work process and branch execution surface", () => {
       expect(document.querySelector<HTMLSelectElement>('[data-scope="run-process"][data-field="startNewRun"]')?.value).toBe("resume");
       expect(document.querySelector<HTMLTextAreaElement>('[data-scope="run-process"][data-field="inputPrompt"]')?.value).toBe("  고객 A\n계약서 검토  ");
       expect(document.querySelector<HTMLTextAreaElement>('[data-scope="run-process"][data-field="inputPrompt"]')?.readOnly).toBe(true);
-      const branch = document.querySelector<HTMLSelectElement>('[data-scope="run-routing"][data-field="branch"]');
+      const branch = document.querySelector<HTMLSelectElement>('[data-scope="run-project-routing"][data-field="branch"]');
       expect([...branch!.options].map((item) => item.textContent)).toContain("feature/review · /feature");
       const mode = document.querySelector<HTMLSelectElement>('[data-scope="run-process"][data-field="startNewRun"]');
       if (mode) { mode.value = "new"; mode.dispatchEvent(new Event("change", { bubbles: true })); }
@@ -1525,7 +1584,7 @@ describe("structured source work editing", () => {
     }
   });
 
-  it("creates or reuses a Task before opening Todo quick run", async () => {
+  it("creates or reuses a Task and opens its detail without opening a run dialog", async () => {
     let preparedStore: Record<string, any> | null = null;
     const dom = await mountPanel(true, (bootstrap) => {
       const now = "2026-08-10T00:00:00.000Z";
@@ -1562,7 +1621,7 @@ describe("structured source work editing", () => {
         value: vi.fn(async (_url: string, init: RequestInit) => {
           const request = JSON.parse(String(init.body));
           requests.push(request);
-          const value = request.type === "prepare-todo-quick-run"
+          const value = request.type === "create-todo-task"
             ? { taskId: "TASK-from-todo", store: preparedStore }
             : request.type === "task-project-context" ? {
                 taskId: "TASK-from-todo", taskVersion: 1, projects: [], registry: [], recommended: [],
@@ -1573,15 +1632,94 @@ describe("structured source work editing", () => {
       });
       const { document } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
-      document.querySelector<HTMLButtonElement>('[data-action="open-todo-run"][data-id="TODO-quick"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="create-task-for-todo"][data-id="TODO-quick"]')?.click();
       await new Promise((resolve) => setTimeout(resolve, 0));
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      const prepare = requests.find((request) => request.type === "prepare-todo-quick-run");
-      expect(prepare).toMatchObject({ type: "prepare-todo-quick-run", todoId: "TODO-quick" });
-      expect(prepare.idempotencyKey).toBe("todo-worktree-00000000-0000-4000-8000-000000000000");
-      expect(document.querySelector<HTMLElement>('[role="dialog"]')?.textContent).toContain("Task 실행");
-      expect(document.querySelector<HTMLElement>('[role="dialog"]')?.textContent).toContain("TASK-from-todo");
+      const prepare = requests.find((request) => request.type === "create-todo-task");
+      expect(prepare).toMatchObject({ type: "create-todo-task", todoId: "TODO-quick" });
+      expect(prepare.idempotencyKey).toBe("todo-task-00000000-0000-4000-8000-000000000000");
+      expect(document.querySelector<HTMLElement>('[role="dialog"]')).toBeNull();
+      expect(document.querySelector<HTMLElement>('[aria-label="Task 상세"]')?.textContent).toContain("TASK-from-todo");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("queries the linked Task memberships before showing the worktree Graph picker", async () => {
+    let refreshedStore: Record<string, any> | null = null;
+    const dom = await mountPanel(true, (bootstrap) => {
+      const now = "2026-08-10T00:00:00.000Z";
+      bootstrap.store.todos = [{
+        id: "TODO-graph", version: 3, title: "Graph 선택", notes: "1차 진행중", draft: "Graph 선택",
+        promptRevisions: [], status: "open", priority: "medium", tags: [], taskId: "task-design", createdAt: now, updatedAt: now,
+      }];
+      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
+        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
+        status: "ready", source: { id: "workspace", name: `${["under", "joy"].join("")}-workspace` }, catalog: [],
+        capabilities: { taskMutation: true, todoMutation: true },
+      };
+      refreshedStore = structuredClone(bootstrap.store);
+    });
+    try {
+      const requests: any[] = [];
+      Object.defineProperty(dom.window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          const request = JSON.parse(String(init.body));
+          requests.push(request);
+          const value = request.type === "todo-graph-choices" ? {
+            taskId: "task-design", taskTitle: "요구사항 설계",
+            graphs: [{ id: "graph-main", name: "MR 코드리뷰", status: "active" }],
+            store: refreshedStore,
+          } : undefined;
+          return Response.json({ ok: true, value });
+        }),
+      });
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="choose-todo-graph"][data-id="TODO-graph"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(requests).toContainEqual({ type: "todo-graph-choices", todoId: "TODO-graph" });
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).toContain("워크트리 Graph 선택");
+      expect(dialog?.textContent).toContain("MR 코드리뷰");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("explains that a linked Task must be added to a Graph before worktree selection", async () => {
+    const dom = await mountPanel(true, (bootstrap) => {
+      const now = "2026-08-10T00:00:00.000Z";
+      bootstrap.store.todos = [{
+        id: "TODO-no-graph", version: 2, title: "Graph 없는 Task", notes: "", draft: "Graph 연결 필요",
+        promptRevisions: [], status: "open", priority: "medium", tags: [], taskId: "task-design", createdAt: now, updatedAt: now,
+      }];
+      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
+        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
+        status: "ready", source: { id: "workspace", name: `${["under", "joy"].join("")}-workspace` }, catalog: [],
+        capabilities: { taskMutation: true, todoMutation: true },
+      };
+    }, (window) => {
+      Object.defineProperty(window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          const request = JSON.parse(String(init.body));
+          const value = request.type === "todo-graph-choices"
+            ? { taskId: "task-design", taskTitle: "요구사항 설계", graphs: [] }
+            : undefined;
+          return Response.json({ ok: true, value });
+        }),
+      });
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="choose-todo-graph"][data-id="TODO-no-graph"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(document.querySelector<HTMLElement>('[role="dialog"]')).toBeNull();
+      expect(document.querySelector<HTMLElement>(".toast")?.textContent).toContain("Task를 Graph에 먼저 추가하십시오");
     } finally {
       dom.window.close();
     }
@@ -1867,18 +2005,20 @@ describe("structured source work editing", () => {
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
       const subgroup = document.querySelector<HTMLInputElement>('[data-scope="local-todo"][data-field="subgroupName"]');
       expect(subgroup?.value).toBe("Review");
-      if (subgroup) {
-        subgroup.value = "Approval";
-        subgroup.dispatchEvent(new Event("change", { bubbles: true }));
+      const comment = document.querySelector<HTMLTextAreaElement>('[data-scope="local-todo"][data-field="notes"]');
+      if (comment) {
+        comment.value = "정지희 1차 후 정석진 작업 예정";
+        comment.dispatchEvent(new Event("change", { bubbles: true }));
       }
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(requests.find((request) => request.type === "mutate-source" && request.mutation?.kind === "todo")).toMatchObject({
         type: "mutate-source",
         mutation: {
           kind: "todo", expectedVersion: 6, relatedVersions: { "task-source": 4 },
-          item: { id: "todo-source", groupName: "Delivery", subgroupName: "Approval" },
+          item: { id: "todo-source", groupName: "Delivery", subgroupName: "Review", notes: "정지희 1차 후 정석진 작업 예정" },
         },
       });
+      expect(document.querySelector('[aria-label="Todo 관리"]')?.textContent).toContain("정지희 1차 후 정석진 작업 예정");
     } finally {
       dom.window.close();
     }

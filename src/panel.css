@@ -448,6 +448,19 @@ textarea { resize: vertical; min-height: 74px; line-height: 1.45; }
 .run-defaults { border: 1px solid var(--border); border-radius: 9px; padding: 9px; background: color-mix(in srgb, var(--card) 58%, transparent); }
 .run-defaults .section-title { justify-content: space-between; }
 .run-routing-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.run-project-picker { display: grid; gap: 8px; }
+.run-project-picker > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.run-project-picker > header > div { display: flex; min-width: 0; align-items: baseline; gap: 7px; }
+.run-project-picker > header > div span { color: var(--muted-foreground); }
+.run-project-options { display: grid; max-height: 220px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; overflow-y: auto; padding: 1px; }
+.run-project-option { display: flex; min-width: 0; align-items: center; gap: 7px; border: 1px solid var(--border); border-radius: 8px; padding: 7px 8px; background: var(--card); cursor: pointer; }
+.run-project-option.selected { border-color: color-mix(in srgb, var(--primary) 66%, var(--border)); background: color-mix(in srgb, var(--accent) 58%, var(--card)); }
+.run-project-option input { width: auto; flex: 0 0 auto; accent-color: var(--primary); }
+.run-project-option > span:nth-of-type(1) { display: grid; min-width: 0; flex: 1; gap: 2px; }
+.run-project-option strong, .run-project-option small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-project-option small { color: var(--muted-foreground); }
+.run-context-fallback { display: grid; gap: 3px; border: 1px dashed var(--border); border-radius: 8px; padding: 10px; color: var(--muted-foreground); }
+.run-context-fallback strong { color: var(--foreground); }
 .run-route-effective { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; border-radius: 7px; padding: 7px 9px; background: var(--secondary); font-size: 12px; }
 .run-route-effective strong, .run-route-effective span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-route-effective span { color: var(--muted-foreground); }
@@ -519,6 +532,16 @@ textarea { resize: vertical; min-height: 74px; line-height: 1.45; }
 .task-project-run-card header { display: flex; min-width: 0; align-items: center; gap: 6px; }
 .task-project-run-card header strong { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-project-run-card code, .task-project-run-card small { min-width: 0; overflow: hidden; color: var(--muted-foreground); text-overflow: ellipsis; white-space: nowrap; }
+.todo-graph-picker .modal-head > span { display: grid; min-width: 0; gap: 2px; }
+.todo-graph-picker .modal-head small { overflow: hidden; color: var(--muted-foreground); text-overflow: ellipsis; white-space: nowrap; }
+.todo-graph-grid { display: grid; gap: 8px; }
+.todo-graph-card { display: grid; width: 100%; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 10px; border: 1px solid var(--border); border-radius: 10px; padding: 11px; background: var(--card); text-align: left; }
+.todo-graph-card:hover { border-color: var(--primary); background: color-mix(in srgb, var(--accent) 56%, var(--card)); }
+.todo-graph-card > span:nth-child(2) { display: grid; min-width: 0; gap: 2px; }
+.todo-graph-card strong, .todo-graph-card small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todo-graph-card small { color: var(--muted-foreground); }
+.todo-graph-card > b { color: var(--primary); white-space: nowrap; }
+.todo-graph-symbol { display: inline-flex; width: 34px; height: 34px; align-items: center; justify-content: center; border-radius: 999px; background: var(--accent); color: var(--primary); }
 .task-run-target-summary { display: grid; gap: 5px; margin-top: 9px; border-top: 1px solid var(--border); padding-top: 8px; font-size: 12px; }
 .task-run-target-summary > span { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
 .task-run-target-summary code { min-width: 0; overflow: hidden; color: var(--muted-foreground); text-overflow: ellipsis; white-space: nowrap; }
@@ -602,6 +625,14 @@ textarea { resize: vertical; min-height: 74px; line-height: 1.45; }
 .work-group-toggle .work-group-chevron { width: 10px; color: var(--foreground); font-size: 12px; }
 .work-card-row { display: grid; grid-template-columns: minmax(0, 1fr) 38px; border-bottom: 1px solid var(--border); }
 .work-card-row:last-child { border-bottom: 0; }
+.work-card-row.todo-card-row { grid-template-columns: minmax(0, 1fr) minmax(126px, auto); }
+.todo-card-actions { display: flex; min-width: 126px; flex-direction: column; justify-content: center; gap: 5px; border-left: 1px solid var(--border); padding: 7px; }
+.todo-card-actions button { width: 100%; min-height: 28px; padding: 4px 7px; white-space: nowrap; }
+.todo-card-actions small { color: var(--muted-foreground); text-align: center; }
+.todo-card-comment { display: flex; grid-column: 1 / -1; min-width: 0; align-items: flex-start; gap: 7px; border-width: 1px 0 0; border-radius: 0; border-color: var(--border); padding: 8px 11px; background: color-mix(in srgb, var(--secondary) 58%, transparent); color: var(--muted-foreground); text-align: left; }
+.todo-card-comment span:last-child { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.todo-primary-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.todo-primary-actions .help { grid-column: 1 / -1; margin: 0; }
 .work-group .work-card { border: 0; border-radius: 0; margin: 0; }
 .quick-worktree-run { border-width: 0 0 0 1px; border-radius: 0; border-color: var(--border); background: color-mix(in srgb, var(--accent) 38%, var(--card)); color: var(--primary); font-size: 17px; }
 .quick-worktree-run:hover { background: color-mix(in srgb, var(--primary) 16%, var(--card)); }
@@ -755,7 +786,14 @@ textarea { resize: vertical; min-height: 74px; line-height: 1.45; }
   .work-controls { grid-template-columns: 1fr 1fr; }
   .work-controls .graph-search { grid-column: 1 / -1; }
   .work-manager-body { grid-template-columns: 1fr; grid-template-rows: minmax(150px, .8fr) minmax(220px, 1.2fr); }
+  .run-project-options { grid-template-columns: 1fr; }
   .work-list { border-right: 0; border-bottom: 1px solid var(--border); }
+  .work-card-row.todo-card-row { grid-template-columns: 1fr; }
+  .todo-card-actions { min-width: 0; flex-direction: row; border-top: 1px solid var(--border); border-left: 0; }
+  .todo-card-actions small { align-self: center; }
+  .todo-card-comment { grid-column: 1; }
+  .todo-graph-card { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .todo-graph-card > b { display: none; }
   .task-list-only .work-list { border-bottom: 0; }
   .execution-target { grid-template-columns: auto minmax(0, 1fr); }
   .execution-target span:nth-last-child(-n+3) { grid-column: 2; }

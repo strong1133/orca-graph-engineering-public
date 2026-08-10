@@ -434,21 +434,21 @@ async function setTaskProjectBranch(taskId, projectId, locator, branchValue) {
   return { context: await taskProjectContext(taskId), store: refreshed.store };
 }
 
-async function prepareStructuredTodoQuickRun(todoId, idempotencyKey) {
+async function createStructuredTaskForTodo(todoId, idempotencyKey) {
   const config = await readDataSourceConfig();
-  if (config.mode !== "structured") throw new Error("Todo quick Task creation requires a structured data source");
+  if (config.mode !== "structured") throw new Error("Todo Task creation requires a structured data source");
   const client = requireWorkTasks();
   const detail = await client.get(`/todos/${encodeURIComponent(todoId)}`);
   const todo = detail.item;
   if (!todo?.id) throw new Error(`todo not found: ${todoId}`);
-  if (todo.archived_at) throw new Error(`archived todo cannot be executed: ${todoId}`);
-  if (["done", "cancelled"].includes(todo.status)) throw new Error(`closed todo cannot be executed: ${todoId}`);
+  if (todo.archived_at) throw new Error(`archived Todo cannot create a Task: ${todoId}`);
+  if (["done", "cancelled"].includes(todo.status)) throw new Error(`closed Todo cannot create a Task: ${todoId}`);
 
   let taskId = detail.task_binding?.id ? String(detail.task_binding.id) : "";
   let idempotentReplay = true;
   if (!taskId) {
     const replayKey = String(idempotencyKey || "").trim();
-    if (!replayKey || replayKey.length > 200) throw new Error("Todo quick-run idempotency key is invalid");
+    if (!replayKey || replayKey.length > 200) throw new Error("Todo Task creation idempotency key is invalid");
     try {
       const created = await client.post(`/todos/${encodeURIComponent(todoId)}/task`, {
         expected_todo_version: Number(todo.version),
@@ -464,9 +464,31 @@ async function prepareStructuredTodoQuickRun(todoId, idempotencyKey) {
       throw error;
     }
   }
-  if (!taskId) throw new Error(`Todo quick Task response did not include a Task id: ${todoId}`);
+  if (!taskId) throw new Error(`Todo Task creation response did not include a Task id: ${todoId}`);
   const refreshed = await refreshConfiguredDataSource(config);
   return { todoId, taskId, idempotentReplay, store: refreshed.store };
+}
+
+async function structuredTodoGraphChoices(todoId) {
+  const config = await readDataSourceConfig();
+  if (config.mode !== "structured") throw new Error("Todo Graph choices require a structured data source");
+  const client = requireWorkTasks();
+  const detail = await client.get(`/todos/${encodeURIComponent(todoId)}`);
+  const todo = detail.item;
+  if (!todo?.id) throw new Error(`todo not found: ${todoId}`);
+  if (todo.archived_at) throw new Error(`archived todo is read-only: ${todoId}`);
+  const taskId = detail.task_binding?.id ? String(detail.task_binding.id) : "";
+  if (!taskId) return { todoId, taskId: null, taskTitle: null, graphs: [] };
+  const listed = await client.get("/tasks?intake_method=all&include_archived=true&limit=500");
+  const task = (listed.items ?? []).find((item) => String(item.id) === taskId);
+  if (!task) throw new Error(`bound Task is unavailable: ${taskId}`);
+  const graphs = (Array.isArray(task.graph_memberships) ? task.graph_memberships : []).map((graph) => ({
+    id: String(graph.id),
+    name: String(graph.name || graph.id),
+    status: String(graph.status || "draft"),
+  }));
+  const refreshed = await refreshConfiguredDataSource(config, graphs[0]?.id);
+  return { todoId, taskId, taskTitle: String(task.title || taskId), graphs, store: refreshed.store };
 }
 
 async function enrichWorkProcessSource(cache) {
@@ -931,6 +953,7 @@ async function refreshEnvironmentTargets(environment) {
   ]);
   const rawProjects = Array.isArray(projectResult.projects) ? projectResult.projects : [];
   const worktrees = Array.isArray(worktreeResult.worktrees) ? worktreeResult.worktrees : [];
+  const activeWorktree = worktrees.find((worktree) => worktree.isActive && !worktree.isArchived);
   const worktreeByRepo = new Map();
   for (const worktree of worktrees) {
     const current = worktreeByRepo.get(worktree.repoId);
@@ -947,6 +970,7 @@ async function refreshEnvironmentTargets(environment) {
       ...(worktree?.worktreeId ? { worktreeId: worktree.worktreeId } : {}),
       ...(worktree?.path ? { path: worktree.path } : {}),
       ...(worktree?.branch ? { branch: worktree.branch } : {}),
+      ...(activeWorktree?.worktreeId && worktree?.worktreeId === activeWorktree.worktreeId ? { current: true } : {}),
     };
   });
   const projectByRepo = new Map();
@@ -1405,7 +1429,7 @@ function projectMatchesTaskTarget(project, target, targets, environmentId) {
 function taskProjectExecutionNode(store, graph, node, targets, targetOverride = null) {
   if (!node?.task?.id) return node;
   const task = (store.tasks ?? []).find((item) => item.id === node.task.id) ?? node.task;
-  const projects = targetOverride ? [targetOverride] : orderedTaskProjects(task);
+  const projects = Array.isArray(targetOverride) ? targetOverride : targetOverride ? [targetOverride] : orderedTaskProjects(task);
   if (!projects.length) return node;
   const enriched = { ...node, task: { ...node.task, projects } };
   const target = projects.find((project) => project.role === "target" && project.locatorKind === "folder");
@@ -1489,12 +1513,16 @@ function resolveTaskRoute(graph, node, targets) {
     }
     return { mode: "existing-session", routing, session: referencedSession, model, ...environment };
   }
-  const projectId = routing.projectId || referencedSession?.projectId;
+  const availableProjects = targets.projects.filter((item) => targetEnvironmentId(item) === environment.environmentId && item.worktreeId);
+  const currentProject = availableProjects.find((item) => item.current)
+    ?? (availableProjects.length === 1 ? availableProjects[0] : null);
+  const projectId = routing.projectId || referencedSession?.projectId || currentProject?.id;
   const project = targets.projects.find((item) => item.id === projectId && targetEnvironmentId(item) === environment.environmentId);
   if (!project?.worktreeId) {
-    const target = routing.projectId || (routing.sessionId ? `session fallback ${routing.sessionId}` : "unset");
-    throw new Error(`project has no available worktree: ${target}`);
+    const target = routing.projectId || (routing.sessionId ? `session fallback ${routing.sessionId}` : "current Orca context");
+    throw new Error(`project has no available worktree: ${target}; select a project or activate an Orca worktree on this machine`);
   }
+  if (!routing.projectId) routing.projectId = project.id;
   let executionProject = project;
   if (routing.branch) {
     const branch = (targets.branches ?? []).find((item) =>
@@ -2453,13 +2481,16 @@ function runtimeExecutionTarget(routingValue, targets, { id, label, locator } = 
   const session = routing.sessionId
     ? targets.sessions.find((item) => item.id === routing.sessionId && targetEnvironmentId(item) === environmentId)
     : null;
-  const projectId = routing.projectId || session?.projectId;
+  const availableProjects = targets.projects.filter((item) => targetEnvironmentId(item) === environmentId && item.worktreeId);
+  const fallbackProject = availableProjects.find((item) => item.current)
+    ?? (availableProjects.length === 1 ? availableProjects[0] : null);
+  const projectId = routing.projectId || session?.projectId || fallbackProject?.id;
   const project = projectId
     ? targets.projects.find((item) => item.id === projectId && targetEnvironmentId(item) === environmentId)
     : null;
   return {
     id: id || `target-${crypto.randomUUID().slice(0, 8)}`,
-    label: label || project?.name || session?.title || "통합 실행",
+    label: label || project?.name || session?.title || "현재 Orca 컨텍스트",
     status: "queued",
     environmentId,
     ...(projectId ? { projectId } : {}),
@@ -2593,7 +2624,12 @@ function scheduleRuntimeExecution(record, job) {
 async function startWorkItemExecution(message, itemKind) {
   const itemId = String(itemKind === "task" ? message.taskId : message.todoId || "");
   const config = await readDataSourceConfig();
-  const [store, targets] = await Promise.all([readWorkingStore(config), readTargets()]);
+  const requestedRouting = standaloneRouting(message.routing);
+  const targetsPromise = !requestedRouting.projectId && !requestedRouting.sessionId
+    && !(Array.isArray(message.projectSessions) && message.projectSessions.length)
+    ? refreshTargets()
+    : readTargets();
+  const [store, targets] = await Promise.all([readWorkingStore(config), targetsPromise]);
   const item = (itemKind === "task" ? store.tasks : store.todos)?.find((candidate) => candidate.id === itemId);
   if (!item) throw new Error(`${itemKind} not found: ${itemId}`);
   const executionMode = itemKind === "task" && message.executionMode === "per_project" ? "per_project" : "single_session";
@@ -2626,7 +2662,7 @@ async function startWorkItemExecution(message, itemKind) {
           ...(event.sessionTitle ? { sessionTitle: event.sessionTitle } : {}),
           ...(event.error ? { error: event.error } : {}),
         });
-      })
+      }, targets)
     : runTodoThroughQuickTask(itemId, message.routing, false, message.idempotencyKey, async (event) => {
         await setRuntimeExecutionTarget(record.id, event.index, event.status, {
           ...(event.sessionId ? { sessionId: event.sessionId } : {}),
@@ -2640,7 +2676,12 @@ async function startWorkItemExecution(message, itemKind) {
 async function startGraphExecution(message) {
   const graphId = String(message.graphId || "");
   const config = await readDataSourceConfig();
-  const [store, targets] = await Promise.all([readWorkingStore(config), readTargets()]);
+  const requestedRouting = standaloneRouting(message.routing);
+  const targetsPromise = !requestedRouting.projectId && !requestedRouting.sessionId
+    && !(Array.isArray(message.projectSessions) && message.projectSessions.length)
+    ? refreshTargets()
+    : readTargets();
+  const [store, targets] = await Promise.all([readWorkingStore(config), targetsPromise]);
   const graph = store.graphs.find((item) => item.id === graphId);
   if (!graph) throw new Error(`graph not found: ${graphId}`);
   const executionMode = message.executionMode === "per_project" ? "per_project" : "single_session";
@@ -2696,14 +2737,20 @@ function standaloneProjectSessions(value) {
   });
 }
 
-async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun, executionMode = "single_session", requestedProjectSessions = [], onProgress = null) {
+async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun, executionMode = "single_session", requestedProjectSessions = [], onProgress = null, executionTargets = null) {
   if (!["task", "todo"].includes(itemKind)) throw new Error(`unsupported standalone work item kind: ${itemKind}`);
   if (!["single_session", "per_project"].includes(executionMode)) throw new Error(`unsupported standalone execution mode: ${executionMode}`);
   if (itemKind !== "task" && executionMode !== "single_session") throw new Error("per-project execution is only available for Tasks");
+  const routing = standaloneRouting(requestedRouting);
   const dataSourceConfig = await readDataSourceConfig();
   const [store, targets] = await Promise.all([
     readWorkingStore(dataSourceConfig),
-    readTargets(),
+    executionTargets
+      ? Promise.resolve(executionTargets)
+      : !routing.projectId && !routing.sessionId && !dryRun
+        && !(Array.isArray(requestedProjectSessions) && requestedProjectSessions.length)
+        ? refreshTargets()
+        : readTargets(),
   ]);
   const collection = itemKind === "task" ? store.tasks : store.todos;
   const item = (collection ?? []).find((candidate) => candidate.id === itemId);
@@ -2714,7 +2761,6 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
   if (!prompt.trim()) throw new Error(`${itemKind} has no executable prompt: ${itemId}`);
   if (prompt.length > 500_000) throw new Error(`${itemKind} prompt is too large: ${itemId}`);
 
-  const routing = standaloneRouting(requestedRouting);
   const graph = { id: `standalone:${itemKind}:${item.id}`, name: `${itemKind === "task" ? "Task" : "Todo"} 단건 실행`, defaults: routing };
   const node = {
     id: `standalone:${itemKind}:${item.id}`,
@@ -2732,24 +2778,33 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
     ? orderedTaskProjects(item).filter((project) => project.role === "target" && project.locatorKind === "folder")
     : [];
   const perProject = executionMode === "per_project";
+  const sessions = itemKind === "task" ? standaloneProjectSessions(requestedProjectSessions) : [];
+  const targetByLocator = new Map(targetProjects.map((project) => [project.locator, project]));
+  const selectedProjectContexts = sessions.map((session, index) => {
+    const projectRouting = session.routing;
+    const environmentId = projectRouting.environmentId
+      || targets.environments?.find((environment) => environment.local)?.id
+      || "local";
+    const selectedProject = targets.projects.find((target) => target.id === projectRouting.projectId
+      && targetEnvironmentId(target) === environmentId);
+    const project = targetByLocator.get(session.locator) ?? {
+      id: `runtime-target:${index + 1}`,
+      role: "target",
+      locatorKind: "folder",
+      locator: session.locator,
+      label: selectedProject?.name || path.basename(session.locator),
+      ...(projectRouting.branch ? { branch: projectRouting.branch } : {}),
+      position: index,
+    };
+    if (!selectedProject || !projectMatchesTaskTarget(selectedProject, project, targets, environmentId)) {
+      throw new Error(`project session does not match the Task target path: ${project.locator}`);
+    }
+    return { project, projectRouting };
+  });
   let executions;
   if (perProject) {
-    if (targetProjects.length < 2) throw new Error("per-project execution requires at least two Task target projects");
-    const sessions = standaloneProjectSessions(requestedProjectSessions);
-    const sessionByLocator = new Map(sessions.map((session) => [session.locator, session]));
-    if (sessions.length !== targetProjects.length || targetProjects.some((project) => !sessionByLocator.has(project.locator))) {
-      throw new Error("project sessions must match the Task target projects exactly");
-    }
-    executions = targetProjects.map((project, index) => {
-      const projectRouting = sessionByLocator.get(project.locator).routing;
-      const environmentId = projectRouting.environmentId
-        || targets.environments?.find((environment) => environment.local)?.id
-        || "local";
-      const selectedProject = targets.projects.find((target) => target.id === projectRouting.projectId
-        && targetEnvironmentId(target) === environmentId);
-      if (!selectedProject || !projectMatchesTaskTarget(selectedProject, project, targets, environmentId)) {
-        throw new Error(`project session does not match the Task target path: ${project.locator}`);
-      }
+    if (sessions.length < 2) throw new Error("per-project execution requires at least two selected Task projects");
+    executions = selectedProjectContexts.map(({ project, projectRouting }, index) => {
       const projectGraph = { ...graph, id: `${graph.id}:${index + 1}`, defaults: projectRouting };
       const projectNode = {
         ...node,
@@ -2757,11 +2812,12 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
         task: { ...node.task, projects: [project] },
       };
       const executionNode = taskProjectExecutionNode(store, projectGraph, projectNode, targets, project);
-      return { project, graph: projectGraph, node: executionNode, route: resolveTaskRoute(projectGraph, executionNode, targets) };
+      return { project, projects: [project], graph: projectGraph, node: executionNode, route: resolveTaskRoute(projectGraph, executionNode, targets) };
     });
   } else {
-    const executionNode = itemKind === "task" ? taskProjectExecutionNode(store, graph, node, targets) : node;
-    executions = [{ project: null, graph, node: executionNode, route: resolveTaskRoute(graph, executionNode, targets) }];
+    const projects = selectedProjectContexts.map((selection) => selection.project);
+    const executionNode = itemKind === "task" ? taskProjectExecutionNode(store, graph, node, targets, projects.length ? projects : null) : node;
+    executions = [{ project: null, projects, graph, node: executionNode, route: resolveTaskRoute(graph, executionNode, targets) }];
   }
   const plan = { dryRun, tasks: executions.map((execution) => ({ route: execution.route })) };
   await attestExecutionPlan(plan);
@@ -2789,7 +2845,7 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
             prompt,
             execution.route.routing,
             scopeContext(store, item),
-            execution.project ? [execution.project] : undefined,
+            execution.projects.length ? execution.projects : undefined,
           ),
           title: `${itemKind === "task" ? "Task" : "Todo"} · ${item.title}${execution.project ? ` · ${execution.project.label || path.basename(execution.project.locator)}` : ""}`,
         },
@@ -2823,8 +2879,8 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
   };
 }
 
-async function runStandaloneTask(taskId, requestedRouting, dryRun, executionMode, projectSessions, onProgress = null) {
-  return runStandaloneWorkItem("task", taskId, requestedRouting, dryRun, executionMode, projectSessions, onProgress);
+async function runStandaloneTask(taskId, requestedRouting, dryRun, executionMode, projectSessions, onProgress = null, executionTargets = null) {
+  return runStandaloneWorkItem("task", taskId, requestedRouting, dryRun, executionMode, projectSessions, onProgress, executionTargets);
 }
 
 async function runTodoThroughQuickTask(todoId, requestedRouting, dryRun, idempotencyKey, onProgress = null) {
@@ -2835,7 +2891,7 @@ async function runTodoThroughQuickTask(todoId, requestedRouting, dryRun, idempot
   if (dryRun) {
     throw new Error("an unbound structured Todo cannot be planned without creating its Task; open the quick-run dialog instead");
   }
-  const prepared = await prepareStructuredTodoQuickRun(todoId, idempotencyKey);
+  const prepared = await createStructuredTaskForTodo(todoId, idempotencyKey);
   const routing = standaloneRouting(requestedRouting);
   const targets = await readTargets();
   const project = targets.projects.find((item) => item.id === routing.projectId
@@ -2888,8 +2944,11 @@ async function handleMessage(message) {
       }
     case "task-project-context":
       return taskProjectContext(String(message.taskId || ""), String(message.workspaceHint || ""));
+    case "create-todo-task":
     case "prepare-todo-quick-run":
-      return prepareStructuredTodoQuickRun(String(message.todoId || ""), message.idempotencyKey);
+      return createStructuredTaskForTodo(String(message.todoId || ""), message.idempotencyKey);
+    case "todo-graph-choices":
+      return structuredTodoGraphChoices(String(message.todoId || ""));
     case "current-orca-project":
       return currentOrcaProject();
     case "link-task-projects":

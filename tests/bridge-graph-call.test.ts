@@ -298,6 +298,33 @@ describe("bridge graph calls", () => {
     expect(after.graphs.every((graph: { runs: unknown[] }) => graph.runs.length === 0)).toBe(true);
   });
 
+  it("runs without an explicit project by using the current Orca worktree", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const now = "2026-08-10T00:00:00.000Z";
+    await writeGraphStore(runtimeDirectory, [], [{
+      id: "TASK-current-context", title: "현재 컨텍스트 실행", prompt: "현재 Orca 컨텍스트에서 실행", draft: "현재 Orca 컨텍스트에서 실행",
+      promptRevisions: [], status: "ready", priority: "medium", tags: [], projects: [], createdAt: now, updatedAt: now,
+    }]);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    await sendToBridge(
+      runtimeDirectory,
+      { type: "start-task-execution", taskId: "TASK-current-context", routing: { environmentId: "local", model: "gpt-5.6-sol" } },
+      "execution completed",
+      { ORCA_CLI_COMMAND: fake.command, ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    expect(calls.find((args) => args[0] === "terminal" && args[1] === "create"))
+      .toEqual(expect.arrayContaining(["--worktree", "id:fake-worktree"]));
+    const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
+    expect(records[0]).toMatchObject({
+      status: "completed",
+      targets: [{ projectId: "fake-project", projectName: "Fake project", sessionId: "fake-session" }],
+    });
+  });
+
   it("starts a tracked Task asynchronously and persists commercial UI progress", async () => {
     const root = process.cwd();
     const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
@@ -452,7 +479,7 @@ describe("bridge graph calls", () => {
     const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
     const creates = calls.filter((args) => args[0] === "terminal" && args[1] === "create");
     expect(creates).toHaveLength(2);
-    expect(creates.map((args) => args[args.indexOf("--worktree") + 1])).toEqual(["id:fake-worktree", "id:second-worktree"]);
+    expect(creates.map((args) => args[args.indexOf("--worktree") + 1]).sort()).toEqual(["id:fake-worktree", "id:second-worktree"]);
     expect(calls.filter((args) => args[0] === "terminal" && args[1] === "send")).toHaveLength(3);
     const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
     expect(records[0].targets).toMatchObject([
@@ -522,6 +549,95 @@ describe("bridge graph calls", () => {
     const webPrompt = sends.find((args) => args.join("\n").includes("target · folder: /recorded/second-project"))?.join("\n") ?? "";
     expect(apiPrompt).not.toContain("/recorded/second-project");
     expect(webPrompt).not.toContain("/recorded/fake-project");
+  });
+
+  it("executes multiple selected Orca projects even when the Task has no saved target projects", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const now = "2026-08-10T00:00:00.000Z";
+    await writeGraphStore(runtimeDirectory, [], [{
+      id: "TASK-runtime-projects", title: "실행 시 프로젝트 선택", prompt: "선택한 프로젝트에서 실행", draft: "선택한 프로젝트에서 실행",
+      promptRevisions: [], status: "ready", priority: "medium", tags: [], projects: [], createdAt: now, updatedAt: now,
+    }]);
+    const fake = await installFakeOrca(runtimeDirectory);
+    const targetsPath = path.join(runtimeDirectory, "targets.json");
+    const targets = JSON.parse(await readFile(targetsPath, "utf8"));
+    targets.projects.push({
+      id: "second-project", name: "Second project", environmentId: "local", repoId: "second-repo",
+      worktreeId: "second-worktree", path: "/portable/second-project", branch: "refs/heads/release",
+    });
+    targets.branches.push({
+      id: "release", branch: "refs/heads/release", environmentId: "local", projectId: "second-project",
+      repoId: "second-repo", worktreeId: "second-worktree", path: "/portable/second-project",
+    });
+    await writeFile(targetsPath, `${JSON.stringify(targets)}\n`, "utf8");
+
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "run-task", taskId: "TASK-runtime-projects", executionMode: "per_project", dryRun: false,
+        projectSessions: [
+          { locator: "/portable/fake-project", routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" } },
+          { locator: "/portable/second-project", routing: { environmentId: "local", projectId: "second-project", branch: "release", model: "gpt-5.6-luna" } },
+        ],
+      },
+      "task TASK-runtime-projects executed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_SECOND_PROJECT: "1",
+      },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    const creates = calls.filter((args) => args[0] === "terminal" && args[1] === "create");
+    expect(creates).toHaveLength(2);
+    expect(creates.map((args) => args[args.indexOf("--worktree") + 1]).sort()).toEqual(["id:fake-worktree", "id:second-worktree"]);
+    const sends = calls.filter((args) => args[0] === "terminal" && args[1] === "send");
+    expect(sends.some((args) => args.join("\n").includes("target · folder: /portable/fake-project"))).toBe(true);
+    expect(sends.some((args) => args.join("\n").includes("target · folder: /portable/second-project"))).toBe(true);
+  });
+
+  it("keeps every selected project in one integrated Task session", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const now = "2026-08-10T00:00:00.000Z";
+    await writeGraphStore(runtimeDirectory, [], [{
+      id: "TASK-integrated-projects", title: "통합 프로젝트 실행", prompt: "한 세션에서 여러 프로젝트 작업", draft: "한 세션에서 여러 프로젝트 작업",
+      promptRevisions: [], status: "ready", priority: "medium", tags: [], projects: [], createdAt: now, updatedAt: now,
+    }]);
+    const fake = await installFakeOrca(runtimeDirectory);
+    const targetsPath = path.join(runtimeDirectory, "targets.json");
+    const targets = JSON.parse(await readFile(targetsPath, "utf8"));
+    targets.projects.push({
+      id: "second-project", name: "Second project", environmentId: "local", repoId: "second-repo",
+      worktreeId: "second-worktree", path: "/portable/second-project", branch: "refs/heads/release",
+    });
+    await writeFile(targetsPath, `${JSON.stringify(targets)}\n`, "utf8");
+
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "run-task", taskId: "TASK-integrated-projects", executionMode: "single_session", dryRun: false,
+        routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" },
+        projectSessions: [
+          { locator: "/portable/fake-project", routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" } },
+          { locator: "/portable/second-project", routing: { environmentId: "local", projectId: "second-project", model: "gpt-5.6-luna" } },
+        ],
+      },
+      "task TASK-integrated-projects executed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_SECOND_PROJECT: "1",
+      },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "create")).toHaveLength(1);
+    const prompt = calls.find((args) => args[0] === "terminal" && args[1] === "send")?.join("\n") ?? "";
+    expect(prompt).toContain("target · folder: /portable/fake-project");
+    expect(prompt).toContain("target · folder: /portable/second-project");
   });
 
   it("waits for every project session before finalizing a partially failed tracked Task", async () => {
@@ -1346,6 +1462,9 @@ describe("bridge graph calls", () => {
       );
 
       const targets = JSON.parse(await readFile(path.join(runtimeDirectory, "targets.json"), "utf8"));
+      expect(targets.projects).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: "fake-project", current: true }),
+      ]));
       expect(targets.sessions).toHaveLength(expectedSessions);
       if (expectedSessions) {
         expect(targets.sessions[0]).toMatchObject({
