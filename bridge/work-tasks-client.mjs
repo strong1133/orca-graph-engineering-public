@@ -215,6 +215,25 @@ export function workTasksClientFromEnvironment(environment = process.env) {
   });
 }
 
+export function workTasksClientFromDataSource(config) {
+  if (config?.mode !== "structured" || typeof config.url !== "string") return null;
+  let endpoint;
+  try { endpoint = new URL(config.url); } catch { return null; }
+  if (endpoint.username || endpoint.password || endpoint.search || endpoint.hash
+    || endpoint.pathname.replace(/\/+$/u, "") !== API_PATH) return null;
+  const allowInsecureLoopback = endpoint.protocol === "http:"
+    && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
+  try {
+    return new WorkTasksClient({
+      baseUrl: endpoint.origin,
+      clientId: "orca-graph-engineering-data-source",
+      allowInsecureLoopback,
+    });
+  } catch {
+    return null;
+  }
+}
+
 export function taskProjectInput(project) {
   const locatorKind = project.locator_kind ?? project.locatorKind;
   const branch = normalizeWorkBranch(project.branch);

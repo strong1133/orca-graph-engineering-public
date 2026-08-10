@@ -286,7 +286,7 @@ export interface GraphRunRecord {
   childRunIds?: string[];
   terminationReason?: "completed" | "node_failed" | "budget" | "timeout" | "stagnation" | "cancelled";
   stats?: { completed?: number; failed?: number; skipped?: number; attempts?: number; durationMs?: number };
-  nodeResults?: Array<{ nodeId: string; status: NodeStatus; sessionId?: string; message?: string; attempt?: number; durationMs?: number; evidence?: string; childGraphId?: string; childRunId?: string }>;
+  nodeResults?: Array<{ nodeId: string; status: NodeStatus; sessionId?: string; sessionTitle?: string; message?: string; attempt?: number; durationMs?: number; evidence?: string; childGraphId?: string; childRunId?: string }>;
 }
 
 export interface GraphDefinition {

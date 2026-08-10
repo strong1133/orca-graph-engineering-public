@@ -286,6 +286,114 @@ describe.each([
     }
   });
 
+  it("selects the one machine that can satisfy every saved Task project and branch", async () => {
+    const dom = await mountPanel(wide, ({ store, targets }) => {
+      const now = "2026-08-10T00:00:00.000Z";
+      store.tasks = [{
+        id: "task-remote", title: "원격 다중 프로젝트", prompt: "work", draft: "work", promptRevisions: [],
+        status: "ready", priority: "medium", tags: [], createdAt: now, updatedAt: now,
+        projects: [
+          { id: "TP-front", role: "target", locatorKind: "folder", locator: "/remote/front", label: "Front", branch: "feature/task", position: 0 },
+          { id: "TP-api", role: "target", locatorKind: "folder", locator: "/remote/api", label: "API", branch: "feature/task", position: 1 },
+        ],
+      }];
+      targets.environments = [
+        { id: "local", name: "jsj1", local: true, connected: true },
+        { id: "environment-jsj2", name: "jsj2", local: false, connected: true },
+      ];
+      targets.projects = [
+        { id: "repo-front", name: "front", environmentId: "local", path: "/local/front", worktreeId: "wt-front-local", branch: "dev" },
+        { id: "repo-api", name: "api", environmentId: "local", path: "/local/api", worktreeId: "wt-api-local", branch: "dev" },
+        { id: "repo-front", name: "front", environmentId: "environment-jsj2", path: "/remote/front", worktreeId: "wt-front-remote", branch: "dev" },
+        { id: "repo-api", name: "api", environmentId: "environment-jsj2", path: "/remote/api", worktreeId: "wt-api-remote", branch: "dev" },
+      ];
+      targets.branches = [
+        { id: "front-hotfix", branch: "feature/task", environmentId: "local", projectId: "repo-front", worktreeId: "wt-front-hotfix", path: "/local/worktrees/front" },
+        { id: "api-hotfix", branch: "feature/task", environmentId: "local", projectId: "repo-api", worktreeId: "wt-api-hotfix", path: "/local/worktrees/api" },
+        { id: "front-dev", branch: "dev", environmentId: "environment-jsj2", projectId: "repo-front", worktreeId: "wt-front-remote", path: "/remote/front" },
+        { id: "api-dev", branch: "dev", environmentId: "environment-jsj2", projectId: "repo-api", worktreeId: "wt-api-remote", path: "/remote/api" },
+      ];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      const taskCard = document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]');
+      const taskId = taskCard?.dataset.id;
+      taskCard?.click();
+      document.querySelector<HTMLButtonElement>(`[data-action="open-task-run"][data-id="${taskId}"]`)?.click();
+
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-field="environmentId"]')?.value).toBe("local");
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-field="projectId"]')?.value).toBe("repo-front");
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-field="branch"]')?.value).toBe("feature/task");
+      expect(dialog?.textContent).not.toContain("새 세션을 만들 프로젝트를 선택하십시오");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("restores the last Task route and keeps the run dialog open when launch fails", async () => {
+    const now = "2026-08-10T00:00:00.000Z";
+    const dom = await mountPanel(wide, (bootstrap) => {
+      (bootstrap as typeof bootstrap & { bridgeApiUrl: string }).bridgeApiUrl = "/test/api";
+      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [{
+        id: "exec-previous", itemKind: "task", itemId: "task-design", title: "요구사항 설계", status: "completed",
+        executionMode: "single_session", createdAt: now, updatedAt: now, progress: { completed: 1, failed: 0, total: 1 },
+        targets: [{
+          id: "target-previous", label: "Current", status: "completed", environmentId: "local",
+          projectId: "repo:current-project", branch: "feature/review", sessionId: "session-previous",
+          sessionTitle: "Review Agent", model: "claude-opus-5",
+        }],
+      }];
+      bootstrap.targets.projects = [{
+        id: "repo:current-project", name: "current-project", environmentId: "local",
+        worktreeId: "worktree-current", path: "/workspace/current", branch: "feature/review",
+      }];
+      bootstrap.targets.sessions = [{
+        id: "session-previous", title: "Review Agent", environmentId: "local", worktreeId: "worktree-current",
+        projectId: "repo:current-project", branch: "feature/review", paneKey: "tab:leaf", agentType: "claude",
+        agentState: "done", connected: true, writable: true,
+      }];
+    }, (window) => {
+      Object.defineProperty(window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          const request = JSON.parse(String(init.body));
+          if (request.type === "save") return Response.json({ ok: true, value: { mode: "local", store: request.store } });
+          if (request.type === "start-task-execution") return Response.json({ ok: false, error: "agent session launch failed" });
+          return Response.json({ ok: true, value: undefined });
+        }),
+      });
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-design"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
+
+      let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-field="sessionId"]')?.value).toBe("session-previous");
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-field="model"]')?.value).toBe("claude-opus-5");
+      dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.click();
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.getAttribute("aria-busy")).toBe("true");
+      expect(dialog?.textContent).toContain("실행 요청 중");
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog).not.toBeNull();
+      expect(dialog?.getAttribute("aria-busy")).toBe("false");
+      expect(dialog?.textContent).toContain("실행을 시작하지 못했습니다");
+      expect(dialog?.textContent).toContain("agent session launch failed");
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-field="sessionId"]')?.value).toBe("session-previous");
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-field="model"]')?.value).toBe("claude-opus-5");
+      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
+    } finally {
+      dom.window.close();
+    }
+  });
+
   it("opens Todo and Task quick-run buttons on an Orca worktree", async () => {
     const dom = await mountPanel(wide, ({ store, targets }) => {
       store.bridgeWorkspace = "current-project";

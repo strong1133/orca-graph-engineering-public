@@ -368,6 +368,99 @@ describe("bridge graph calls", () => {
     });
   });
 
+  it("reuses one newly created session for sequential Graph nodes on the same route", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-unified-session",
+      [taskNode("first"), taskNode("second")],
+      [{ id: "first-second", from: "first", to: "second", kind: "sequence" }],
+      { projectId: "fake-project", model: "gpt-5.6-sol", reasoning: "high" },
+    );
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: graph.id,
+        executionMode: "single_session",
+        routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol", reasoning: "high" },
+      },
+      "execution completed",
+      { ORCA_CLI_COMMAND: fake.command, ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "create")).toHaveLength(1);
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "send")).toHaveLength(2);
+    const after = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
+    expect(after.graphs[0].runs.at(-1).nodeResults).toMatchObject([
+      { nodeId: "first", status: "done", sessionId: "fake-session", sessionTitle: "GRAPH-unified-session · Run #1 · Fake project" },
+      { nodeId: "second", status: "done", sessionId: "fake-session", sessionTitle: "GRAPH-unified-session · Run #1 · Fake project" },
+    ]);
+    const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
+    expect(records[0].targets[0]).toMatchObject({ sessionId: "fake-session", sessionTitle: "GRAPH-unified-session · Run #1 · Fake project" });
+  });
+
+  it("creates and tracks one Graph session per distinct project route", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-project-sessions",
+      [taskNode("api-first"), taskNode("api-second"), taskNode("web", { projectId: "second-project", branch: "release", model: "gpt-5.6-luna" })],
+      [
+        { id: "api-sequence", from: "api-first", to: "api-second", kind: "sequence" },
+        { id: "web-sequence", from: "api-second", to: "web", kind: "sequence" },
+      ],
+      { projectId: "fake-project", branch: "main", model: "gpt-5.6-sol" },
+    );
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+    const targetsPath = path.join(runtimeDirectory, "targets.json");
+    const targetStore = JSON.parse(await readFile(targetsPath, "utf8"));
+    targetStore.projects.push({
+      id: "second-project", name: "Second project", environmentId: "local", worktreeId: "second-worktree",
+      path: "/portable/second-project", branch: "refs/heads/release",
+    });
+    targetStore.branches.push({
+      id: "release", branch: "refs/heads/release", environmentId: "local", projectId: "second-project",
+      repoId: "second-repo", worktreeId: "second-worktree", path: "/portable/second-project",
+    });
+    await writeFile(targetsPath, `${JSON.stringify(targetStore)}\n`, "utf8");
+
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: graph.id,
+        executionMode: "per_project",
+        projectSessions: [
+          { locator: "/portable/fake-project", label: "API", routing: { environmentId: "local", projectId: "fake-project", branch: "main", model: "gpt-5.6-sol" } },
+          { locator: "/portable/second-project", label: "Web", routing: { environmentId: "local", projectId: "second-project", branch: "release", model: "gpt-5.6-luna" } },
+        ],
+      },
+      "execution completed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_SECOND_PROJECT: "1",
+      },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    const creates = calls.filter((args) => args[0] === "terminal" && args[1] === "create");
+    expect(creates).toHaveLength(2);
+    expect(creates.map((args) => args[args.indexOf("--worktree") + 1])).toEqual(["id:fake-worktree", "id:second-worktree"]);
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "send")).toHaveLength(3);
+    const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
+    expect(records[0].targets).toMatchObject([
+      { locator: "/portable/fake-project", projectId: "fake-project", sessionTitle: "GRAPH-project-sessions · Run #1 · Fake project" },
+      { locator: "/portable/second-project", projectId: "second-project", sessionTitle: "GRAPH-project-sessions · Run #1 · Second project" },
+    ]);
+  });
+
   it("attests all targets and executes one independent session per Task project with its own model", async () => {
     const root = process.cwd();
     const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
@@ -378,8 +471,8 @@ describe("bridge graph calls", () => {
       id: "TASK-multi-project", title: "다중 프로젝트 Task", prompt: "각 프로젝트 작업", draft: "각 프로젝트 작업",
       promptRevisions: [], status: "ready", priority: "medium", tags: [],
       projects: [
-        { id: "target-a", role: "target", locatorKind: "folder", locator: "/portable/fake-project", label: "API", branch: "main", position: 0 },
-        { id: "target-b", role: "target", locatorKind: "folder", locator: "/portable/second-project", label: "Web", branch: "release", position: 1 },
+        { id: "target-a", role: "target", locatorKind: "folder", locator: "/recorded/fake-project", label: "API", branch: "main", position: 0 },
+        { id: "target-b", role: "target", locatorKind: "folder", locator: "/recorded/second-project", label: "Web", branch: "release", position: 1 },
       ],
       createdAt: now, updatedAt: now,
     }];
@@ -391,6 +484,10 @@ describe("bridge graph calls", () => {
       id: "second-project", name: "Second project", environmentId: "local", repoId: "second-repo",
       worktreeId: "second-worktree", path: "/portable/second-project", branch: "refs/heads/release",
     });
+    targets.projects.push(
+      { id: "fake-project", name: "Recorded API", environmentId: "recorded-device", path: "/recorded/fake-project", worktreeId: "recorded-api" },
+      { id: "second-project", name: "Recorded Web", environmentId: "recorded-device", path: "/recorded/second-project", worktreeId: "recorded-web" },
+    );
     targets.branches.push({
       id: "release", branch: "refs/heads/release", environmentId: "local", projectId: "second-project",
       repoId: "second-repo", worktreeId: "second-worktree", path: "/portable/second-project",
@@ -402,8 +499,8 @@ describe("bridge graph calls", () => {
       {
         type: "run-task", taskId: "TASK-multi-project", executionMode: "per_project", dryRun: false,
         projectSessions: [
-          { locator: "/portable/fake-project", routing: { environmentId: "local", projectId: "fake-project", branch: "main", model: "gpt-5.6-sol", reasoning: "high" } },
-          { locator: "/portable/second-project", routing: { environmentId: "local", projectId: "second-project", branch: "release", model: "gpt-5.6-luna", reasoning: "medium" } },
+          { locator: "/recorded/fake-project", routing: { environmentId: "local", projectId: "fake-project", branch: "main", model: "gpt-5.6-sol", reasoning: "high" } },
+          { locator: "/recorded/second-project", routing: { environmentId: "local", projectId: "second-project", branch: "release", model: "gpt-5.6-luna", reasoning: "medium" } },
         ],
       },
       "task TASK-multi-project executed",
@@ -421,10 +518,10 @@ describe("bridge graph calls", () => {
     expect(creates.some((args) => args.includes("id:second-worktree") && args.join(" ").includes("gpt-5.6-luna"))).toBe(true);
     const sends = calls.filter((args) => args[0] === "terminal" && args[1] === "send");
     expect(sends).toHaveLength(2);
-    const apiPrompt = sends.find((args) => args.join("\n").includes("target · folder: /portable/fake-project"))?.join("\n") ?? "";
-    const webPrompt = sends.find((args) => args.join("\n").includes("target · folder: /portable/second-project"))?.join("\n") ?? "";
-    expect(apiPrompt).not.toContain("/portable/second-project");
-    expect(webPrompt).not.toContain("/portable/fake-project");
+    const apiPrompt = sends.find((args) => args.join("\n").includes("target · folder: /recorded/fake-project"))?.join("\n") ?? "";
+    const webPrompt = sends.find((args) => args.join("\n").includes("target · folder: /recorded/second-project"))?.join("\n") ?? "";
+    expect(apiPrompt).not.toContain("/recorded/second-project");
+    expect(webPrompt).not.toContain("/recorded/fake-project");
   });
 
   it("waits for every project session before finalizing a partially failed tracked Task", async () => {

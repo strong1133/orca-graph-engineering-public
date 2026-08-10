@@ -6,6 +6,7 @@ const {
   taskProjectInput,
   todoQuickTaskInput,
   validateWorkTasksBaseUrl,
+  workTasksClientFromDataSource,
   workTasksEnvironment,
 } = await import(`../bridge/${["work", "tasks"].join("-")}-client.mjs`);
 const sourceName = ["under", "joy"].join("");
@@ -59,6 +60,30 @@ describe("Work Tasks Hermes client", () => {
     expect(validateWorkTasksBaseUrl("https://host.ts.net/")).toBe("https://host.ts.net");
     expect(() => validateWorkTasksBaseUrl("https://example.com")).toThrow("HTTPS *.ts.net");
     expect(validateWorkTasksBaseUrl("http://127.0.0.1:9000", { allowInsecureLoopback: true })).toBe("http://127.0.0.1:9000");
+  });
+
+  it("reuses the exact structured workspace endpoint for project and Task operations", () => {
+    const client = workTasksClientFromDataSource({
+      schemaVersion: 1,
+      mode: "structured",
+      url: `https://hermes.example.ts.net${apiPath}/`,
+      authEnv: "ORCA_GRAPH_SOURCE_TOKEN",
+    });
+    expect(client?.baseUrl).toBe("https://hermes.example.ts.net");
+    expect(client?.apiBase).toBe(`https://hermes.example.ts.net${apiPath}`);
+
+    const loopback = workTasksClientFromDataSource({
+      schemaVersion: 1,
+      mode: "structured",
+      url: `http://127.0.0.1:9000${apiPath}`,
+    });
+    expect(loopback?.baseUrl).toBe("http://127.0.0.1:9000");
+  });
+
+  it("does not treat unrelated structured sources as a workspace API", () => {
+    expect(workTasksClientFromDataSource({ mode: "structured", url: "https://hermes.example.ts.net/other" })).toBeNull();
+    expect(workTasksClientFromDataSource({ mode: "structured", url: `https://example.com${apiPath}` })).toBeNull();
+    expect(workTasksClientFromDataSource({ mode: "unstructured", url: `https://hermes.example.ts.net${apiPath}` })).toBeNull();
   });
 });
 
