@@ -2878,6 +2878,23 @@ async function saveStore(showNotice = true): Promise<void> {
 
 type SourceWorkKind = "domain" | "milestone" | "task" | "todo";
 
+function refreshManager(
+  kind: SourceWorkKind,
+  options: { selectedId?: string | null; taskDetailOpen?: boolean } = {},
+): void {
+  view.mode = ({ domain: "domains", milestone: "milestones", task: "tasks", todo: "todos" } as const)[kind];
+  clearGraphSelection();
+  view.inspectorOpen = false;
+  if (options.selectedId !== undefined) {
+    if (kind === "domain") view.selectedDomainId = options.selectedId;
+    else if (kind === "milestone") view.selectedMilestoneId = options.selectedId;
+    else if (kind === "task") view.selectedTaskId = options.selectedId;
+    else view.selectedTodoId = options.selectedId;
+  }
+  if (kind === "task" && options.taskDetailOpen !== undefined) view.taskDetailOpen = options.taskDetailOpen;
+  render();
+}
+
 function sourceRelatedVersions(kind: SourceWorkKind, item: LocalDomain | LocalMilestone | LocalTask | LocalTodo): Record<string, number> {
   if (kind === "todo") {
     const taskId = (item as LocalTodo).taskId;
@@ -3121,10 +3138,8 @@ app.addEventListener("click", (event) => {
         status: "active", owners: [], version: dataSource.config.mode === "structured" ? 0 : 1, createdAt: now, updatedAt: now,
       };
       store.domains.push(domain);
-      view.selectedDomainId = domain.id;
-      view.mode = "domains";
       view.dirty = true;
-      render();
+      refreshManager("domain", { selectedId: domain.id });
       persistStructuredItem("domain", domain, 0, "Domain을 원천에 만들었습니다.");
       break;
     }
@@ -3139,10 +3154,8 @@ app.addEventListener("click", (event) => {
         status: "active", priority: "medium", successCriteria: [], owners: [], version: dataSource.config.mode === "structured" ? 0 : 1, createdAt: now, updatedAt: now,
       };
       store.milestones.push(milestone);
-      view.selectedMilestoneId = milestone.id;
-      view.mode = "milestones";
       view.dirty = true;
-      render();
+      refreshManager("milestone", { selectedId: milestone.id });
       persistStructuredItem("milestone", milestone, 0, "Milestone을 원천에 만들었습니다.");
       break;
     }
@@ -3164,7 +3177,7 @@ app.addEventListener("click", (event) => {
         domain.status = "archived";
         touchScope(domain);
       }
-      render();
+      refreshManager("domain", { selectedId: domain.id });
       persistStructuredItem("domain", domain, expectedVersion);
       break;
     }
@@ -3183,7 +3196,7 @@ app.addEventListener("click", (event) => {
         milestone.status = "archived";
         touchScope(milestone);
       }
-      render();
+      refreshManager("milestone", { selectedId: milestone.id });
       persistStructuredItem("milestone", milestone, expectedVersion);
       break;
     }
@@ -3204,11 +3217,8 @@ app.addEventListener("click", (event) => {
         if (milestone) { task.domainId = milestone.domainId; task.milestoneId = milestone.id; }
       }
       store.tasks.push(task);
-      view.selectedTaskId = task.id;
-      view.taskDetailOpen = true;
-      view.mode = "tasks";
       view.dirty = true;
-      render();
+      refreshManager("task", { selectedId: task.id, taskDetailOpen: true });
       persistStructuredItem("task", task, 0, "Task를 원천에 만들었습니다.");
       break;
     }
@@ -3228,10 +3238,8 @@ app.addEventListener("click", (event) => {
         if (milestone) { todo.domainId = milestone.domainId; todo.milestoneId = milestone.id; }
       }
       store.todos.push(todo);
-      view.selectedTodoId = todo.id;
-      view.mode = "todos";
       view.dirty = true;
-      render();
+      refreshManager("todo", { selectedId: todo.id });
       persistStructuredItem("todo", todo, 0, "Todo를 원천에 만들었습니다.");
       break;
     }
@@ -3329,6 +3337,9 @@ app.addEventListener("click", (event) => {
       const expectedVersion = Number(task.version ?? 0);
       task.status = "archived";
       touchWorkItem(task);
+      view.selectedTaskId = null;
+      view.taskDetailOpen = false;
+      view.mode = "tasks";
       closeModal();
       toast("Task를 보관했습니다. 필요하면 Task 복원으로 되돌릴 수 있습니다.");
       persistStructuredItem("task", task, expectedVersion, "Task를 원천에서 보관했습니다.");
@@ -3341,7 +3352,7 @@ app.addEventListener("click", (event) => {
       if (task.status !== "archived") return;
       task.status = "backlog";
       touchWorkItem(task);
-      render();
+      refreshManager("task", { selectedId: task.id, taskDetailOpen: true });
       persistStructuredItem("task", task, expectedVersion, "Task를 원천에서 복원했습니다.");
       break;
     }
@@ -3401,7 +3412,7 @@ app.addEventListener("click", (event) => {
       const expectedVersion = Number(todo.version ?? 0);
       todo.status = todo.status === "done" ? "open" : "done";
       touchWorkItem(todo);
-      render();
+      refreshManager("todo", { selectedId: todo.id });
       persistStructuredItem("todo", todo, expectedVersion);
       break;
     }
@@ -3411,7 +3422,7 @@ app.addEventListener("click", (event) => {
       const expectedVersion = Number(todo.version ?? 0);
       todo.status = todo.status === "cancelled" ? "open" : "cancelled";
       touchWorkItem(todo);
-      render();
+      refreshManager("todo", { selectedId: todo.id });
       persistStructuredItem("todo", todo, expectedVersion);
       break;
     }

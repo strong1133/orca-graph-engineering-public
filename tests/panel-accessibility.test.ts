@@ -223,6 +223,7 @@ describe.each([
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
       document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
       const deleteButton = document.querySelector<HTMLButtonElement>('[data-action="open-task-delete"]');
+      const deletedTaskId = deleteButton?.dataset.id;
       expect(deleteButton?.textContent).toBe("Task 삭제");
       expect(deleteButton?.classList.contains("danger")).toBe(true);
       deleteButton?.click();
@@ -233,8 +234,51 @@ describe.each([
       dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-delete"]')?.click();
 
       expect(document.querySelector<HTMLElement>('[role="dialog"]')).toBeNull();
+      expect(document.querySelector<HTMLElement>('[aria-label="Task 상세"]')).toBeNull();
+      expect(document.querySelector<HTMLElement>('[aria-label="Task 관리"]')).not.toBeNull();
+      expect(document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.classList.contains("active")).toBe(true);
+      const archivedCard = [...document.querySelectorAll<HTMLButtonElement>('[data-action="select-local-task"]')]
+        .find((item) => item.dataset.id === deletedTaskId);
+      expect(archivedCard).not.toBeUndefined();
+      expect(archivedCard?.textContent).toContain("보관");
+      archivedCard?.click();
       expect(document.querySelector<HTMLButtonElement>('[data-action="archive-local-task"]')?.textContent).toBe("Task 복원");
-      expect(document.querySelector<HTMLSelectElement>('[data-scope="local-task"][data-field="status"]')?.value).toBe("archived");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("keeps each management menu active after its own mutations", async () => {
+    const dom = await mountPanel(wide);
+    try {
+      const { document } = dom.window;
+      const expectManager = (mode: "domains" | "milestones" | "tasks" | "todos", label: string): void => {
+        const workspace = mode === "tasks"
+          ? document.querySelector<HTMLElement>('[aria-label="Task 관리"], [aria-label="Task 상세"]')
+          : document.querySelector<HTMLElement>(`[aria-label="${label} 관리"]`);
+        expect(workspace).not.toBeNull();
+        expect(document.querySelector<HTMLButtonElement>(`[data-action="set-view"][data-id="${mode}"]`)?.classList.contains("active")).toBe(true);
+      };
+
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="domains"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="new-domain"]')?.click();
+      expectManager("domains", "Domain");
+
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="milestones"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="new-milestone"]')?.click();
+      expectManager("milestones", "Milestone");
+      document.querySelector<HTMLButtonElement>('[data-action="archive-milestone"]')?.click();
+      expectManager("milestones", "Milestone");
+
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="new-local-task"]')?.click();
+      expectManager("tasks", "Task");
+
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="new-local-todo"]')?.click();
+      expectManager("todos", "Todo");
+      document.querySelector<HTMLButtonElement>('[data-action="toggle-todo-done"]')?.click();
+      expectManager("todos", "Todo");
     } finally {
       dom.window.close();
     }
