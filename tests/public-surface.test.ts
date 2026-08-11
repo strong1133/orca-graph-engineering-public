@@ -110,6 +110,17 @@ describe("public plugin surface", () => {
     expect(bridge).toContain("live loop re-entry is not supported by the local bridge");
   });
 
+  it("routes every graph store write through the single write lane", async () => {
+    const bridge = await readFile(path.join(root, "bridge/index.mjs"), "utf8");
+    // 실행 진행 기록과 패널 저장은 서로 다른 레인에서 돈다. store 파일은 통째로
+    // 교체되므로 쓰기 하나라도 잠금 밖에 남으면 편집이 조용히 사라진다.
+    const writes = [...bridge.matchAll(/atomicJson\(storePath/gu)].length;
+    const lanes = [...bridge.matchAll(/withStoreWrite\(/gu)].length;
+    expect(writes).toBeGreaterThan(0);
+    // 선언 1회 + 쓰기 지점마다 1회.
+    expect(lanes).toBe(writes + 1);
+  });
+
   it("keeps the complete panel type scale on D2Coding at the enlarged sizes", async () => {
     const css = await readFile(path.join(root, "src/panel.css"), "utf8");
     const families = [...css.matchAll(/font-family:\s*([^;]+);/gu)].map((match) => match[1]?.trim());
@@ -118,7 +129,7 @@ describe("public plugin surface", () => {
     const sizes = [...css.matchAll(/font-size:\s*(\d+)px/gu)].map((match) => Number(match[1]));
     expect(Object.fromEntries([...new Set(sizes)].sort((left, right) => left - right)
       .map((size) => [size, sizes.filter((value) => value === size).length]))).toEqual({
-      9: 1, 10: 8, 11: 25, 12: 46, 13: 4, 14: 1, 15: 1, 16: 1, 17: 3, 18: 5,
+      9: 1, 10: 8, 11: 33, 12: 51, 13: 5, 14: 1, 15: 1, 16: 1, 17: 3, 18: 5,
     });
   });
 });

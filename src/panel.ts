@@ -26,6 +26,7 @@ import {
   type GraphEdge,
   type GraphGroupMode,
   type GraphNode,
+  type GraphRunRecord,
   type GraphStore,
   type DomainStatus,
   type LocalDomain,
@@ -2053,7 +2054,7 @@ function renderCanvas(graph: GraphDefinition): string {
       const selected = view.selectedNodeIds.includes(node.id);
       const query = view.nodeQuery.trim().toLocaleLowerCase("ko-KR");
       const searchMatch = !query || `${node.id} ${title} ${nodeSubtitle(node)}`.toLocaleLowerCase("ko-KR").includes(query);
-      return `<article class="node ${node.kind} status-${node.status} execution-${executionStatus} ${critical.has(node.id) ? "critical" : ""} ${loopNodes.has(node.id) ? "in-loop" : ""} ${ready(node) ? "ready" : ""} ${branchClosed(node) ? "branch-closed" : ""} ${selected ? "selected" : ""} ${routeMissing ? "route-missing" : ""} ${node.engineering?.layoutPinned ? "layout-pinned" : ""} ${query ? searchMatch ? "search-match" : "search-dim" : ""} ${connectingClass}" data-node-id="${esc(node.id)}" data-drag-node="${esc(node.id)}" data-action="select-node" data-id="${esc(node.id)}" role="button" tabindex="0" aria-label="${esc(accessibleLabel)}" aria-pressed="${selected}" style="left:${node.x}px;top:${node.y}px">
+      return `<article class="node ${node.kind} status-${node.status} execution-${executionStatus} ${critical.has(node.id) ? "critical" : ""} ${loopNodes.has(node.id) ? "in-loop" : ""} ${ready(node) ? "ready" : ""} ${branchClosed(node) ? "branch-closed" : ""} ${selected ? "selected" : ""} ${routeMissing ? "route-missing" : ""} ${node.engineering?.layoutPinned ? "layout-pinned" : ""} ${query ? searchMatch ? "search-match" : "search-dim" : ""} ${connectingClass}" data-node-id="${esc(node.id)}" data-drag-node="${esc(node.id)}" data-action="select-node" data-id="${esc(node.id)}" role="button" tabindex="0" aria-label="${esc(accessibleLabel)}" title="${esc(nodeRunTooltip(graph, node, executionStatus))}" aria-pressed="${selected}" style="left:${node.x}px;top:${node.y}px">
         ${nodeVector(node)}
         <span class="node-status-strip ${executionStatus}"></span>
         ${(["top", "right", "bottom", "left"] as NodeSide[]).map((side) => `<button class="connect-port port-${side} ${ports.has(side) ? "connected" : ""}" data-connect-port data-node-id="${esc(node.id)}" data-side="${side}" aria-label="${esc(title)} ${side} 연결점" title="드래그하여 연결"></button>`).join("")}
@@ -3410,10 +3411,53 @@ function nodeExecutionChipMarkup(status: VisualNodeStatus): string {
   return `<span class="node-execution-chip ${status}" title="${esc(visualNodeStatusLabel[status])}"><span class="execution-pulse"></span>${esc(visualNodeStatusLabel[status])}</span>`;
 }
 
+const runStatusLabel: Record<GraphRunRecord["status"], string> = {
+  running: "진행 중",
+  done: "완료",
+  failed: "실패",
+  cancelled: "취소",
+  planned: "계획",
+};
+
+function runSeconds(durationMs: number): string {
+  return `${Math.round(durationMs / 100) / 10}초`;
+}
+
+/** 가장 최근에 이 노드가 실제로 돌았던 run과 그 결과. 최신 run에 기록이 없으면 이전 run까지 거슬러 본다. */
+function nodeRunResult(graph: GraphDefinition, node: GraphNode): { run: GraphRunRecord; result: NonNullable<GraphRunRecord["nodeResults"]>[number] } | null {
+  for (let index = graph.runs.length - 1; index >= 0; index -= 1) {
+    const run = graph.runs[index];
+    const result = run?.nodeResults?.find((item) => item.nodeId === node.id);
+    if (run && result) return { run, result };
+  }
+  return null;
+}
+
+function nodeRunTooltip(graph: GraphDefinition, node: GraphNode, status: VisualNodeStatus): string {
+  const found = nodeRunResult(graph, node);
+  const lines = [`${nodeDisplayTitle(node)} · ${visualNodeStatusLabel[status]}`];
+  if (!found) {
+    lines.push("이 노드의 실행 기록이 아직 없습니다.");
+    return lines.join("\n");
+  }
+  const { run, result } = found;
+  lines.push(`Run #${run.runNo} · ${runStatusLabel[run.status]}`);
+  const meta = [
+    result.attempt ? `시도 ${result.attempt}회` : "",
+    result.durationMs ? runSeconds(result.durationMs) : "",
+    result.endedAt ? new Date(result.endedAt).toLocaleString("ko-KR") : "",
+  ].filter(Boolean);
+  if (meta.length) lines.push(meta.join(" · "));
+  if (result.sessionTitle || result.sessionId) lines.push(`세션 ${result.sessionTitle || result.sessionId}`);
+  if (result.message) lines.push("", result.status === "failed" ? `실패 사유\n${result.message.slice(0, 1_500)}` : result.message.slice(0, 1_500));
+  return lines.join("\n");
+}
+
 function nodeRunMetaMarkup(graph: GraphDefinition, node: GraphNode, status: VisualNodeStatus, execution: RuntimeExecution | undefined): string {
-  if (!execution) return "";
-  const result = latestRun(graph)?.nodeResults?.find((item) => item.nodeId === node.id);
-  return `<div class="node-run-meta status-${status}"><strong>${esc(visualNodeStatusLabel[status])}</strong>${result?.attempt ? `<span>attempt ${result.attempt}</span>` : ""}${result?.durationMs ? `<span>${Math.round(result.durationMs / 100) / 10}s</span>` : ""}${result?.message ? `<span title="${esc(result.message)}">${esc(result.message)}</span>` : ""}</div>`;
+  const result = nodeRunResult(graph, node)?.result;
+  // 실행 기록이 남아 있으면 실행 레코드가 사라진 뒤에도 계속 보여야 한다.
+  if (!execution && !result) return "";
+  return `<div class="node-run-meta status-${status}"><strong>${esc(visualNodeStatusLabel[status])}</strong>${result?.attempt ? `<span>시도 ${result.attempt}</span>` : ""}${result?.durationMs ? `<span>${esc(runSeconds(result.durationMs))}</span>` : ""}${result?.message ? `<span class="node-run-message" title="${esc(result.message)}">${esc(result.message)}</span>` : ""}</div>`;
 }
 
 function latestExecution(itemKind: RuntimeExecution["itemKind"], itemId: string): RuntimeExecution | undefined {
@@ -3440,8 +3484,9 @@ function executionBanner(execution: RuntimeExecution | undefined): string {
 }
 
 function executionTargetSession(target: RuntimeExecutionTarget): string {
-  if (target.sessionTitle) return `Orca 세션 · ${target.sessionTitle}`;
-  if (target.sessionId) return `Orca 세션 · ${target.sessionId.slice(0, 12)}`;
+  const more = target.sessionCount && target.sessionCount > 1 ? ` 외 ${target.sessionCount - 1}개` : "";
+  if (target.sessionTitle) return `Orca 세션 · ${target.sessionTitle}${more}`;
+  if (target.sessionId) return `Orca 세션 · ${target.sessionId.slice(0, 12)}${more}`;
   return target.status === "queued" ? "세션 생성 대기" : "새 Orca 세션";
 }
 
@@ -3458,6 +3503,9 @@ function renderExecutionCard(execution: RuntimeExecution, grouped = false, group
     <div class="execution-progress" role="progressbar" aria-label="${esc(execution.title)} 실행 진행률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span style="width:${percent}%"></span></div>
     <div class="execution-targets">${execution.targets.map((target) => `<div class="execution-target status-${target.status}"><span class="execution-pulse"></span><strong>${esc(target.projectName || target.label)}</strong><span>${esc(target.branch || "기본 브랜치")}</span><span title="${esc(target.sessionId ?? "")}">${esc(executionTargetSession(target))}</span><span>${esc(modelName(target.model))}</span>${target.error ? `<small class="execution-target-error">${esc(target.error)}</small>` : ""}</div>`).join("")}</div>
     ${execution.error ? `<p class="execution-error" role="alert">${esc(execution.error)}</p>` : ""}
+    ${executionActive(execution) ? `<p class="execution-cancel-row">${execution.cancelRequestedAt
+      ? '<span class="execution-cancelling">중단 요청함 · 진행 중인 노드가 끝나면 멈춥니다</span>'
+      : `<button class="ghost" data-action="cancel-execution" data-id="${esc(execution.id)}">■ 실행 중단</button>`}</p>` : ""}
     ${grouped ? "" : `<footer><button data-action="open-execution-item" data-kind="${execution.itemKind}" data-id="${esc(execution.itemId)}">${kindLabel} 열기</button></footer>`}
   </article>`;
 }
@@ -3475,12 +3523,58 @@ function executionGroups(records: RuntimeExecution[]): RuntimeExecution[][] {
     .sort((left, right) => right[0]!.createdAt.localeCompare(left[0]!.createdAt));
 }
 
+/** 실행 현황의 핵심 — 실행 레코드는 "어디에 보냈는지"만 안다. 무슨 일이 있었는지는 run의 노드별 결과에 있다. */
+function renderGraphRunTimeline(graphId: string): string {
+  const graph = store.graphs.find((item) => item.id === graphId);
+  if (!graph) return "";
+  const runs = [...graph.runs].reverse().slice(0, 5);
+  if (!runs.length) return '<p class="run-timeline-empty">아직 기록된 run이 없습니다.</p>';
+  const nodeLabel = (nodeId: string): string => {
+    const node = graph.nodes.find((item) => item.id === nodeId);
+    return node ? nodeDisplayTitle(node) : nodeId;
+  };
+  return `<div class="run-timeline">${runs.map((run, index) => {
+    const results = run.nodeResults ?? [];
+    const counts = {
+      done: results.filter((item) => item.status === "done").length,
+      skipped: results.filter((item) => item.status === "skipped").length,
+      failed: results.filter((item) => item.status === "failed").length,
+    };
+    return `<details class="run-entry run-status-${run.status}" ${index === 0 ? "open" : ""}>
+      <summary>
+        <span class="run-no">Run #${run.runNo}</span>
+        <span class="run-status-chip ${run.status}">${esc(runStatusLabel[run.status])}</span>
+        <span class="run-counts">완료 ${counts.done}${counts.skipped ? ` · 건너뜀 ${counts.skipped}` : ""}${counts.failed ? ` · 실패 ${counts.failed}` : ""} / 노드 ${graph.nodes.length}</span>
+        <time>${esc(new Date(run.startedAt).toLocaleString("ko-KR"))}</time>
+      </summary>
+      ${run.inputPrompt ? `<div class="run-input"><strong>이번 run 업무 입력</strong><p>${esc(run.inputPrompt)}</p></div>` : ""}
+      ${run.terminationReason && run.terminationReason !== "completed" ? `<p class="run-termination">종료 사유 · ${esc(run.terminationReason)}</p>` : ""}
+      ${results.length
+        ? `<ol class="run-nodes">${results.map((result) => `<li class="run-node status-${result.status}">
+            <span class="run-node-status">${esc(visualNodeStatusLabel[result.status])}</span>
+            <div class="run-node-body">
+              <strong>${esc(nodeLabel(result.nodeId))}</strong>
+              <span class="run-node-meta">${[
+                result.attempt ? `시도 ${result.attempt}` : "",
+                result.durationMs ? runSeconds(result.durationMs) : "",
+                result.endedAt ? new Date(result.endedAt).toLocaleTimeString("ko-KR") : "",
+                result.sessionTitle || result.sessionId ? `세션 ${result.sessionTitle || result.sessionId}` : "",
+              ].filter(Boolean).map((part) => `<span>${esc(part)}</span>`).join("")}</span>
+              ${result.message ? `<pre class="run-node-message ${result.status === "failed" ? "failed" : ""}">${esc(result.message)}</pre>` : ""}
+            </div>
+          </li>`).join("")}</ol>`
+        : '<p class="run-nodes-empty">이 run에는 노드별 기록이 없습니다. 다른 실행기가 처리했거나 첫 노드 전에 멈춘 run입니다.</p>'}
+    </details>`;
+  }).join("")}</div>`;
+}
+
 function renderExecutionGroup(records: RuntimeExecution[]): string {
   const latest = records[0]!;
   const kindLabel = latest.itemKind === "graph" ? "Graph" : latest.itemKind === "task" ? "Task" : "Todo";
   const active = records.filter(executionActive).length;
   return `<article class="execution-group" data-execution-kind="${latest.itemKind}" data-execution-item-id="${esc(latest.itemId)}">
     <header class="execution-group-header"><span class="execution-kind">${kindLabel}</span><div><strong>${esc(latest.title)}</strong><small>${esc(latest.itemId)} · 실행 ${records.length}회${active ? ` · 진행 중 ${active}` : ""}</small></div>${executionInline(latest)}<button data-action="open-execution-item" data-kind="${latest.itemKind}" data-id="${esc(latest.itemId)}">${kindLabel} 열기</button></header>
+    ${latest.itemKind === "graph" ? `<section class="execution-run-history"><header><strong>노드별 진행 경과</strong><span>최근 run 5회</span></header>${renderGraphRunTimeline(latest.itemId)}</section>` : ""}
     <div class="execution-group-runs">${records.map((execution, index) => renderExecutionCard(execution, true, index)).join("")}</div>
   </article>`;
 }
@@ -3558,7 +3652,7 @@ function render(): void {
             <span class="toolbar-group"><button data-action="add-task">＋ Task</button><button data-action="open-batch-tasks">＋ Task 묶음</button><button data-action="add-condition">＋ ◇ 조건</button><button data-action="add-graph-call">＋ ▦ 호출</button></span>
             <span class="toolbar-group"><button data-action="undo" ${view.historyUndo.length ? "" : "disabled"}>↶</button><button data-action="redo" ${view.historyRedo.length ? "" : "disabled"}>↷</button><button data-action="open-templates">Topology</button><button data-action="auto-layout">자동 정렬 미리보기 ${view.layoutDirection}</button><button data-action="toggle-layout">${view.layoutDirection === "LR" ? "가로 → 세로" : "세로 → 가로"}</button></span>
             <span class="toolbar-group"><label class="node-search"><span>⌕</span><input data-action="node-search" value="${esc(view.nodeQuery)}" placeholder="노드 검색 ⌘K" aria-label="노드 검색"></label><select data-action="group-mode" aria-label="캔버스 그룹">${option("none", "그룹 없음", graphGroupMode(graph))}${option("domain", "Domain", graphGroupMode(graph))}${option("milestone", "Milestone", graphGroupMode(graph))}${option("superstep", "Superstep", graphGroupMode(graph))}${option("loop", "Loop", graphGroupMode(graph))}</select></span>
-            <span class="toolbar-group"><button data-action="refresh-targets">Orca 대상 갱신</button></span>
+            <span class="toolbar-group"><button data-action="refresh-targets">Orca 대상 갱신</button><button data-action="reset-graph-history" title="노드와 연결은 그대로 두고 실행 상태만 되돌립니다">↺ 실행 초기화</button></span>
             <span class="toolbar-group"><button data-action="show-analysis">그래프 설정</button><button data-action="toggle-problems">Problems</button><button data-action="open-history">실행 이력</button><button data-action="export-json">JSON</button><button data-action="import-json">가져오기</button><button data-action="open-shortcuts">?</button><span class="badge">run ${runCount}</span></span>
           </span>
           <span class="toolbar-compact">
@@ -3575,7 +3669,7 @@ function render(): void {
                 <button data-action="toggle-layout">레이아웃 방향 전환</button>
                 <button data-action="editor-mode" data-id="${view.editorMode === "design" ? "run" : "design"}">${view.editorMode === "design" ? "실행 보기" : "설계 모드"}</button>
                 <button data-action="redo" ${view.historyRedo.length ? "" : "disabled"}>다시 실행</button>
-                <button data-action="reset-run">실행 상태 리셋</button>
+                <button data-action="reset-graph-history">↺ 실행 초기화</button>
                 <button data-action="show-analysis">그래프 설정</button>
                 <button data-action="toggle-problems">Problems</button>
                 <button data-action="open-data-source">데이터 원천</button>
@@ -4070,6 +4164,7 @@ function patchCanvasExecution(graph: GraphDefinition): void {
     const title = nodeDisplayTitle(node);
     const editorLabel = node.kind === "condition" ? "조건 편집" : node.kind === "graph_call" ? "그래프 호출 편집" : "Task 편집";
     element.setAttribute("aria-label", `${node.kind === "condition" ? "조건" : node.kind === "graph_call" ? "그래프 호출" : "작업"} 노드 ${title}, 실행 상태 ${visualNodeStatusLabel[status]}. 클릭하면 ${editorLabel}을 엽니다.`);
+    element.setAttribute("title", nodeRunTooltip(graph, node, status));
   }
   for (const edge of graph.edges) {
     const source = graph.nodes.find((node) => node.id === edge.from);
@@ -4365,10 +4460,13 @@ async function chooseTodoWorktreeGraph(todoId: string): Promise<void> {
 }
 
 async function saveStore(showNotice = true, rebuildPanel = true): Promise<void> {
-  const result = await sendBridge<{ mode?: string; graph?: GraphDefinition; store?: GraphStore }>({ type: "save", store, rebuildPanel });
+  const result = await sendBridge<{ mode?: string; graph?: GraphDefinition; store?: GraphStore; warnings?: string[] }>({ type: "save", store, rebuildPanel });
   if (result?.store) store = normalizeGraphStore(result.store);
   else if (dataSource.config.mode === "structured") activeGraph().version += 1;
   view.dirty = false;
+  // 원천이 노드 실행 계약을 버렸다면 조용히 넘어가면 안 된다. 저장은 됐지만
+  // 그 노드의 안전 가드는 실행 시 검사할 데이터가 없는 상태가 된다.
+  for (const warning of result?.warnings ?? []) toast(warning);
   if (showNotice) {
     const destination = dataSource.config.mode === "structured" ? "구조화 원천" : dataSource.config.mode === "folder" ? "폴더 원천" : "로컬 브리지";
     const subject = dataSource.config.mode === "structured" ? "그래프를" : "Graph·Domain·Milestone·Task·Todo를";
@@ -5378,6 +5476,34 @@ app.addEventListener("click", (event) => {
       const before = graphSnapshot(graph);
       resetGraphRunState(graph);
       touch(graph); recordGraphHistory(before, "실행 상태 리셋", graph); render(); break;
+    }
+    case "cancel-execution": {
+      const executionId = target.dataset.id;
+      if (!executionId) return;
+      // 이미 보낸 에이전트 턴은 되돌릴 수 없다. 무엇이 멈추고 무엇이 안 멈추는지
+      // 먼저 알려 준 뒤 요청한다.
+      if (!window.confirm("진행 중인 노드가 끝나면 실행을 중단합니다.\n이미 에이전트에게 보낸 작업은 그대로 진행됩니다. 계속할까요?")) return;
+      void sendBridge<{ message?: string }>({ type: "cancel-execution", executionId })
+        .then((result) => {
+          void refreshExecutionStatus();
+          toast(result?.message ?? "실행 중단을 요청했습니다.");
+        })
+        .catch((error) => toast(error instanceof Error ? error.message : String(error)));
+      break;
+    }
+    case "reset-graph-history": {
+      // 구조는 건드리지 않는다. 원천이 상태를 소유하면 그쪽 reset 계약을 쓰고,
+      // 로컬 원천이면 브리지가 같은 의미로 되돌린다. run 이력 자체는 보존된다.
+      if (!window.confirm(`${graph.name}의 실행 이력을 초기화합니다.\n노드와 연결은 그대로 두고 실행 상태만 되돌립니다. 계속할까요?`)) return;
+      void sendBridge<{ store?: GraphStore }>({ type: "reset-graph-run", graphId: graph.id })
+        .then((result) => {
+          if (result?.store) store = normalizeGraphStore(result.store);
+          clearGraphSelection();
+          render();
+          toast("실행 이력을 초기화했습니다.");
+        })
+        .catch((error) => toast(error instanceof Error ? error.message : String(error)));
+      break;
     }
     case "clear-stale-run": {
       const item = store.graphs.find((candidate) => candidate.id === target.dataset.id);

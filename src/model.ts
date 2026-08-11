@@ -290,7 +290,7 @@ export interface GraphRunRecord {
   childRunIds?: string[];
   terminationReason?: "completed" | "node_failed" | "budget" | "timeout" | "stagnation" | "cancelled";
   stats?: { completed?: number; failed?: number; skipped?: number; attempts?: number; durationMs?: number };
-  nodeResults?: Array<{ nodeId: string; status: NodeStatus; sessionId?: string; sessionTitle?: string; message?: string; attempt?: number; durationMs?: number; evidence?: string; childGraphId?: string; childRunId?: string }>;
+  nodeResults?: Array<{ nodeId: string; status: NodeStatus; sessionId?: string; sessionTitle?: string; message?: string; attempt?: number; durationMs?: number; startedAt?: string; endedAt?: string; evidence?: string; childGraphId?: string; childRunId?: string }>;
 }
 
 export interface GraphDefinition {
@@ -398,6 +398,8 @@ export interface RuntimeExecutionTarget {
   branch?: string;
   sessionId?: string;
   sessionTitle?: string;
+  /** 노드마다 다른 세션으로 라우팅된 run에서 실제로 사용된 서로 다른 세션 수. */
+  sessionCount?: number;
   model?: string;
   startedAt?: string;
   endedAt?: string;
@@ -417,6 +419,8 @@ export interface RuntimeExecution {
   startedAt?: string;
   endedAt?: string;
   progress: { completed: number; failed: number; total: number };
+  /** 사용자가 중단을 요청한 시각. 노드 경계에서 관측된다. */
+  cancelRequestedAt?: string;
   targets: RuntimeExecutionTarget[];
   error?: string;
 }

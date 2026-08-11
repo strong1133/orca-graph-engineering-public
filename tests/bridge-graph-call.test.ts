@@ -35,6 +35,9 @@ async function sendToBridge(
   expected: string,
   environment: Record<string, string> = {},
   trailingPayloads: unknown[] = [],
+  // 뒤따르는 프레임을 이 표시가 나온 뒤에 보낸다. 같이 밀어 넣으면 두 요청이
+  // 한 번에 큐에 들어가 "실행 중에 들어온 요청"을 재현하지 못한다.
+  trailingAfter?: { marker: string; delayMs?: number },
 ): Promise<string> {
   const root = process.cwd();
   const child = spawn(process.execPath, [path.join(root, "bridge/index.mjs")], {
@@ -55,6 +58,10 @@ async function sendToBridge(
   try {
     await waitForOutput(child, () => output, "bridge ready");
     child.stdin.write(frame(payload));
+    if (trailingAfter && trailingPayloads.length) {
+      await waitForOutput(child, () => output, trailingAfter.marker);
+      await new Promise((resolve) => setTimeout(resolve, trailingAfter.delayMs ?? 250));
+    }
     for (const trailing of trailingPayloads) child.stdin.write(frame(trailing));
     await waitForOutput(child, () => output, expected);
     child.stdin.end();
@@ -140,6 +147,11 @@ if (args[0] === "environment" && args[1] === "list") {
     writable: true,
   }] };
 } else if (args[0] === "terminal" && args[1] === "wait") {
+  const waitTrace = process.env.ORCA_GRAPH_FAKE_WAIT_TRACE;
+  const waitDelay = Number(process.env.ORCA_GRAPH_FAKE_WAIT_DELAY_MS || 0);
+  if (waitTrace) appendFileSync(waitTrace, "start\\n");
+  if (waitDelay > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitDelay);
+  if (waitTrace) appendFileSync(waitTrace, "end\\n");
   result = { wait: { satisfied: !["busy", "idle-timeout"].includes(mode) } };
 } else if (args[0] === "terminal" && args[1] === "create") {
   if (process.env.ORCA_GRAPH_FAKE_FAIL_SECOND === "1" && args.includes("id:second-worktree")) {
@@ -494,6 +506,165 @@ describe("bridge graph calls", () => {
     ]);
     const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
     expect(records[0].targets[0]).toMatchObject({ sessionId: "fake-session", sessionTitle: "GRAPH-unified-session · Run #1 · Fake project" });
+  });
+
+  it("keeps answering bridge messages while an execution is still running", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-queue-lane",
+      [taskNode("only")],
+      [],
+      { projectId: "fake-project", model: "gpt-5.6-sol" },
+    );
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    // 실행이 도는 동안 초기화 요청을 함께 보낸다. 두 작업이 같은 큐에 있으면
+    // 초기화는 실행이 끝난 뒤에야 처리된다 — 정작 필요한 순간에 막히는 것이다.
+    const output = await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: graph.id,
+        executionMode: "single_session",
+        routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" },
+      },
+      "execution completed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_WAIT_DELAY_MS: "1200",
+      },
+      [{ type: "reset-graph-run", graphId: graph.id }],
+      { marker: "execution queued", delayMs: 300 },
+    );
+
+    expect(output).toContain("graph run state reset");
+    expect(output.indexOf("graph run state reset")).toBeLessThan(output.indexOf("execution completed"));
+  });
+
+  it("stops a running Graph at the next node boundary when the user cancels", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-cancel",
+      [taskNode("first"), taskNode("second"), taskNode("third")],
+      [
+        { id: "first-second", from: "first", to: "second", kind: "sequence" },
+        { id: "second-third", from: "second", to: "third", kind: "sequence" },
+      ],
+      { projectId: "fake-project", model: "gpt-5.6-sol" },
+    );
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    const output = await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: graph.id,
+        executionMode: "single_session",
+        routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" },
+      },
+      "execution cancelled",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_WAIT_DELAY_MS: "900",
+      },
+      [{ type: "cancel-execution", graphId: "GRAPH-cancel" }],
+      { marker: "execution queued", delayMs: 200 },
+    );
+
+    expect(output).toContain("execution cancel requested");
+    const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
+    expect(records[0].status).toBe("cancelled");
+    expect(records[0].cancelRequestedAt).toBeTruthy();
+    // 중단은 노드 경계에서 관측된다 — 모든 노드를 보내고 끝나는 일은 없어야 한다.
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "send").length).toBeLessThan(3);
+    // 중단은 실행 레코드와 run 이력 양쪽에서 실패가 아니라 취소로 남아야 한다.
+    const after = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
+    const run = after.graphs.find((item: { id: string }) => item.id === graph.id).runs.at(-1);
+    expect(run.status).toBe("cancelled");
+    expect(run.terminationReason).toBe("cancelled");
+  });
+
+  it("keeps a panel save made while an execution is running", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-concurrent-save",
+      [taskNode("only")],
+      [],
+      { projectId: "fake-project", model: "gpt-5.6-sol" },
+    );
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+    const saved = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
+    // 실행이 도는 동안 사용자가 다른 항목을 저장한다. 실행 진행 기록이 store를
+    // 통째로 덮어쓰면 이 편집은 조용히 사라진다.
+    saved.todos = [{
+      id: "TODO-during-run", title: "실행 중 저장한 Todo", notes: "", status: "todo",
+      priority: "medium", tags: [], promptRevisions: [],
+      createdAt: "2026-08-11T00:00:00.000Z", updatedAt: "2026-08-11T00:00:00.000Z",
+    }];
+
+    const output = await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: graph.id,
+        executionMode: "single_session",
+        routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" },
+      },
+      "execution completed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_WAIT_DELAY_MS: "1200",
+      },
+      [{ type: "save", store: saved, rebuildPanel: false }],
+      { marker: "execution queued", delayMs: 300 },
+    );
+
+    expect(output).toContain("graph store saved");
+    const after = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
+    expect(after.todos?.map((todo: { id: string }) => todo.id)).toEqual(["TODO-during-run"]);
+    // 실행 쪽 기록도 함께 남아야 한다.
+    const executed = after.graphs.find((item: { id: string }) => item.id === graph.id);
+    expect(executed.runs.at(-1).nodeResults?.length ?? executed.nodes[0].status).toBeTruthy();
+  });
+
+  it("resets a Graph run state without touching its structure or run history", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-reset-history",
+      [taskNode("first"), taskNode("second")],
+      [{ id: "first-second", from: "first", to: "second", kind: "sequence" }],
+    );
+    graph.nodes[0]!.status = "done";
+    graph.nodes[1]!.status = "failed";
+    graph.status = "running";
+    graph.runs = [{
+      id: "run-1", runNo: 1, status: "running", startedAt: "2026-08-11T00:00:00.000Z",
+      nodeResults: [{ nodeId: "first", status: "done" }, { nodeId: "second", status: "failed", message: "blocked" }],
+    }] as never;
+    await writeGraphStore(runtimeDirectory, [graph]);
+
+    await sendToBridge(runtimeDirectory, { type: "reset-graph-run", graphId: graph.id }, "graph run state reset");
+
+    const after = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
+    const reset = after.graphs.find((item: { id: string }) => item.id === graph.id);
+    expect(reset.nodes.map((node: { id: string; status: string }) => [node.id, node.status])).toEqual([["first", "pending"], ["second", "pending"]]);
+    expect(reset.status).toBe("draft");
+    // 구조도 이력도 파괴하지 않는다 — 상태만 되돌린다.
+    expect(reset.edges).toHaveLength(1);
+    expect(reset.runs).toHaveLength(1);
+    expect(reset.runs[0]).toMatchObject({ id: "run-1", status: "cancelled", terminationReason: "cancelled" });
+    expect(reset.runs[0].nodeResults).toHaveLength(2);
   });
 
   it("recovers a Graph node from a transient Orca runtime_unavailable during terminal create", async () => {
@@ -866,6 +1037,101 @@ describe("bridge graph calls", () => {
       ],
     });
     expect(records[0].error).toContain("1/2 project executions failed");
+  });
+
+  it("fails a tracked Task when the agent reports RESULT: failed and keeps its session", async () => {
+    const root = process.cwd();
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const store = JSON.parse(await readFile(path.join(root, "fixtures/default-store.json"), "utf8"));
+    const now = "2026-08-10T00:00:00.000Z";
+    store.tasks = [{
+      id: "TASK-blocked", title: "차단된 Task", prompt: "계약값을 확인한다", draft: "계약값을 확인한다",
+      promptRevisions: [], status: "ready", priority: "medium", tags: [],
+      projects: [{ id: "blocked-target", role: "target", locatorKind: "folder", locator: "/portable/fake-project", label: "Fake project", branch: "main", position: 0 }],
+      createdAt: now, updatedAt: now,
+    }];
+    await writeFile(path.join(runtimeDirectory, "store.json"), `${JSON.stringify(store)}\n`, "utf8");
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    await sendToBridge(
+      runtimeDirectory,
+      { type: "start-task-execution", taskId: "TASK-blocked", routing: { environmentId: "local", sessionId: "fake-session", model: "gpt-5.6-sol" } },
+      "execution failed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_ASSISTANT: "RESULT: failed — 필수 계약값 누락으로 blocked",
+      },
+    );
+
+    const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
+    expect(records[0]).toMatchObject({
+      itemKind: "task", itemId: "TASK-blocked", status: "failed",
+      progress: { completed: 0, failed: 1, total: 1 },
+      targets: [{ status: "failed", sessionId: "fake-session" }],
+    });
+    expect(records[0].error).toContain("필수 계약값 누락으로 blocked");
+    // 계약 문구가 실제로 에이전트에게 전달되어야 판정이 성립한다.
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    const sent = calls.find((args) => args[0] === "terminal" && args[1] === "send");
+    expect(sent?.join(" ")).toContain("RESULT: done");
+  });
+
+  it("does not serialize per-project agent waits behind each other", async () => {
+    const root = process.cwd();
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const store = JSON.parse(await readFile(path.join(root, "fixtures/default-store.json"), "utf8"));
+    const now = "2026-08-10T00:00:00.000Z";
+    store.tasks = [{
+      id: "TASK-parallel", title: "동시 실행 Task", prompt: "프로젝트별 실행", draft: "프로젝트별 실행",
+      promptRevisions: [], status: "ready", priority: "medium", tags: [],
+      projects: [
+        { id: "target-a", role: "target", locatorKind: "folder", locator: "/portable/fake-project", label: "API", branch: "main", position: 0 },
+        { id: "target-b", role: "target", locatorKind: "folder", locator: "/portable/second-project", label: "Web", branch: "release", position: 1 },
+      ],
+      createdAt: now, updatedAt: now,
+    }];
+    await writeFile(path.join(runtimeDirectory, "store.json"), `${JSON.stringify(store)}\n`, "utf8");
+    const fake = await installFakeOrca(runtimeDirectory);
+    const waitTrace = path.join(runtimeDirectory, "wait-trace.log");
+    const targetsPath = path.join(runtimeDirectory, "targets.json");
+    const targets = JSON.parse(await readFile(targetsPath, "utf8"));
+    targets.projects.push({
+      id: "second-project", name: "Second project", environmentId: "local", repoId: "second-repo",
+      worktreeId: "second-worktree", path: "/portable/second-project", branch: "refs/heads/release",
+    });
+    targets.branches.push({
+      id: "release", branch: "refs/heads/release", environmentId: "local", projectId: "second-project",
+      repoId: "second-repo", worktreeId: "second-worktree", path: "/portable/second-project",
+    });
+    await writeFile(targetsPath, `${JSON.stringify(targets)}\n`, "utf8");
+
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-task-execution", taskId: "TASK-parallel", executionMode: "per_project",
+        projectSessions: [
+          { locator: "/portable/fake-project", routing: { environmentId: "local", projectId: "fake-project", branch: "main", model: "gpt-5.6-sol" } },
+          { locator: "/portable/second-project", routing: { environmentId: "local", projectId: "second-project", branch: "release", model: "gpt-5.6-luna" } },
+        ],
+      },
+      "execution completed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_SECOND_PROJECT: "1",
+        ORCA_GRAPH_FAKE_WAIT_TRACE: waitTrace,
+        ORCA_GRAPH_FAKE_WAIT_DELAY_MS: "600",
+      },
+    );
+
+    // 두 프로젝트의 tui-idle 대기가 겹쳐야 한다. 전역 큐에 묶이면 start,end,start,end로
+    // 완전히 분리되고 뒤 프로젝트는 자기 폴링 예산을 큐에서 다 써버린다.
+    const trace = (await readFile(waitTrace, "utf8")).trim().split("\n").filter(Boolean);
+    expect(trace.length).toBeGreaterThanOrEqual(4);
+    expect(trace.slice(0, 2)).toEqual(["start", "start"]);
   });
 
   it("executes one Todo directly in the selected Orca worktree", async () => {

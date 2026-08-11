@@ -612,6 +612,65 @@ describe.each([
     }
   });
 
+  it("shows the run work input, per-node outcome, and failure reason in the execution status view", async () => {
+    const dom = await mountPanel(wide, (bootstrap) => {
+      bootstrap.store.graphs[0].runs = [{
+        id: "run-1", runNo: 7, status: "failed", startedAt: "2026-08-11T03:00:00.000Z",
+        endedAt: "2026-08-11T03:04:00.000Z", trigger: "manual", terminationReason: "node_failed",
+        inputPrompt: "상속바로 백오피스 고객재등록 버튼 복구",
+        nodeResults: [
+          { nodeId: "node-design", status: "done", attempt: 1, durationMs: 42_000, sessionId: "term-a", sessionTitle: "설계 세션", message: "RESULT: done" },
+          { nodeId: "node-implement", status: "failed", attempt: 2, durationMs: 7_000, sessionId: "term-b", message: "필수 템플릿 계약값 누락으로 blocked" },
+        ],
+      }];
+      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [{
+        id: "exec-graph-run", itemKind: "graph", itemId: "graph-orca-demo", title: "Orca 그래프 엔지니어링",
+        status: "failed", executionMode: "single_session",
+        createdAt: "2026-08-11T03:00:00.000Z", updatedAt: "2026-08-11T03:04:00.000Z",
+        progress: { completed: 1, failed: 1, total: 4 },
+        targets: [{ id: "target-1", label: "current-project", status: "failed", environmentId: "local", projectId: "current-project" }],
+      }];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
+      const history = document.querySelector<HTMLElement>(".execution-run-history");
+      expect(history?.textContent).toContain("Run #7");
+      expect(history?.textContent).toContain("상속바로 백오피스 고객재등록 버튼 복구");
+      expect(history?.textContent).toContain("요구사항 설계");
+      expect(history?.textContent).toContain("설계 세션");
+      const failedNode = history?.querySelector<HTMLElement>(".run-node.status-failed");
+      expect(failedNode?.textContent).toContain("구현 및 검증");
+      expect(failedNode?.textContent).toContain("필수 템플릿 계약값 누락으로 blocked");
+      expect(failedNode?.textContent).toContain("시도 2");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("exposes each node's last run outcome as a canvas tooltip and offers a run-history reset", async () => {
+    const dom = await mountPanel(wide, (bootstrap) => {
+      bootstrap.store.graphs[0].runs = [{
+        id: "run-1", runNo: 3, status: "failed", startedAt: "2026-08-11T03:00:00.000Z", trigger: "manual",
+        nodeResults: [{ nodeId: "node-implement", status: "failed", attempt: 1, durationMs: 5_000, sessionTitle: "구현 세션", message: "필수 템플릿 계약값 누락으로 blocked" }],
+      }];
+    });
+    try {
+      const { document } = dom.window;
+      const node = document.querySelector<HTMLElement>('.node[data-node-id="node-implement"]');
+      const tooltip = node?.getAttribute("title") ?? "";
+      expect(tooltip).toContain("Run #3");
+      expect(tooltip).toContain("실패 사유");
+      expect(tooltip).toContain("필수 템플릿 계약값 누락으로 blocked");
+      expect(tooltip).toContain("구현 세션");
+      const untouched = document.querySelector<HTMLElement>('.node[data-node-id="node-design"]')?.getAttribute("title") ?? "";
+      expect(untouched).toContain("실행 기록이 아직 없습니다");
+      expect(document.querySelectorAll('[data-action="reset-graph-history"]').length).toBeGreaterThan(0);
+    } finally {
+      dom.window.close();
+    }
+  });
+
   it("groups repeated execution history under its Graph instead of rendering separate Graph rows", async () => {
     const dom = await mountPanel(wide, (bootstrap) => {
       const base = {

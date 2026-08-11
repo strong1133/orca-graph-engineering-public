@@ -8,6 +8,13 @@ import { promisify } from "node:util";
 import { updatePanelBootstrap } from "../scripts/panel-bootstrap.mjs";
 import { prepareRuntimeDirectory, resolveRuntimeDirectory } from "../scripts/runtime-path.mjs";
 import {
+  dispatchedResultFailure,
+  droppedNodeEngineering,
+  nodeAttemptBudget,
+  remoteNodeDecision,
+  runWallDeadline,
+} from "./execution-policy.mjs";
+import {
   claimStructuredNode,
   commitFolderStore,
   commitStructuredGraph,
@@ -71,6 +78,8 @@ const orcaInvocation = await resolveOrcaInvocation();
 
 const assemblies = new Map();
 let queue = Promise.resolve();
+let executionQueue = Promise.resolve();
+let storeWriteQueue = Promise.resolve();
 let orcaQueue = Promise.resolve();
 let executionRegistryQueue = Promise.resolve();
 let rebuildQueue = Promise.resolve();
@@ -553,6 +562,47 @@ async function enrichWorkProcessSource(cache) {
   };
 }
 
+// 실행 이력 초기화 — 구조가 아니라 상태만 되돌린다. 원천은 현재 run을 봉인하고
+// 모든 노드를 pending으로 돌리며 지난 run 이력은 파괴하지 않는다.
+async function resetGraphRunState(graphId) {
+  if (!graphId) throw new Error("graph id is required to reset a run");
+  const config = await readDataSourceConfig();
+  const store = await readWorkingStore(config);
+  const graph = store.graphs.find((item) => item.id === graphId);
+  if (!graph) throw new Error(`graph not found: ${graphId}`);
+  if (config.mode === "structured") {
+    const client = requireWorkTasks();
+    const reset = (expectedVersion) => client.post(`/graphs/${encodeURIComponent(graph.id)}/reset`, { expected_version: expectedVersion });
+    try {
+      await reset(graph.version);
+    } catch (error) {
+      if (error?.status !== 409) throw error;
+      const latest = await refreshConfiguredDataSource(config, graph.id, { rebuildPanel: false });
+      const latestGraph = latest.store.graphs.find((item) => item.id === graph.id);
+      if (!latestGraph) throw error;
+      await reset(latestGraph.version);
+    }
+    const refreshed = await refreshConfiguredDataSource(config, graph.id);
+    return { mode: config.mode, graphId, store: refreshed.store };
+  }
+  const now = new Date().toISOString();
+  const run = graph.runs.at(-1);
+  if (run?.status === "running") {
+    run.status = "cancelled";
+    run.endedAt = now;
+    run.terminationReason = "cancelled";
+    run.summary ||= "사용자가 실행 이력을 초기화했습니다.";
+  }
+  for (const node of graph.nodes) {
+    node.status = "pending";
+    delete node.branchTaken;
+  }
+  graph.status = "draft";
+  graph.updatedAt = now;
+  await saveStore(store, `${graph.name} · 실행 이력을 초기화했습니다.`);
+  return { mode: config.mode, graphId, store };
+}
+
 async function setGraphProcess(graphId, expectedVersion, enabled) {
   const client = requireWorkTasks();
   try {
@@ -609,9 +659,31 @@ function storeBackedSource(mode) {
   return mode === "structured" || mode === "folder";
 }
 
+// 원천 run 요약에는 노드별 이력이 없다. 브리지가 실행하며 관측한 결과는 원천을
+// 다시 읽어도 남아 있어야 패널에서 실패 사유가 사라지지 않는다.
+function mergeObservedRunResults(sourceStore, localStore) {
+  const localGraphs = new Map((localStore?.graphs ?? []).map((graph) => [graph.id, graph]));
+  return (sourceStore.graphs ?? []).map((graph) => {
+    const localRuns = new Map(((localGraphs.get(graph.id)?.runs) ?? []).map((run) => [run.id, run]));
+    if (!localRuns.size) return graph;
+    let carried = false;
+    const runs = (graph.runs ?? []).map((run) => {
+      if (run.nodeResults?.length) return run;
+      const observed = localRuns.get(run.id)?.nodeResults;
+      if (!observed?.length) return run;
+      carried = true;
+      return { ...run, nodeResults: observed.map((result) => ({ ...result })) };
+    });
+    return carried ? { ...graph, runs } : graph;
+  });
+}
+
 function mergeBridgeRuntime(sourceStore, localStore) {
   return {
     ...sourceStore,
+    ...(Array.isArray(sourceStore?.graphs) && localStore?.graphs
+      ? { graphs: mergeObservedRunResults(sourceStore, localStore) }
+      : {}),
     ...(localStore?.bridgeTerminalId ? { bridgeTerminalId: localStore.bridgeTerminalId } : {}),
     ...(localStore?.bridgeWorkspace ? { bridgeWorkspace: localStore.bridgeWorkspace } : {}),
     ...(localStore?.lastBridgeMessage ? { lastBridgeMessage: localStore.lastBridgeMessage } : {}),
@@ -667,7 +739,16 @@ function rebuild() {
   return task;
 }
 
-async function saveStore(store, message, { rebuildPanel = true } = {}) {
+// 실행 진행과 패널 저장은 서로 다른 레인에서 돈다. store 파일은 통째로 교체되므로
+// 읽기-수정-쓰기가 겹치면 나중 쓰기가 앞선 편집을 통째로 삼킨다. 모든 store 쓰기를
+// 한 줄로 세워 그 교차를 없앤다.
+function withStoreWrite(job) {
+  const task = storeWriteQueue.then(job);
+  storeWriteQueue = task.catch(() => undefined);
+  return task;
+}
+
+async function saveStore(store, message, { rebuildPanel = true, mergeGraphId = null } = {}) {
   if (!store || store.schemaVersion !== 1 || !Array.isArray(store.graphs)
     || (store.domains !== undefined && !Array.isArray(store.domains))
     || (store.milestones !== undefined && !Array.isArray(store.milestones))
@@ -675,18 +756,34 @@ async function saveStore(store, message, { rebuildPanel = true } = {}) {
     || (store.todos !== undefined && !Array.isArray(store.todos))) {
     throw new Error("invalid graph store payload");
   }
-  store.lastBridgeMessage = message;
-  store.lastBridgeAt = new Date().toISOString();
-  const config = await readDataSourceConfig();
-  let sourceCache;
-  if (config.mode === "folder") {
-    await commitFolderStore(config, store);
-    sourceCache = await refreshDataSource(config);
-    await atomicJson(sourceCachePath, sourceCache);
-  }
-  await atomicJson(storePath, store);
-  if (rebuildPanel) await rebuild();
-  return sourceCache;
+  return withStoreWrite(async () => {
+    let next = store;
+    if (mergeGraphId) {
+      // 실행이 소유한 것은 자기 그래프의 노드 상태와 run 이력뿐이다. 그 사이 사용자가
+      // 저장한 다른 편집까지 덮어쓰지 않도록 디스크 최신본 위에 그 그래프만 얹는다.
+      const executing = store.graphs.find((item) => item.id === mergeGraphId);
+      const persisted = await readJson(storePath, defaultStorePath);
+      const index = Array.isArray(persisted.graphs)
+        ? persisted.graphs.findIndex((item) => item.id === mergeGraphId)
+        : -1;
+      if (executing && index >= 0) {
+        persisted.graphs[index] = executing;
+        next = persisted;
+      }
+    }
+    next.lastBridgeMessage = message;
+    next.lastBridgeAt = new Date().toISOString();
+    const config = await readDataSourceConfig();
+    let sourceCache;
+    if (config.mode === "folder") {
+      await commitFolderStore(config, next);
+      sourceCache = await refreshDataSource(config);
+      await atomicJson(sourceCachePath, sourceCache);
+    }
+    await atomicJson(storePath, next);
+    if (rebuildPanel) await rebuild();
+    return sourceCache;
+  });
 }
 
 async function readDataSourceConfig() {
@@ -705,9 +802,13 @@ async function refreshConfiguredDataSource(config, preferredGraphId, { rebuildPa
   await atomicJson(sourceCachePath, cache);
   let result = cache;
   if (storeBackedSource(config.mode) && cache.store?.schemaVersion === 1) {
-    const localStore = await readJson(storePath, defaultStorePath);
-    result = await cacheWithBridgeRuntime(cache, localStore);
-    await atomicJson(storePath, result.store);
+    // 읽기-병합-쓰기 전체가 한 임계구역이어야 실행 진행 기록과 겹쳐도 서로를 삼키지 않는다.
+    result = await withStoreWrite(async () => {
+      const localStore = await readJson(storePath, defaultStorePath);
+      const merged = await cacheWithBridgeRuntime(cache, localStore);
+      await atomicJson(storePath, merged.store);
+      return merged;
+    });
   }
   if (rebuildPanel) await rebuild();
   return result;
@@ -725,9 +826,13 @@ async function configureDataSource(rawConfig, seedStore) {
   await atomicJson(sourceCachePath, cache);
   let result = cache;
   if (storeBackedSource(config.mode) && cache.store?.schemaVersion === 1) {
-    const localStore = await readJson(storePath, defaultStorePath);
-    result = await cacheWithBridgeRuntime(cache, localStore);
-    await atomicJson(storePath, result.store);
+    // 읽기-병합-쓰기 전체가 한 임계구역이어야 실행 진행 기록과 겹쳐도 서로를 삼키지 않는다.
+    result = await withStoreWrite(async () => {
+      const localStore = await readJson(storePath, defaultStorePath);
+      const merged = await cacheWithBridgeRuntime(cache, localStore);
+      await atomicJson(storePath, merged.store);
+      return merged;
+    });
   }
   await rebuild();
   return result;
@@ -752,8 +857,14 @@ async function savePanelStore(store, { rebuildPanel = true } = {}) {
   const graph = store.graphs.find((item) => item.id === store.activeGraphId);
   if (!graph) throw new Error("active graph is missing");
   const committed = await commitStructuredGraph(config, graph);
+  const dropped = droppedNodeEngineering(graph, committed);
   const refreshedCache = await refreshConfiguredDataSource(config, graph.id);
-  return { mode: "structured", graph: committed, store: refreshedCache.store };
+  return {
+    mode: "structured",
+    graph: committed,
+    store: refreshedCache.store,
+    ...(dropped.length ? { warnings: [`이 데이터 원천이 노드 실행 계약을 보존하지 않았습니다 (${dropped.join(" / ")}). 해당 노드의 승인 게이트·재시도·권한 검사는 실행 시 적용되지 않습니다.`] } : {}),
+  };
 }
 
 async function mutateStructuredSource(mutation, preferredGraphId) {
@@ -779,9 +890,12 @@ async function adoptBridgeTerminal(terminalId) {
   if (typeof terminalId !== "string" || !terminalId.trim()) throw new Error("bridge terminal id is required");
   const shown = await runOrca(["terminal", "show", "--terminal", terminalId.trim()]);
   if (!shown?.terminal?.connected || !shown.terminal.writable) throw new Error("bridge terminal is unavailable or read-only");
-  const store = await readJson(storePath, defaultStorePath);
-  store.bridgeTerminalId = terminalId.trim();
-  await atomicJson(storePath, store);
+  const store = await withStoreWrite(async () => {
+    const current = await readJson(storePath, defaultStorePath);
+    current.bridgeTerminalId = terminalId.trim();
+    await atomicJson(storePath, current);
+    return current;
+  });
   await rebuild();
   return { terminalId: store.bridgeTerminalId, store };
 }
@@ -831,7 +945,27 @@ async function runOrcaNow(args, timeout = 30_000, cwd = root, environmentSelecto
   return payload.result;
 }
 
+// 변이 명령만 한 줄로 세운다. 읽기와 대기는 Orca 상태를 바꾸지 않으므로 직렬화할
+// 이유가 없고, 같은 줄에 세우면 `terminal wait --for tui-idle`(최대 90초) 하나가
+// 뒤에 선 모든 호출의 예산을 먹어치운다. Task per_project처럼 dispatch를 동시에
+// 띄우는 경로에서는 그것이 그대로 다른 프로젝트의 위양성 실패가 된다.
+const ORCA_UNSERIALIZED_COMMANDS = new Set([
+  "status",
+  "environment list",
+  "project list",
+  "repo list",
+  "worktree list",
+  "worktree ps",
+  "tab list",
+  "terminal list",
+  "terminal read",
+  "terminal show",
+  "terminal wait",
+]);
+
 function runOrca(args, timeout = 30_000, cwd = root, environmentSelector = null) {
+  const command = [args[0], args[1]].filter((part) => typeof part === "string" && !part.startsWith("-")).join(" ");
+  if (ORCA_UNSERIALIZED_COMMANDS.has(command)) return runOrcaNow(args, timeout, cwd, environmentSelector);
   const task = orcaQueue.then(() => runOrcaNow(args, timeout, cwd, environmentSelector));
   orcaQueue = task.catch(() => undefined);
   return task;
@@ -1574,25 +1708,6 @@ function buildPrompt(graph, node, runId, workInput) {
   ].filter(Boolean).join("\n");
 }
 
-// 실패 보고를 놓치면 실패한 노드가 done으로 굳는다. 에이전트가 계약된 결과 줄을
-// 굵게 쓰거나 목록/인용 기호를 앞에 붙여도 같은 판정이 나오도록 장식을 걷어내고,
-// 서두 몇 줄 안에서 찾는다. done을 먼저 만나면 거기서 멈춘다.
-const DISPATCH_RESULT_SCAN_LINES = 5;
-
-function dispatchedResultFailure(summary) {
-  const lines = String(summary || "").split(/\r?\n/u)
-    .map((line) => line.replace(/^[\s>*\-#]+/u, "").replace(/[*`_]/gu, "").trim())
-    .filter(Boolean)
-    .slice(0, DISPATCH_RESULT_SCAN_LINES);
-  for (const line of lines) {
-    const match = line.match(/^RESULT:\s*(done|failed)\b\s*(?:[—:-]\s*)?(.*)$/iu);
-    if (!match) continue;
-    if (match[1].toLowerCase() === "done") return "";
-    return match[2]?.trim() || "agent reported failed or blocked work";
-  }
-  return "";
-}
-
 function standaloneRouting(value) {
   if (value === undefined || value === null) return {};
   if (typeof value !== "object" || Array.isArray(value)) throw new Error("standalone task routing must be an object");
@@ -1635,7 +1750,8 @@ function buildStandaloneWorkItemPrompt(itemKind, item, prompt, routing, scope, p
     `- reasoning: ${routing.reasoning || "agent default/current"}`,
     "",
     `Follow the target repository's instructions and complete only this ${label}.`,
-    "Finish with a concise result and the verification performed.",
+    "Then make the first line of the final response exactly `RESULT: done` or `RESULT: failed — <reason>`.",
+    "Use `RESULT: failed` for blocked, incomplete, unverifiable, or failed work; follow it with a concise result and the verification performed.",
   ].filter(Boolean).join("\n");
 }
 
@@ -2018,7 +2134,8 @@ async function evaluateCondition(graph, node, targets, runId, nodeOutputs, workI
 async function persistRunProgress(store, message, executionId = undefined, graphId = undefined) {
   // Open panels poll the response bridge for runtime state. Rebuilding panel.html here
   // reloads every Orca WebView and destroys in-flight click targets on every node update.
-  await saveStore(store, message, { rebuildPanel: false });
+  // 실행 중 사용자가 저장한 편집을 삼키지 않도록 실행 중인 그래프만 얹어 쓴다.
+  await saveStore(store, message, { rebuildPanel: false, ...(graphId ? { mergeGraphId: graphId } : {}) });
   if (executionId && graphId) {
     await syncGraphRuntimeExecution(executionId, store.graphs.find((item) => item.id === graphId));
   }
@@ -2302,6 +2419,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
 
   try {
     for (const nodeId of order) {
+      assertNotCancelled(runtimeExecutionId);
       const elapsed = Date.now() - now.getTime();
       const maxWallMs = Number(graph.runGuards?.maxWallSeconds || 0) * 1000;
       if (!dryRun && maxWallMs && elapsed > maxWallMs) {
@@ -2537,14 +2655,16 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
     await persistRunProgress(store, `${graph.name} · ${dryRun ? "실행 계획" : "Run"} #${run.runNo} 완료`, runtimeExecutionId, graph.id);
     return run;
   } catch (error) {
-    run.status = "failed";
+    const cancelled = error?.executionCancelled === true;
+    run.status = cancelled ? "cancelled" : "failed";
     run.endedAt = new Date().toISOString();
-    run.terminationReason ||= "node_failed";
+    run.terminationReason ||= cancelled ? "cancelled" : "node_failed";
     run.stats.durationMs = Date.now() - now.getTime();
     run.summary = error instanceof Error ? error.message : String(error);
     graph.status = "active";
     await persistRunProgress(store, `${graph.name} · Run #${run.runNo} 실패 · ${run.summary}`, runtimeExecutionId, graph.id);
     const failure = new Error(`${graph.name}: ${run.summary}`, { cause: error });
+    if (cancelled) failure.executionCancelled = true;
     failure.graphRunId = run.id;
     failure.graphId = graph.id;
     throw failure;
@@ -2557,7 +2677,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
    브리지가 통신 오류로 제자리를 도는 경우를 끊는 마지막 방어선이다. */
 const REMOTE_EXECUTION_MAX_STEPS = 500;
 
-function syncRemoteFrontierStore(store, graphId, frontier) {
+function syncRemoteFrontierStore(store, graphId, frontier, nodeResults = null) {
   const localGraph = store.graphs.find((graph) => graph.id === graphId);
   if (!localGraph) return;
   if (frontier.graph) {
@@ -2572,8 +2692,12 @@ function syncRemoteFrontierStore(store, graphId, frontier) {
   }
   if (frontier.run?.id) {
     const index = localGraph.runs.findIndex((run) => run.id === frontier.run.id);
-    if (index >= 0) localGraph.runs[index] = { ...localGraph.runs[index], ...frontier.run };
-    else localGraph.runs.push(frontier.run);
+    const merged = index >= 0 ? { ...localGraph.runs[index], ...frontier.run } : { ...frontier.run };
+    // 원천 run 요약은 노드별 이력을 싣지 않는다. 브리지가 직접 관측한 결과를 붙여야
+    // 패널에서 어느 노드가 어디서 왜 멈췄는지 볼 수 있다.
+    if (nodeResults?.length) merged.nodeResults = nodeResults.map((result) => ({ ...result }));
+    if (index >= 0) localGraph.runs[index] = merged;
+    else localGraph.runs.push(merged);
   }
 }
 
@@ -2617,6 +2741,25 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
   };
   const nodeOutputs = new Map();
   const sessionPool = new Map();
+  // 이 run에서 브리지가 관측한 노드별 경과. 원천은 요약 통계만 돌려주므로 이것이
+  // 패널이 볼 수 있는 유일한 노드 단위 이력이다.
+  const observedResults = new Map();
+  const runResults = () => [...observedResults.values()];
+  const recordNodeResult = (node, patch) => {
+    const previous = observedResults.get(node.id) ?? {
+      nodeId: node.id,
+      status: "running",
+      startedAt: new Date().toISOString(),
+    };
+    const next = { ...previous, ...patch };
+    if (["done", "skipped", "failed"].includes(next.status) && !next.endedAt) {
+      next.endedAt = new Date().toISOString();
+      const started = Date.parse(next.startedAt);
+      if (Number.isFinite(started)) next.durationMs = Date.parse(next.endedAt) - started;
+    }
+    observedResults.set(node.id, next);
+    return next;
+  };
   // claim과 complete 사이에 원천 graph version이 움직일 수 있다 — 대시보드 편집,
   // 만료된 임대 회수, 다른 실행자. 거기서 complete를 포기하면 노드는 running으로
   // 잠긴 채 남고 임대가 끝날 때까지 그래프를 다시 돌릴 수 없다. 최신 version으로
@@ -2633,18 +2776,41 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
     }
   };
   const persistRemoteFailure = async (runnable, claim, message) => {
+    recordNodeResult(runnable, { status: "failed", message: message.slice(0, 4_000) });
     const failed = await settleNode(runnable.id, claim.graph.version, {
       result: "failed", note: message.slice(0, 2000),
     });
     frontier = Array.isArray(failed.nodes)
       ? { ...frontier, graph: failed.graph, run: failed.run, nodes: failed.nodes }
       : await fetchStructuredExecution(config, graph.id);
-    syncRemoteFrontierStore(store, graph.id, frontier);
+    syncRemoteFrontierStore(store, graph.id, frontier, runResults());
     await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} 실패 · 원격 run`, executionId, graph.id);
   };
+  // run 시간 한도는 preflight가 루프 그래프에 필수로 요구하는 가드다. 원격에서
+  // 지키지 않으면 강제한 계약이 실행 단계에서 사라진다. 노드 경계에서만 끊어
+  // 진행 중인 노드를 임대만 남긴 채 버리지 않는다.
+  const maxWallSeconds = Number(graph.runGuards?.maxWallSeconds || 0);
+  const wallDeadline = runWallDeadline(graph.runGuards, frontier.run?.startedAt, Date.now());
   let completed = 0;
   let skipped = 0;
   for (let step = 0; step < REMOTE_EXECUTION_MAX_STEPS; step += 1) {
+    if (executionId && cancelRequests.has(executionId)) {
+      // 원천이 run 수명주기의 소유자다. 여기서 run을 봉인하면 진행한 노드까지
+      // 되돌리게 되므로 원천은 건드리지 않고, 로컬 거울에만 중단을 남긴다.
+      // 원천 run은 다음 실행이 새 run을 시작할 때 supersede된다.
+      const localRun = store.graphs.find((item) => item.id === graph.id)?.runs?.find((run) => run.id === frontier.run?.id);
+      if (localRun) {
+        localRun.status = "cancelled";
+        localRun.endedAt = new Date().toISOString();
+        localRun.terminationReason = "cancelled";
+        localRun.summary = "사용자가 실행을 중단했습니다. 원천 run은 다음 실행이 새 run을 시작할 때 정리됩니다.";
+      }
+      await persistRunProgress(store, `${graph.name} · 사용자가 중단 · 원격 run`, executionId, graph.id);
+    }
+    assertNotCancelled(executionId);
+    if (wallDeadline && Date.now() > wallDeadline) {
+      throw new Error(`원격 그래프 실행이 run 시간 한도 ${maxWallSeconds}초를 넘겨 중단했습니다.`);
+    }
     const closable = frontier.nodes.find((node) => node.branchClosed && node.status === "pending");
     const runnable = closable ?? frontier.nodes.find((node) => node.ready
       && node.executable !== false && capability.nodeKinds.includes(node.kind));
@@ -2662,15 +2828,29 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
     if (!closable) {
       const localRuntimeNode = store.graphs.find((item) => item.id === graph.id)?.nodes.find((item) => item.id === runnable.id);
       if (localRuntimeNode) localRuntimeNode.status = "running";
+      recordNodeResult(runnable, { status: "running", attempt: Number(claim.node?.attempt) || 1 });
       await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} 실행 중 · 원격 run`, executionId, graph.id);
     }
     let outcome;
-    if (closable) {
+    // 설계 노드는 라우팅뿐 아니라 승인 게이트·자식 그래프 같은 실행 의미도 싣고 있다.
+    // frontier에는 그것이 없으므로 dispatch 여부를 정하기 전에 먼저 읽는다.
+    const design = closable ? null : localNode(runnable.id);
+    // 무엇을 할지는 순수 규칙이 정한다. 실행기는 그 결정을 수행만 한다.
+    const decisionForNode = remoteNodeDecision({ runnable, design, closable });
+    if (decisionForNode.action === "fail") {
+      const message = `${runnable.label || runnable.id}: ${decisionForNode.reason}`;
+      await persistRemoteFailure(runnable, claim, message);
+      throw new Error(message);
+    }
+    if (decisionForNode.action === "skip") {
       outcome = { result: "skipped", note: "branch closed" };
+      recordNodeResult(runnable, { status: "skipped", message: decisionForNode.reason });
       skipped += 1;
-    } else if (runnable.kind === "condition") {
-      const design = localNode(runnable.id);
-      if (!design) throw new Error(`${runnable.label || runnable.id}: condition is missing from the panel snapshot`);
+    } else if (decisionForNode.action === "gate") {
+      outcome = { result: "done", note: decisionForNode.reason };
+      recordNodeResult(runnable, { status: "done", message: "사람 승인이 기록된 게이트입니다." });
+      nodeOutputs.set(runnable.id, "human gate approved");
+    } else if (decisionForNode.action === "condition") {
       let branch = normalizeBranch(design.branchTaken);
       let decision = null;
       if (!branch) {
@@ -2687,47 +2867,74 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
         ? `AI auto decision${decision.reason ? `: ${decision.reason}` : ""}`
         : "fixed branch selected in the run settings";
       outcome = { result: "done", branch, note, ...(decision?.sessionId ? { sessionId: decision.sessionId } : {}) };
+      recordNodeResult(runnable, {
+        status: "done",
+        message: `branch=${branch} · ${note}`,
+        ...(decision?.sessionId ? { sessionId: decision.sessionId } : {}),
+        ...(decision?.sessionTitle ? { sessionTitle: decision.sessionTitle } : {}),
+      });
       if (executionId && decision?.sessionId) {
         await assignRuntimeExecutionSession(executionId, decision, taskTargetForExecutionNode(design)?.locator);
       }
       nodeOutputs.set(runnable.id, `branch=${branch} · ${note}`);
     } else {
       // 라우팅은 설계 노드(project/session/model override와 Task)에 실려 있다.
-      // frontier에는 없으므로 없으면 임의로 보내지 않고 이 노드를 실패로 닫는다.
-      const design = localNode(runnable.id);
-      if (!design) {
-        await persistRemoteFailure(runnable, claim, "node is missing from the panel snapshot; refresh the data source");
-        throw new Error(`${runnable.label || runnable.id}: node is missing from the panel snapshot; refresh the data source`);
-      }
-      try {
-        const dispatched = await dispatchTask(graph, design, targets, frontier.run?.id ?? graph.id, {
-          sessionPool,
-          title: `${graph.name} · 원격 Run`,
-          ...(workInput !== undefined ? { workInput } : {}),
-        });
-        if (executionId) {
-          await assignRuntimeExecutionSession(executionId, dispatched, taskTargetForExecutionNode(design)?.locator);
+      // 재시도 예산도 설계에 있다 — preflight가 maxAttempts>1이면 idempotency key를
+      // 요구하므로, 여기서 1회만 보내면 강제한 계약과 실제 동작이 어긋난다.
+      const maxAttempts = nodeAttemptBudget(design);
+      let dispatched = null;
+      let lastError = null;
+      let attempt = 0;
+      for (attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        recordNodeResult(runnable, { status: "running", attempt });
+        try {
+          dispatched = await dispatchTask(graph, design, targets, frontier.run?.id ?? graph.id, {
+            sessionPool,
+            title: `${graph.name} · 원격 Run`,
+            ...(workInput !== undefined ? { workInput } : {}),
+          });
+          if (executionId) {
+            await assignRuntimeExecutionSession(executionId, dispatched, taskTargetForExecutionNode(design)?.locator);
+          }
+          const dispatchedFailure = dispatchedResultFailure(dispatched.resultSummary);
+          if (dispatchedFailure) throw new Error(dispatchedFailure);
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+          dispatched = null;
+          if (attempt < maxAttempts) {
+            await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} 재시도 대기 · ${attempt}/${maxAttempts} · 원격 run`, executionId, graph.id);
+            await new Promise((resolve) => setTimeout(resolve, retryDelay(attempt)));
+          }
         }
-        const dispatchedFailure = dispatchedResultFailure(dispatched.resultSummary);
-        if (dispatchedFailure) throw new Error(dispatchedFailure);
-        if (dispatched.resultSummary) nodeOutputs.set(runnable.id, dispatched.resultSummary);
-        outcome = {
-          result: "done",
-          sessionId: dispatched.sessionId,
-          ...(dispatched.resultSummary ? { note: dispatched.resultSummary.slice(0, 2_000) } : {}),
-        };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        await persistRemoteFailure(runnable, claim, message);
-        throw error;
       }
+      if (lastError || !dispatched) {
+        const message = lastError instanceof Error ? lastError.message : String(lastError);
+        recordNodeResult(runnable, { attempt: Math.min(attempt, maxAttempts) });
+        await persistRemoteFailure(runnable, claim, message);
+        throw lastError instanceof Error ? lastError : new Error(message);
+      }
+      if (dispatched.resultSummary) nodeOutputs.set(runnable.id, dispatched.resultSummary);
+      outcome = {
+        result: "done",
+        sessionId: dispatched.sessionId,
+        ...(dispatched.resultSummary ? { note: dispatched.resultSummary.slice(0, 2_000) } : {}),
+      };
+      recordNodeResult(runnable, {
+        status: "done",
+        attempt: Math.min(attempt, maxAttempts),
+        sessionId: dispatched.sessionId,
+        ...(dispatched.sessionTitle ? { sessionTitle: dispatched.sessionTitle } : {}),
+        ...(dispatched.resultSummary ? { message: dispatched.resultSummary.slice(0, 4_000) } : {}),
+      });
     }
     const done = await settleNode(runnable.id, claim.graph.version, outcome);
     if (outcome.result === "done" && !closable) completed += 1;
     frontier = Array.isArray(done.nodes)
       ? { ...frontier, graph: done.graph, run: done.run, nodes: done.nodes }
       : await fetchStructuredExecution(config, graph.id);
-    syncRemoteFrontierStore(store, graph.id, frontier);
+    syncRemoteFrontierStore(store, graph.id, frontier, runResults());
     await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} ${closable ? "건너뜀" : "완료"} · 원격 run`, executionId, graph.id);
   }
   const failedNodes = frontier.nodes.filter((node) => node.status === "failed");
@@ -2930,17 +3137,62 @@ async function syncGraphRuntimeExecution(executionId, graph) {
     const completed = statusSource.filter((item) => item.status === "done" || item.status === "skipped").length;
     const failed = statusSource.filter((item) => item.status === "failed").length;
     record.progress = { completed, failed, total: Math.max(record.progress.total, graph.nodes?.length ?? 0) };
-    const sessionIds = nodeResults.map((item) => item.sessionId).filter(Boolean);
-    const firstWithSession = nodeResults.find((item) => item.sessionId);
-    if (sessionIds[0] && record.targets[0] && !record.targets[0].sessionId) {
-      record.targets[0].sessionId = sessionIds[0];
-      if (firstWithSession?.sessionTitle) record.targets[0].sessionTitle = firstWithSession.sessionTitle;
+    const withSession = nodeResults.filter((item) => item.sessionId);
+    if (withSession[0] && record.targets[0] && !record.targets[0].sessionId) {
+      record.targets[0].sessionId = withSession[0].sessionId;
+      if (withSession[0].sessionTitle) record.targets[0].sessionTitle = withSession[0].sessionTitle;
+    }
+    // 노드마다 다른 프로젝트·세션으로 라우팅된 run은 세션이 하나가 아니다.
+    // 요약에 첫 세션만 남기면 나머지 세션이 있었다는 사실 자체가 사라진다.
+    const distinct = [...new Set(withSession.map((item) => item.sessionId))];
+    if (record.targets[0]) {
+      if (distinct.length > 1) record.targets[0].sessionCount = distinct.length;
+      else delete record.targets[0].sessionCount;
     }
   });
 }
 
+// 중단 요청은 노드 경계에서만 관측된다. 진행 중인 에이전트 턴을 중간에 끊으면
+// 원격 노드가 claim된 채 임대 만료까지 잠기고 Orca 세션도 정리되지 않는다.
+const cancelRequests = new Set();
+
+function assertNotCancelled(executionId) {
+  if (!executionId || !cancelRequests.has(executionId)) return;
+  // 사고와 의도를 구분하는 표시. 감싸는 오류에도 옮겨 실어야 run 이력까지 일관된다.
+  const error = new Error("사용자가 실행을 중단했습니다.");
+  error.executionCancelled = true;
+  throw error;
+}
+
+async function requestExecutionCancel(executionId, itemId = "") {
+  if (!executionId && !itemId) throw new Error("execution id or item id is required to cancel");
+  const records = await readExecutions();
+  // 실행 ID를 모르는 호출자(그래프 화면 등)는 그 항목의 진행 중 실행을 지목한다.
+  const record = executionId
+    ? records.find((item) => item.id === executionId)
+    : records.find((item) => item.itemId === itemId && ["queued", "running"].includes(item.status));
+  if (!record) throw new Error(`execution not found: ${executionId || itemId}`);
+  executionId = record.id;
+  if (!["queued", "running"].includes(record.status)) {
+    return { executionId, status: record.status, cancelling: false, message: "이미 끝난 실행입니다." };
+  }
+  cancelRequests.add(executionId);
+  await updateRuntimeExecution(executionId, (current) => {
+    current.cancelRequestedAt = new Date().toISOString();
+  }, { rebuildPanel: false });
+  return {
+    executionId,
+    status: record.status,
+    cancelling: true,
+    message: "진행 중인 노드가 끝나면 중단합니다. 이미 보낸 에이전트 작업은 그대로 진행됩니다.",
+  };
+}
+
 function scheduleRuntimeExecution(record, job) {
-  const task = queue.then(async () => {
+  // 실행은 서로 겹치지 않게 직렬화하되 메시지 큐와는 분리한다. 같은 줄에 세우면
+  // 15분짜리 노드 하나가 저장·원천 새로고침·실행 초기화를 전부 막는다 —
+  // 정작 초기화가 필요한 순간에 버튼이 응답하지 않는다.
+  const task = executionQueue.then(async () => {
     const startedAt = new Date().toISOString();
     await updateRuntimeExecution(record.id, (current) => {
       current.status = "running";
@@ -2976,29 +3228,39 @@ function scheduleRuntimeExecution(record, job) {
         if (current.itemKind !== "graph") current.progress.completed = current.progress.total;
         current.progress.failed = 0;
       });
+      // 중단 요청이 늦게 도착해 이미 성공했다면 그 요청은 유효하지 않다.
+      if (cancelRequests.has(record.id)) {
+        await updateRuntimeExecution(record.id, (current) => { delete current.cancelRequestedAt; }, { rebuildPanel: false });
+      }
       console.log(`[bridge] execution completed ${record.id}`);
       return result;
     } catch (error) {
       const endedAt = new Date().toISOString();
       const message = error instanceof Error ? error.message : String(error);
+      // 사용자가 멈춘 것을 실패로 기록하면 이력에서 사고와 의도가 구분되지 않는다.
+      const cancelled = error?.executionCancelled === true || cancelRequests.has(record.id);
       await updateRuntimeExecution(record.id, (current) => {
-        current.status = "failed";
+        current.status = cancelled ? "cancelled" : "failed";
         current.endedAt = endedAt;
         current.error = message.slice(0, 2_000);
         for (const target of current.targets) {
           if (target.status === "queued" || target.status === "running") {
-            target.status = "failed";
+            target.status = cancelled ? "cancelled" : "failed";
             target.error = message.slice(0, 2_000);
             target.endedAt = endedAt;
           }
         }
-        current.progress.failed = Math.max(1, current.targets.filter((item) => item.status === "failed").length);
+        current.progress.failed = cancelled
+          ? current.targets.filter((item) => item.status === "failed").length
+          : Math.max(1, current.targets.filter((item) => item.status === "failed").length);
       });
-      console.error(`[bridge] ${record.itemKind} ${record.itemId} execution failed: ${message}`);
+      console.error(`[bridge] ${record.itemKind} ${record.itemId} execution ${cancelled ? "cancelled" : "failed"}: ${message}`);
       return undefined;
+    } finally {
+      cancelRequests.delete(record.id);
     }
   });
-  queue = task.catch(() => undefined);
+  executionQueue = task.catch(() => undefined);
 }
 
 async function startWorkItemExecution(message, itemKind) {
@@ -3163,6 +3425,13 @@ function standaloneProjectSessions(value) {
   });
 }
 
+// 단건 실행에는 노드 편집기가 없다. 그래프 노드의 timeoutSeconds에 해당하는 값을
+// 환경변수로라도 조절할 수 있어야 오래 걸리는 Task가 900초에 잘리지 않는다.
+function standaloneTimeoutSeconds() {
+  const configured = Number(process.env.ORCA_GRAPH_WORK_ITEM_TIMEOUT_SECONDS || 900);
+  return Number.isFinite(configured) ? Math.max(60, Math.floor(configured)) : 900;
+}
+
 async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun, executionMode = "single_session", requestedProjectSessions = [], onProgress = null, executionTargets = null) {
   if (!["task", "todo"].includes(itemKind)) throw new Error(`unsupported standalone work item kind: ${itemKind}`);
   if (!["single_session", "per_project"].includes(executionMode)) throw new Error(`unsupported standalone execution mode: ${executionMode}`);
@@ -3198,7 +3467,7 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
       ...(itemKind === "task" && Array.isArray(item.projects) ? { projects: orderedTaskProjects(item) } : {}),
     },
     routing: {},
-    engineering: { contextMode: "inherit", timeoutSeconds: 900 },
+    engineering: { contextMode: "inherit", timeoutSeconds: standaloneTimeoutSeconds() },
   };
   const targetProjects = itemKind === "task"
     ? orderedTaskProjects(item).filter((project) => project.role === "target" && project.locatorKind === "folder")
@@ -3258,6 +3527,9 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
 
   const settled = await Promise.allSettled(executions.map(async (execution, index) => {
     await onProgress?.({ index, status: "running" });
+    // 실패한 실행일수록 어느 Orca session에서 돌았는지 열어봐야 한다.
+    // dispatch가 세션을 만든 뒤에 실패해도 그 정보는 남긴다.
+    let dispatchedSession = null;
     try {
       const result = await dispatchTask(
         execution.graph,
@@ -3276,7 +3548,12 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
           title: `${itemKind === "task" ? "Task" : "Todo"} · ${item.title}${execution.project ? ` · ${execution.project.label || path.basename(execution.project.locator)}` : ""}`,
         },
       );
-      await onProgress?.({ index, status: "completed", sessionId: result.sessionId, sessionTitle: result.sessionTitle });
+      dispatchedSession = { sessionId: result.sessionId, sessionTitle: result.sessionTitle };
+      // 에이전트가 계약대로 실패를 보고했다면 그것은 성공한 실행이 아니다.
+      // Graph 노드와 같은 판정을 단건 실행에도 적용한다.
+      const dispatchedFailure = dispatchedResultFailure(result.resultSummary);
+      if (dispatchedFailure) throw new Error(dispatchedFailure);
+      await onProgress?.({ index, status: "completed", ...dispatchedSession });
       return {
         locator: execution.project?.locator ?? null,
         sessionId: result.sessionId,
@@ -3285,7 +3562,12 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
         position: index,
       };
     } catch (error) {
-      await onProgress?.({ index, status: "failed", error: error instanceof Error ? error.message : String(error) });
+      await onProgress?.({
+        index,
+        status: "failed",
+        ...(dispatchedSession ?? {}),
+        error: error instanceof Error ? error.message : String(error),
+      });
       throw error;
     }
   }));
@@ -3325,8 +3607,15 @@ async function runTodoThroughQuickTask(todoId, requestedRouting, dryRun, idempot
   if (project?.path) {
     await linkTaskProjects(prepared.taskId, [project.path], routing.branch);
   }
-  const result = await runStandaloneTask(prepared.taskId, routing, false, undefined, undefined, onProgress);
-  return { ...result, todoId, taskId: prepared.taskId };
+  try {
+    const result = await runStandaloneTask(prepared.taskId, routing, false, undefined, undefined, onProgress);
+    return { ...result, todoId, taskId: prepared.taskId };
+  } catch (error) {
+    // Task는 이미 원천에 만들어졌고 보존 계약상 지우지 않는다. 실패 메시지에서
+    // 그 사실을 숨기면 사용자는 고아 Task가 생긴 줄도 모른다.
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message}\n이 Todo의 Task ${prepared.taskId}는 이미 생성되어 남아 있습니다. 같은 Todo를 다시 실행하면 그 Task를 재사용합니다.`, { cause: error });
+  }
 }
 
 async function handleMessage(message) {
@@ -3397,6 +3686,16 @@ async function handleMessage(message) {
         typeof message.locator === "string" ? message.locator : "",
         message.branch,
       );
+    case "cancel-execution": {
+      const result = await requestExecutionCancel(String(message.executionId || ""), String(message.itemId || message.graphId || ""));
+      console.log(`[bridge] execution cancel requested ${result.executionId}`);
+      return result;
+    }
+    case "reset-graph-run": {
+      const result = await resetGraphRunState(String(message.graphId || ""));
+      console.log(`[bridge] graph run state reset (${result.graphId})`);
+      return result;
+    }
     case "set-graph-process":
       return setGraphProcess(String(message.graphId || ""), Number(message.expectedVersion), Boolean(message.enabled));
     case "create-quick-graph": {

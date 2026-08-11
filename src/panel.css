@@ -859,3 +859,41 @@ textarea { resize: vertical; min-height: 74px; line-height: 1.45; }
   .execution-pulse, .node.status-running .node-vector { animation: none; }
   .execution-progress > span { transition: none; }
 }
+
+/* 실행 현황 · 노드별 진행 경과 타임라인 */
+.execution-run-history { display: grid; gap: 8px; border: 1px solid var(--border); border-radius: 11px; padding: 10px; background: color-mix(in srgb, var(--background) 60%, var(--card)); }
+.execution-run-history > header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.execution-run-history > header strong { font-size: 13px; }
+.execution-run-history > header span { font-size: 11px; color: var(--muted-foreground); }
+.run-timeline { display: grid; gap: 7px; }
+.run-timeline-empty, .run-nodes-empty { margin: 0; font-size: 12px; color: var(--muted-foreground); }
+.run-entry { border: 1px solid var(--border); border-radius: 10px; background: var(--card); overflow: hidden; }
+.run-entry > summary { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 10px; cursor: pointer; font-size: 12px; }
+.run-entry > summary::-webkit-details-marker { display: none; }
+.run-entry .run-no { font-weight: 700; }
+.run-entry .run-counts { color: var(--muted-foreground); }
+.run-entry > summary time { margin-left: auto; color: var(--muted-foreground); font-size: 11px; }
+.run-status-chip { padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); }
+.run-status-chip.running { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+.run-status-chip.failed { background: color-mix(in srgb, #ef4444 20%, transparent); }
+.run-status-chip.done { background: color-mix(in srgb, #22c55e 20%, transparent); }
+.run-entry.run-status-failed { border-color: color-mix(in srgb, #ef4444 45%, var(--border)); }
+.run-input { margin: 0 10px 8px; padding: 8px 10px; border-radius: 9px; background: color-mix(in srgb, var(--background) 70%, var(--card)); }
+.run-input strong { display: block; font-size: 11px; color: var(--muted-foreground); margin-bottom: 3px; }
+.run-input p { margin: 0; font-size: 12px; white-space: pre-wrap; }
+.run-termination { margin: 0 10px 8px; font-size: 12px; color: #fca5a5; }
+.run-nodes { list-style: none; margin: 0; padding: 0 10px 10px; display: grid; gap: 6px; }
+.run-node { display: grid; grid-template-columns: 78px 1fr; gap: 9px; align-items: start; padding: 8px; border-radius: 9px; border: 1px solid var(--border); background: color-mix(in srgb, var(--background) 55%, var(--card)); }
+.run-node-status { font-size: 11px; font-weight: 700; padding-top: 1px; }
+.run-node.status-failed { border-color: color-mix(in srgb, #ef4444 50%, var(--border)); }
+.run-node.status-failed .run-node-status { color: #ef4444; }
+.run-node.status-done .run-node-status { color: #22c55e; }
+.run-node.status-skipped .run-node-status, .run-node.status-pending .run-node-status { color: var(--muted-foreground); }
+.run-node-body { display: grid; gap: 4px; min-width: 0; }
+.run-node-body > strong { font-size: 12px; overflow-wrap: anywhere; }
+.run-node-meta { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; color: var(--muted-foreground); }
+.run-node-message { margin: 2px 0 0; padding: 7px 8px; border-radius: 7px; background: color-mix(in srgb, var(--background) 80%, var(--card)); font-size: 11px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 190px; overflow: auto; }
+.run-node-message.failed { background: color-mix(in srgb, #ef4444 12%, var(--card)); }
+.node-run-message { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.execution-cancel-row { margin: 0; display: flex; justify-content: flex-end; }
+.execution-cancelling { font-size: 11px; color: var(--muted-foreground); }
