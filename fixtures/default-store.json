@@ -1,7 +1,6 @@
 {
   "schemaVersion": 1,
   "activeGraphId": "graph-orca-demo",
-  "lastBridgeMessage": "브리지를 연결하면 로컬 저장과 Orca 대상 검색을 사용할 수 있습니다.",
   "domains": [],
   "milestones": [],
   "tasks": [],
@@ -155,7 +154,9 @@
             "role": "verifier",
             "contextMode": "fresh",
             "maxAttempts": 1,
-            "permissions": ["read"],
+            "permissions": [
+              "read"
+            ],
             "evidenceRequired": true
           }
         }
@@ -165,5 +166,7 @@
       "createdAt": "2026-08-08T00:00:00.000Z",
       "updatedAt": "2026-08-08T00:00:00.000Z"
     }
-  ]
+  ],
+  "lastSaveMessage": "편집한 뒤 저장하면 Orca 터미널로 저장 명령을 보냅니다.",
+  "dispatchLog": []
 }

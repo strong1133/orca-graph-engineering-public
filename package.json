@@ -18,7 +18,7 @@
   },
   "packageManager": "npm@10.9.4",
   "files": [
-    "bridge/",
+    "lib/",
     "docs/architecture.md",
     "docs/data-source-contract.md",
     "docs/graph-engineering-reference.md",
@@ -39,9 +39,7 @@
     "check": "npm run typecheck && npm run test && npm run build",
     "package:plugin": "node scripts/package-plugin.mjs",
     "verify:plugin": "node scripts/verify-plugin-package.mjs",
-    "bridge": "node bridge/index.mjs",
-    "bridge:client": "node scripts/bridge-client.mjs",
-    "preview": "node scripts/serve.mjs"
+    "store": "node scripts/graph-store.mjs"
   },
   "devDependencies": {
     "@types/jsdom": "^21.1.7",

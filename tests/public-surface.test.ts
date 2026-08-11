@@ -63,7 +63,7 @@ describe("public plugin surface", () => {
     expect(packager).toContain("createCanonicalArchive");
     expect(packager).toContain("archive.writeUInt32LE(0, 4)");
     expect(verifier).not.toContain("ORCA_GRAPH_SKIP_REBUILD");
-    expect(verifier).toContain("bridgeSave: \"saved\"");
+    expect(verifier).toContain("saveCli: \"saved\"");
     expect(workflow).toContain("no-install plugin bootstrap/save");
     expect(packageJson.files).not.toContain("runtime/");
     if (packageJson.private === true) {
@@ -84,7 +84,7 @@ describe("public plugin surface", () => {
 
   it("does not regress to private-service names, secrets, or absolute contributor paths", async () => {
     // 테스트 픽스처도 공개된다. 여기 개인 장치 이름이 남으면 그것도 결합이다.
-    const roots = ["bridge", "docs", "fixtures", "scripts", "src", "tests"];
+    const roots = ["docs", "fixtures", "lib", "scripts", "src", "tests"];
     const files = ["README.md", "CONTRIBUTING.md", "SECURITY.md", "orca-plugin.json", "package.json"];
     for (const directory of roots) files.push(...await publicFiles(directory));
     const forbidden = [
@@ -110,22 +110,36 @@ describe("public plugin surface", () => {
     expect(findings).toEqual([]);
   });
 
-  it("makes the unsupported live-loop boundary visible before dispatch", async () => {
+  it("keeps the panel honest about what it can observe after dispatch", async () => {
     const panel = await readFile(path.join(root, "src/panel.ts"), "utf8");
-    const bridge = await readFile(path.join(root, "bridge/index.mjs"), "utf8");
-    expect(panel).toContain("로컬 브리지는 loop 재진입을 아직 실행하지 않습니다");
-    expect(bridge).toContain("live loop re-entry is not supported by the local bridge");
+    // 패널에는 세션에서 돌아오는 채널이 없다. 진행률이나 완료를 지어내면 사용자는
+    // 실제로는 확인되지 않은 상태를 사실로 읽는다.
+    expect(panel).toContain("전달 뒤의 진행은 각 세션에서 확인하십시오");
+    expect(panel).not.toContain("executionActive");
   });
 
-  it("routes every graph store write through the single write lane", async () => {
-    const bridge = await readFile(path.join(root, "bridge/index.mjs"), "utf8");
-    // 실행 진행 기록과 패널 저장은 서로 다른 레인에서 돈다. store 파일은 통째로
-    // 교체되므로 쓰기 하나라도 잠금 밖에 남으면 편집이 조용히 사라진다.
-    const writes = [...bridge.matchAll(/atomicJson\(storePath/gu)].length;
-    const lanes = [...bridge.matchAll(/withStoreWrite\(/gu)].length;
-    expect(writes).toBeGreaterThan(0);
-    // 선언 1회 + 쓰기 지점마다 1회.
-    expect(lanes).toBe(writes + 1);
+  it("keeps the save path free of a resident helper process", async () => {
+    const cli = await readFile(path.join(root, "scripts/graph-store.mjs"), "utf8");
+    const panel = await readFile(path.join(root, "src/panel.ts"), "utf8");
+    // 상주 프로세스를 되살리면 사용자가 다시 그것을 관리해야 한다.
+    expect(cli).toContain("상주 프로세스가 아니다");
+    expect(cli).not.toContain("http.createServer");
+    expect(cli).not.toContain("process.stdin");
+    // 넓게 보기용 loopback 응답 채널이 되살아나는 것을 막는다. 데이터 원천 URL
+    // 입력의 예시 값은 사용자가 직접 넣는 주소이므로 여기 해당하지 않는다.
+    expect(panel).not.toContain("fetch(");
+    expect(panel).not.toContain("__ORCA_GRAPH_WIDE_API__");
+  });
+
+  it("sends every panel write through the one host action Orca allows", async () => {
+    const panel = await readFile(path.join(root, "src/panel.ts"), "utf8");
+    // 패널이 밖으로 나가는 통로는 terminal.sendText 하나뿐이다. 다른 경로가 생기면
+    // 그것은 Orca가 막아 둔 것을 우회한 것이거나, 동작하지 않는 코드다.
+    const hostCalls = [...panel.matchAll(/hostCall<[^>]*>\("([a-zA-Z.]+)"/gu)].map((match) => match[1]);
+    const inlineCalls = [...panel.matchAll(/hostCall\("([a-zA-Z.]+)"/gu)].map((match) => match[1]);
+    expect([...new Set([...hostCalls, ...inlineCalls])].sort()).toEqual([
+      "notifications.show", "terminal.sendText", "workspace.readContext",
+    ]);
   });
 
   it("keeps the complete panel type scale on D2Coding at the enlarged sizes", async () => {

@@ -6,7 +6,7 @@ type FixtureNode = Partial<GraphNode> & Pick<GraphNode, "id">;
 
 export interface ValidationFixtureCase {
   id: string;
-  bridgeMode: "dry" | "live";
+  runMode: "dry" | "live";
   expected: {
     code: string | null;
     severity: "error" | null;
@@ -30,7 +30,7 @@ export function graphFromValidationFixture(item: ValidationFixtureCase): GraphDe
   return {
     id: `fixture-${item.id}`,
     name: item.id,
-    summary: "shared model/bridge validation fixture",
+    summary: "shared model validation fixture",
     status: "active",
     version: 1,
     pinned: false,

@@ -3,10 +3,10 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-// The runtime bridge deliberately stays dependency-free JavaScript so an
+// The runtime library deliberately stays dependency-free JavaScript so an
 // extracted plugin can run without installing packages.
 // @ts-expect-error JavaScript runtime module has no declaration file.
-import { commitFolderStore, commitStructuredGraph, commitStructuredMutation, folderSourceStorePath, initializeFolderDataSource, normalizeDataSourceConfig, projectUnstructuredJson, refreshDataSource, requestDataSource } from "../bridge/data-source.mjs";
+import { commitFolderStore, commitStructuredGraph, commitStructuredMutation, folderSourceStorePath, initializeFolderDataSource, normalizeDataSourceConfig, projectUnstructuredJson, refreshDataSource, requestDataSource } from "../lib/data-source.mjs";
 
 const envKeys: string[] = [];
 const cleanupDirectories: string[] = [];
@@ -63,14 +63,14 @@ describe("folder and local Git storage", () => {
     const store = {
       schemaVersion: 1,
       activeGraphId: "graph-folder",
-      bridgeTerminalId: "local-terminal",
+      saveTerminalId: "local-terminal",
       graphs: [{ id: "graph-folder", name: "Folder graph", nodes: [], edges: [] }],
       domains: [], milestones: [], tasks: [{ id: "task-folder", title: "Folder task" }], todos: [],
     };
 
     await initializeFolderDataSource(config, store);
     const stored = JSON.parse(await readFile(folderSourceStorePath(config), "utf8"));
-    expect(stored.bridgeTerminalId).toBeUndefined();
+    expect(stored.saveTerminalId).toBeUndefined();
     expect(stored.graphs[0].name).toBe("Folder graph");
 
     const cache = await refreshDataSource(config);
@@ -112,7 +112,7 @@ describe("unstructured JSON catalog", () => {
 });
 
 describe("structured workspace contract", () => {
-  it("recovers the Orca session token from the configured origin after a bridge restart", async () => {
+  it("recovers the Orca session token from the configured origin on a later run", async () => {
     const authEnv = "ORCA_GRAPH_SOURCE_TOKEN";
     envKeys.push(authEnv);
     delete process.env[authEnv];

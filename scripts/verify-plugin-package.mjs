@@ -7,6 +7,7 @@ import {
   rm,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { gzipSync } from "node:zlib";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { extract as extractTar, list as listTar } from "tar";
@@ -16,75 +17,59 @@ import {
 } from "./orca-plugin-manifest-schema.mjs";
 import { readPanelBootstrap } from "./panel-bootstrap.mjs";
 
-function frame(payload) {
-  const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  return `OGX1:release-check:1:1:${encoded}:END`;
+function savePayload(value) {
+  return gzipSync(Buffer.from(JSON.stringify(value), "utf8"), { level: 9 }).toString("base64url");
 }
 
-async function waitForOutput(child, output, expected) {
-  await new Promise((resolve, reject) => {
-    const deadline = setTimeout(() => {
-      reject(new Error(`extracted bridge did not print '${expected}':\n${output()}`));
-    }, 5000);
-    const poll = setInterval(() => {
-      if (!output().includes(expected)) return;
-      clearTimeout(deadline);
-      clearInterval(poll);
-      resolve();
-    }, 10);
-    child.once("error", (error) => {
-      clearTimeout(deadline);
-      clearInterval(poll);
-      reject(error);
-    });
-  });
-}
-
-async function verifyBridgeBootstrap(packageRoot, runtimeDirectory) {
+/**
+ * 압축을 푼 플러그인에서 저장 CLI가 그대로 도는지 확인한다. 이것이 패널의 유일한
+ * 쓰기 경로이므로, 여기가 깨지면 사용자는 편집한 것을 저장할 방법이 없다.
+ */
+async function verifySaveCli(packageRoot, runtimeDirectory) {
   const panelPath = path.join(packageRoot, "dist/panel.html");
   const panelBefore = await readFile(panelPath, "utf8");
   const store = JSON.parse(await readFile(path.join(packageRoot, "fixtures/default-store.json"), "utf8"));
-  store.graphs[0].name = `${store.graphs[0].name} · extracted save verified`;
-  const child = spawn(process.execPath, [path.join(packageRoot, "bridge/index.mjs")], {
-    cwd: packageRoot,
-    env: {
-      ...process.env,
-      ORCA_GRAPH_RUNTIME_DIR: runtimeDirectory,
-    },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  let output = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => { output += chunk; });
-  child.stderr.on("data", (chunk) => { output += chunk; });
-  try {
-    await waitForOutput(child, () => output, "bridge ready");
-    child.stdin.write(frame({ type: "ping" }));
-    await waitForOutput(child, () => output, "[bridge] pong");
-    child.stdin.write(frame({ type: "save", store }));
-    await waitForOutput(child, () => output, "[bridge] graph store saved");
-    child.stdin.end();
-    await new Promise((resolve, reject) => {
-      const deadline = setTimeout(() => reject(new Error("extracted bridge did not exit after stdin closed")), 5000);
-      child.once("close", (code) => {
-        clearTimeout(deadline);
-        if (code === 0) resolve();
-        else reject(new Error(`extracted bridge exited with ${code}:\n${output}`));
-      });
+  const graph = { ...store.graphs[0], name: `${store.graphs[0].name} · extracted save verified` };
+
+  const result = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      path.join(packageRoot, "scripts/graph-store.mjs"),
+      "save",
+      savePayload({ graphs: [graph], activeGraphId: graph.id }),
+    ], {
+      cwd: packageRoot,
+      env: { ...process.env, ORCA_GRAPH_RUNTIME_DIR: runtimeDirectory },
+      stdio: ["ignore", "pipe", "pipe"],
     });
-    const savedStore = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
-    if (savedStore.graphs[0]?.name !== store.graphs[0].name) {
-      throw new Error("extracted bridge save did not update runtime/store.json");
-    }
-    const panelAfter = await readFile(panelPath, "utf8");
-    if (panelAfter === panelBefore) throw new Error("extracted bridge save did not update dist/panel.html");
-    const panelBootstrap = readPanelBootstrap(panelAfter);
-    if (panelBootstrap.store?.graphs?.[0]?.name !== store.graphs[0].name) {
-      throw new Error("extracted bridge save did not embed the saved store in dist/panel.html");
-    }
-  } finally {
-    if (!child.killed && child.exitCode === null) child.kill();
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.stderr.on("data", (chunk) => { output += chunk; });
+    const deadline = setTimeout(() => {
+      child.kill();
+      reject(new Error(`extracted save CLI did not exit:\n${output}`));
+    }, 15_000);
+    child.once("error", (error) => { clearTimeout(deadline); reject(error); });
+    child.once("close", (code) => {
+      clearTimeout(deadline);
+      if (code === 0) resolve(output);
+      else reject(new Error(`extracted save CLI exited with ${code}:\n${output}`));
+    });
+  });
+  if (!result.includes("저장 완료")) {
+    throw new Error(`extracted save CLI did not report a save:\n${result}`);
+  }
+
+  const savedStore = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
+  if (savedStore.graphs.find((item) => item.id === graph.id)?.name !== graph.name) {
+    throw new Error("extracted save CLI did not update runtime/store.json");
+  }
+  const panelAfter = await readFile(panelPath, "utf8");
+  if (panelAfter === panelBefore) throw new Error("extracted save CLI did not update dist/panel.html");
+  const panelBootstrap = readPanelBootstrap(panelAfter);
+  if (panelBootstrap.store?.graphs?.find((item) => item.id === graph.id)?.name !== graph.name) {
+    throw new Error("extracted save CLI did not embed the saved store in dist/panel.html");
   }
 }
 
@@ -158,7 +143,8 @@ export async function verifyPluginPackage(artifactPath) {
     const fileSet = new Set(files);
     for (const required of [
       "package/.github/workflows/ci.yml",
-      "package/bridge/index.mjs",
+      "package/lib/store.mjs",
+      "package/scripts/graph-store.mjs",
       "package/dist/panel.html",
       "package/npm-shrinkwrap.json",
       "package/orca-plugin.json",
@@ -204,11 +190,10 @@ export async function verifyPluginPackage(artifactPath) {
     if (!packageJson.scripts?.check || !packageJson.scripts?.test || !packageJson.devDependencies?.vitest) {
       throw new Error("plugin artifact does not carry its declared check toolchain");
     }
-    await verifyBridgeBootstrap(packageRoot, path.join(temporaryRoot, "runtime"));
+    await verifySaveCli(packageRoot, path.join(temporaryRoot, "runtime"));
     return {
       ok: true,
-      bridgePing: "pong",
-      bridgeSave: "saved",
+      saveCli: "saved",
       panelBootstrapUpdated: true,
       canonicalHeaders: true,
       fileCount: files.length,

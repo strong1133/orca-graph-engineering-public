@@ -1,4 +1,3 @@
-import { encodeBridgeFrames } from "./bridge-protocol";
 import {
   GRID,
   NODE_HEIGHT,
@@ -41,8 +40,10 @@ import {
   type PromptRevision,
   type ProjectTarget,
   type RoutingTarget,
-  type RuntimeExecution,
-  type RuntimeExecutionTarget,
+  DISPATCH_LOG_LIMIT,
+  type DispatchRecord,
+  type DispatchTarget,
+  type ExecutionItemKind,
   type ExecutionMode,
   type TopologyKind,
   type WorkPriority,
@@ -108,36 +109,6 @@ type SavedTaskRunSettings = {
 
 const taskRunSettingsMetadataKey = "orcaGraphRunSettings";
 
-type RegistryProject = {
-  name: string;
-  path: string;
-  environment: string;
-  kind?: string;
-  repo_id?: string;
-  remote?: string;
-  registryVersion?: number;
-  worktrees?: Array<{
-    id: string;
-    path: string;
-    branch?: string;
-    display_name?: string;
-    is_main?: boolean;
-  }>;
-};
-
-type TaskProjectContext = {
-  taskId: string;
-  taskVersion: number;
-  projects: Array<{ id?: string; role: "related" | "target"; locatorKind: "folder" | "git"; locator: string; label?: string; branch?: string; position: number }>;
-  registry: RegistryProject[];
-  registryVersions?: Record<string, number>;
-  recommended: RegistryProject[];
-  environment: string;
-  /** registry의 기준 장치. 브리지가 알려 주지 않으면 현재 장치를 기준으로 본다. */
-  primaryEnvironment?: string;
-  current: { repoId?: string; path?: string; projectId?: string; branch?: string; worktreeId?: string } | null;
-};
-
 type RunProjectReference = { locator: string; label?: string; branch?: string };
 type RunProjectCandidate = {
   project: ProjectTarget;
@@ -150,7 +121,7 @@ type RunProjectCandidate = {
 type TodoGraphChoice = { id: string; name: string; status: string };
 
 type ModalState =
-  | { kind: "bridge"; loading: boolean; context: WorkspaceContext; error?: string }
+  | { kind: "save-terminal"; terminals: Array<{ id: string }> }
   | { kind: "data-source"; error?: string }
   | RunModalState
   | TaskRunModalState
@@ -232,42 +203,54 @@ interface ViewState {
 const bootstrapElement = document.querySelector<HTMLScriptElement>("#orca-graph-bootstrap");
 if (!bootstrapElement?.textContent) throw new Error("Graph Engineering bootstrap is missing.");
 const bootstrap = structuredClone(JSON.parse(bootstrapElement.textContent) as Bootstrap);
-const injectedWideApi = (window as Window & { __ORCA_GRAPH_WIDE_API__?: string }).__ORCA_GRAPH_WIDE_API__;
-const isWideMode = typeof injectedWideApi === "string" && injectedWideApi.startsWith("/");
-const hasSandboxedLoopbackBridge = !isWideMode && /^http:\/\/127\.0\.0\.1:\d+\//u.test(bootstrap.bridgeApiUrl ?? "");
 const workspaceProductName = `${["under", "joy"].join("")}-workspace`;
 
-function trustedBridgeApi(value: string | undefined): string | undefined {
-  if (!value) return undefined;
-  if (value.startsWith("/")) return value;
-  try {
-    const url = new URL(value);
-    return url.protocol === "http:" && url.hostname === "127.0.0.1" ? url.toString() : undefined;
-  } catch {
-    return undefined;
-  }
+// Orca는 패널 문서를 `sandbox="allow-scripts"` iframe에 `connect-src 'none'` CSP로
+// 감싼다. 네트워크도 파일도 브라우저 저장소도 없고 플러그인 워커와 통신할 채널도
+// 없으므로, 패널이 밖으로 나가는 유일한 통로는 `terminal.sendText`다. 조회는
+// panel.html의 bootstrap JSON으로 들어오고, 저장과 실행은 그 통로로 나간다.
+let store: GraphStore = normalizeGraphStore(bootstrap.store);
+
+const CHANGE_COLLECTIONS = ["graphs", "domains", "milestones", "tasks", "todos"] as const;
+type ChangeCollection = (typeof CHANGE_COLLECTIONS)[number];
+
+/**
+ * 마지막으로 원천과 일치했던 상태. 저장에 성공하면 여기가 새 기준이 된다.
+ *
+ * 부팅 시점의 store가 곧 원천의 상태이므로 그때 바로 기준을 잡는다. 비워 두면
+ * 첫 저장이 store 전체를 보내게 되고, 실제 데이터에서는 그것이 터미널 한 줄에
+ * 담기지 않는다.
+ */
+let savedBaseline = new Map<string, string>();
+
+function baselineKey(collection: ChangeCollection, id: string): string {
+  return `${collection}:${id}`;
 }
 
-// Orca panel documents are intentionally wrapped in an opaque sandbox with
-// `connect-src 'none'`. Only the bridge-served wide view may use HTTP. The
-// sidebar always uses the public terminal.sendText host action.
-const responseBridgeApi = trustedBridgeApi(injectedWideApi)
-  ?? (bootstrap.bridgeApiUrl?.startsWith("/") ? trustedBridgeApi(bootstrap.bridgeApiUrl) : undefined);
-type BridgeEnvelope<T> = { ok?: boolean; error?: string; value?: T };
-const pendingBridgeSyncKey = "orca-graph-engineering:pending-terminal-bridge-sync";
-let store: GraphStore = normalizeGraphStore(bootstrap.store);
+function captureBaseline(source: GraphStore): Map<string, string> {
+  const baseline = new Map<string, string>();
+  for (const collection of CHANGE_COLLECTIONS) {
+    for (const item of source[collection]) baseline.set(baselineKey(collection, item.id), JSON.stringify(item));
+  }
+  return baseline;
+}
+
+function resetBaseline(): void {
+  savedBaseline = captureBaseline(store);
+}
+
+// 부팅 시점의 store가 원천의 상태다. 여기서 기준을 잡아야 첫 저장이 바뀐 것만 보낸다.
+resetBaseline();
+
 let targets = bootstrap.targets;
-let executions: RuntimeExecution[] = Array.isArray(bootstrap.executions) ? bootstrap.executions : [];
 let dataSource: DataSourceState = bootstrap.dataSource ?? {
   config: { schemaVersion: 1, mode: "local" },
   status: "idle",
   catalog: [],
   message: "로컬 JSON 저장소를 사용합니다.",
 };
-let taskProjectContextState: TaskProjectContext | null = null;
-let taskProjectContextLoading = false;
-let taskProjectContextError = "";
-let currentOrcaProjectState: TaskProjectContext["current"] = null;
+/** 현재 Orca worktree 이름. 실행 대상 프로젝트를 추천할 때만 쓰는 힌트다. */
+let currentWorkspaceName = "";
 let taskProjectPickerEnvironment = "";
 let taskProjectPickerQuery = "";
 const selectedTaskProjectBundles = new Map<string, string>();
@@ -287,7 +270,7 @@ if (!store.graphs.length) {
   store.activeGraphId = id;
 }
 const view: ViewState = {
-  mode: isWideMode && window.location.hash === "#executions" ? "executions" : "canvas",
+  mode: "canvas",
   graphQuery: "",
   graphStatusFilter: "all",
   graphRunFilter: "all",
@@ -357,11 +340,6 @@ window.addEventListener("message", (event) => {
 });
 
 function hostCall<T>(action: string, params?: unknown): Promise<T> {
-  if (isWideMode) {
-    if (action === "notifications.show") return Promise.resolve(undefined as T);
-    if (action === "workspace.readContext") return Promise.resolve(null as T);
-    return Promise.reject(new Error(`${action}은 Orca 사이드바 패널에서만 사용할 수 있습니다.`));
-  }
   const requestId = crypto.randomUUID();
   return new Promise<T>((resolve, reject) => {
     const timer = window.setTimeout(() => {
@@ -620,15 +598,6 @@ function localWorkMutable(): boolean {
 
 /* 원천이 원격 실행을 여는가. 구조를 모르는 값이나 빈 nodeKinds를 "실행해도 좋다"로
    읽지 않는다 — 이 판정이 틀리면 실행 상태가 두 곳으로 갈라진다. */
-function remoteExecution(): { nodeKinds: NodeKind[] } | null {
-  if (dataSource.config.mode !== "structured" || dataSource.status !== "ready") return null;
-  const execution = dataSource.capabilities?.execution;
-  if (!execution || execution.mode !== "remote-claim") return null;
-  const nodeKinds = (execution.nodeKinds ?? []).filter((kind): kind is NodeKind =>
-    kind === "task" || kind === "condition" || kind === "graph_call");
-  return nodeKinds.length ? { nodeKinds } : null;
-}
-
 function taskGraphLinks(taskId: string): Array<{ graph: GraphDefinition; node: GraphNode }> {
   return store.graphs.flatMap((graph) => graph.nodes
     .filter((node) => node.task?.id === taskId)
@@ -673,6 +642,40 @@ function promptState(item: LocalTask | LocalTodo): "running" | "failed" | "curre
 
 function nextPromptRevision(item: LocalTask | LocalTodo): number {
   return Math.max(0, ...item.promptRevisions.map((revision) => revision.revision)) + 1;
+}
+
+/**
+ * 사람이 직접 고친 Meta Draft를 현재 Meta revision으로 append한다.
+ *
+ * Meta는 실행에 실제로 쓰이는 프롬프트다. revision 없이 필드만 바꾸면 무엇을 근거로
+ * 그 프롬프트가 됐는지가 이력에서 사라진다.
+ */
+function setMetaDraft(item: LocalTask | LocalTodo, content: string): boolean {
+  const trimmed = content.trim();
+  if ((item.metaDraft ?? "") === content) return false;
+  const basedOn = currentDraftRevision(item);
+  for (const revision of item.promptRevisions) {
+    if (revision.kind === "meta") revision.status = "stale";
+  }
+  if (trimmed) {
+    item.promptRevisions.push({
+      id: `${item.id}:meta:${crypto.randomUUID()}`,
+      kind: "meta",
+      revision: nextPromptRevision(item),
+      content,
+      status: "current",
+      generator: "human",
+      ...(basedOn ? { basedOnId: basedOn.id } : {}),
+      createdAt: new Date().toISOString(),
+    });
+    item.metaDraft = content;
+    if ("prompt" in item) item.prompt = content;
+  } else {
+    delete item.metaDraft;
+    if ("prompt" in item) item.prompt = item.draft;
+  }
+  touchWorkItem(item);
+  return true;
 }
 
 function setHumanDraft(item: LocalTask | LocalTodo, content: string): boolean {
@@ -995,9 +998,7 @@ function selectedRunProjectCandidates(
 function runModalReferences(modal: RunModalState | TaskRunModalState): RunProjectReference[] {
   if (modal.kind === "run") return graphProjectTargets(activeGraph());
   if (modal.itemKind !== "task") return [];
-  return (taskProjectContextState?.taskId === modal.itemId
-    ? taskProjectContextState.projects
-    : store.tasks.find((item) => item.id === modal.itemId)?.projects ?? [])
+  return (store.tasks.find((item) => item.id === modal.itemId)?.projects ?? [])
     .filter((project) => project.role === "target" && project.locatorKind === "folder")
     .sort((left, right) => left.position - right.position);
 }
@@ -1033,7 +1034,25 @@ function syncRunPrimaryRouting(modal: RunModalState | TaskRunModalState, referen
   if (selected.sessionId) route.sessionId = selected.sessionId;
 }
 
-function savedExecutionRouting(target: RuntimeExecutionTarget | undefined): RoutingTarget | undefined {
+/** 지금 활성 상태인 Orca 프로젝트. 실행 대상을 추천할 때만 쓴다. */
+function currentOrcaProject(): { repoId?: string; path?: string; projectId?: string; branch?: string; worktreeId?: string } | null {
+  const project = targets.projects.find((item) => item.current);
+  if (!project) return null;
+  return {
+    ...(project.repoId ? { repoId: project.repoId } : {}),
+    ...(project.path ? { path: project.path } : {}),
+    projectId: project.id,
+    ...(project.branch ? { branch: project.branch } : {}),
+    ...(project.worktreeId ? { worktreeId: project.worktreeId } : {}),
+  };
+}
+
+/** 이 항목을 마지막으로 어디에 보냈는지. 실행 창의 기본값을 채우는 데 쓴다. */
+function latestDispatch(itemKind: DispatchRecord["itemKind"], itemId: string): DispatchRecord | undefined {
+  return store.dispatchLog.find((record) => record.itemKind === itemKind && record.itemId === itemId);
+}
+
+function savedExecutionRouting(target: DispatchTarget | undefined): RoutingTarget | undefined {
   if (!target) return undefined;
   const environmentId = routeEnvironmentId(target.environmentId);
   const model = target.model && targets.models.some((item) => item.id === target.model) ? target.model : undefined;
@@ -1065,22 +1084,26 @@ function savedExecutionRouting(target: RuntimeExecutionTarget | undefined): Rout
 
 function createRunModal(live: boolean): RunModalState {
   const graph = activeGraph();
-  const previousExecution = latestExecution("graph", graph.id);
+  const previousExecution = latestDispatch("graph", graph.id);
   const defaults = routingValue(graph.defaults);
   const projectTargets = graphProjectTargets(graph);
   defaults.environmentId = routeEnvironmentId(defaults.environmentId ?? environmentForTaskTargets(projectTargets));
   if (defaults.sessionId) delete defaults.reasoning;
   let suggestedProjectId: string | undefined;
   const hasTaskTarget = graph.nodes.some((node) => Boolean(taskTargetForGraphNode(node)));
-  if (!defaults.projectId && !defaults.sessionId && !hasTaskTarget && store.bridgeWorkspace) {
-    const workspace = store.bridgeWorkspace.trim().toLocaleLowerCase("en-US");
-    const matches = targets.projects.filter((item) => {
+  if (!defaults.projectId && !defaults.sessionId && !hasTaskTarget) {
+    // 지금 열려 있는 Orca 프로젝트가 가장 그럴듯한 기본값이다. 그것을 모르면
+    // 워크트리 이름과 이름이 정확히 하나 일치하는 프로젝트로 물러난다.
+    const workspace = currentWorkspaceName.trim().toLocaleLowerCase("en-US");
+    const byName = workspace ? targets.projects.filter((item) => {
       const id = item.id.toLocaleLowerCase("en-US");
       const name = item.name.toLocaleLowerCase("en-US");
       return id === workspace || name === workspace || id.endsWith(`/${workspace}`);
-    });
-    if (matches.length === 1) {
-      suggestedProjectId = matches[0]!.id;
+    }) : [];
+    const suggested = targets.projects.find((item) => item.current)
+      ?? (byName.length === 1 ? byName[0] : undefined);
+    if (suggested) {
+      suggestedProjectId = suggested.id;
       defaults.projectId = suggestedProjectId;
     }
   }
@@ -1173,10 +1196,8 @@ function savedTaskRunSettings(task: LocalTask | undefined): SavedTaskRunSettings
 function createWorkItemRunModal(itemKind: "task" | "todo", item: LocalTask | LocalTodo): TaskRunModalState {
   const task = itemKind === "task" ? item as LocalTask : undefined;
   const savedSettings = savedTaskRunSettings(task);
-  const targetFolders = task && taskProjectContextState?.taskId === task.id
-    ? taskProjectContextState.projects.filter((project) => project.role === "target" && project.locatorKind === "folder")
-    : task?.projects?.filter((project) => project.role === "target" && project.locatorKind === "folder") ?? [];
-  const previousExecution = latestExecution(itemKind, item.id);
+  const targetFolders = task?.projects?.filter((project) => project.role === "target" && project.locatorKind === "folder") ?? [];
+  const previousExecution = latestDispatch(itemKind, item.id);
   const previousPrimaryRouting = savedExecutionRouting(previousExecution?.targets[0]);
   const previousEnvironmentId = previousPrimaryRouting
     && targetFolders.every((project) => Boolean(projectForTaskLocator(project.locator, routeEnvironmentId(previousPrimaryRouting.environmentId))))
@@ -1187,9 +1208,8 @@ function createWorkItemRunModal(itemKind: "task" | "todo", item: LocalTask | Loc
   };
   const projectRoutings: Record<string, RoutingTarget> = {};
   let suggestedProjectId: string | undefined;
-  const current = itemKind === "task" && taskProjectContextState?.taskId === item.id
-    ? taskProjectContextState.current ?? currentOrcaProjectState
-    : currentOrcaProjectState;
+  // 지금 열려 있는 Orca 워크트리. `refresh`가 대상 목록에 표시해 둔다.
+  const current = currentOrcaProject();
   const currentMatches = current ? targets.projects.filter((project) =>
     routeEnvironmentId(project.environmentId) === routing.environmentId
       && ((current.worktreeId && project.worktreeId === current.worktreeId)
@@ -1201,8 +1221,8 @@ function createWorkItemRunModal(itemKind: "task" | "todo", item: LocalTask | Loc
     routing.projectId = suggestedProjectId;
     if (current?.branch) routing.branch = shortBranch(current.branch);
     else if (currentMatches[0]!.branch) routing.branch = shortBranch(currentMatches[0]!.branch);
-  } else if (store.bridgeWorkspace) {
-    const workspace = store.bridgeWorkspace.trim().toLocaleLowerCase("en-US");
+  } else if (currentWorkspaceName) {
+    const workspace = currentWorkspaceName.trim().toLocaleLowerCase("en-US");
     const matches = targets.projects.filter((item) => {
       const id = item.id.toLocaleLowerCase("en-US");
       const name = item.name.toLocaleLowerCase("en-US");
@@ -1213,19 +1233,6 @@ function createWorkItemRunModal(itemKind: "task" | "todo", item: LocalTask | Loc
       suggestedProjectId = matches[0]!.id;
       routing.projectId = suggestedProjectId;
       if (matches[0]!.branch) routing.branch = shortBranch(matches[0]!.branch);
-    }
-  }
-  const contextRecommendation = itemKind === "task" && taskProjectContextState?.taskId === item.id
-    && taskProjectContextState.recommended.length === 1
-    ? taskProjectContextState.recommended[0]
-    : undefined;
-  if (contextRecommendation) {
-    const project = targets.projects.find((item) => routeEnvironmentId(item.environmentId) === routing.environmentId
-      && item.path === contextRecommendation.path);
-    if (project) {
-      suggestedProjectId = project.id;
-      routing.projectId = project.id;
-      if (project.branch) routing.branch = shortBranch(project.branch);
     }
   }
   const targetFolder = targetFolders[0];
@@ -1967,7 +1974,6 @@ function renderProblems(graph: GraphDefinition): string {
 
 function renderCanvas(graph: GraphDefinition): string {
   if (view.layoutPreview?.graphId === graph.id) graph = view.layoutPreview.graph;
-  const runtime = latestExecution("graph", graph.id);
   const analysis = analyzeGraph(graph);
   const critical = new Set(analysis.criticalPathNodeIds);
   const loopNodes = new Set(analysis.loopNodeIds);
@@ -2038,7 +2044,7 @@ function renderCanvas(graph: GraphDefinition): string {
 
   const nodes = graph.nodes
     .map((node) => {
-      const executionStatus = visualNodeStatus(graph, node, runtime);
+      const executionStatus = visualNodeStatus(graph, node);
       const routing = effectiveRouting(graph, node);
       const targetKind = routing.sessionId ? "세션" : routing.projectId ? "새 세션" : "실행 대상";
       const target = routing.sessionId ? sessionName(routing.sessionId) : routing.projectId ? projectName(routing.projectId) : "미지정";
@@ -2078,7 +2084,7 @@ function renderCanvas(graph: GraphDefinition): string {
               </div>
               <div class="node-chips node-policy-chips"><span class="chip role-${role}">${esc(role)}</span>${node.joinMode === "any" ? '<span class="chip">OR join</span>' : ""}${loopNodes.has(node.id) ? '<span class="chip loop-chip">↻ loop</span>' : ""}</div>`}
         </div>
-        ${nodeRunMetaMarkup(graph, node, executionStatus, runtime)}
+        ${nodeRunMetaMarkup(graph, node, executionStatus)}
         ${view.editorMode === "run" && role === "human_gate" ? `<div class="gate-actions"><button data-action="gate-decision" data-id="approved">승인</button><button class="danger" data-action="gate-decision" data-id="rejected">거절</button></div>` : ""}
         ${selected && view.editorMode === "design" ? `<div class="node-quickbar"><button class="edit" data-action="edit-node" data-id="${esc(node.id)}">${editorLabel}</button><button data-action="duplicate-selection" title="복제">⧉</button><button data-action="connect-node" title="연결">→</button><button data-action="toggle-node-pin" title="위치 고정">${node.engineering?.layoutPinned ? "◇" : "◆"}</button><button class="danger" data-action="remove-node" title="삭제">×</button></div>` : ""}
       </article>`;
@@ -2104,7 +2110,6 @@ function renderCanvas(graph: GraphDefinition): string {
   const previewing = view.layoutPreview?.graphId === graph.id;
 
   return `<div class="canvas-shell zoom-${semanticZoomLevel()} ${view.connectingFrom ? "connecting" : ""} mode-${view.editorMode}" data-canvas tabindex="0" style="${gridStyle}">
-    ${executionBanner(runtime)}
     <div class="world" style="transform:translate(${view.panX}px,${view.panY}px) scale(${view.zoom})">
       ${groupFrames}
       <svg class="edges" width="3200" height="2200" viewBox="0 0 3200 2200">
@@ -2496,22 +2501,18 @@ function renderRunProjectPicker(
 
 function renderModal(): string {
   if (!view.modal) return "";
-  if (view.modal.kind === "bridge") {
-    const context = view.modal.context;
-    const bridgeTerminalAvailable = Boolean(store.bridgeTerminalId)
-      && Boolean(context?.terminals.some((terminal) => terminal.id === store.bridgeTerminalId));
+  if (view.modal.kind === "save-terminal") {
     return `<div class="modal-backdrop"><section class="modal" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="modal-title">
-      <div class="modal-head"><strong id="modal-title">로컬 브리지 연결</strong><button class="icon ghost" data-action="close-modal" data-modal-initial-focus aria-label="닫기">×</button></div>
+      <div class="modal-head"><strong id="modal-title">저장할 터미널</strong><button class="icon ghost" data-action="close-modal" data-modal-initial-focus aria-label="닫기">×</button></div>
       <div class="modal-body">
-        <p class="help">Orca pluginApi 1의 보안 경계 때문에 저장·프로젝트 검색·실행은 선택한 셸 터미널에서 투명하게 동작하는 브리지가 담당합니다.</p>
-        ${view.modal.loading ? "<p>현재 워크트리 터미널을 읽는 중…</p>" : ""}
-        ${view.modal.error ? `<p class="warning-list">${esc(view.modal.error)}</p>` : ""}
-        ${context ? `<p class="help">${esc(context.displayName)} · ${esc(context.branch)}</p><div class="terminal-list">
-          ${context.terminals.map((terminal) => `<button class="terminal-option ${store.bridgeTerminalId === terminal.id ? "primary" : ""}" data-action="choose-terminal" data-id="${esc(terminal.id)}"><span>▣</span><code>${esc(terminal.id)}</code></button>`).join("") || "<p>현재 워크트리에 열린 터미널이 없습니다.</p>"}
-        </div>` : ""}
-        <p class="help">셸 터미널을 고른 뒤 브리지 시작을 누르십시오. Codex/Claude TUI가 실행 중인 터미널은 선택하지 마십시오.</p>
+        <p class="help">Orca 플러그인 패널은 파일을 직접 쓸 수 없어 저장 명령 한 줄을 터미널로 보냅니다. 셸 터미널을 하나 고르십시오. 한 번 고르면 계속 사용합니다.</p>
+        <div class="terminal-list">
+          ${view.modal.terminals.map((terminal) => `<button class="terminal-option ${store.saveTerminalId === terminal.id ? "primary" : ""}" data-action="choose-save-terminal" data-id="${esc(terminal.id)}"><span>▣</span><code>${esc(terminal.id)}</code></button>`).join("")
+            || "<p>현재 워크트리에 열린 터미널이 없습니다.</p>"}
+        </div>
+        <p class="help">Codex·Claude가 실행 중인 터미널은 고르지 마십시오. 그 터미널은 작업을 받는 대상입니다.</p>
       </div>
-      <div class="modal-actions"><button data-action="close-modal">닫기</button><button class="primary" data-action="start-bridge" ${bridgeTerminalAvailable ? "" : "disabled"}>브리지 시작</button></div>
+      <div class="modal-actions"><button data-action="close-modal">닫기</button></div>
     </section></div>`;
   }
   if (view.modal.kind === "data-source") {
@@ -2540,7 +2541,7 @@ function renderModal(): string {
           <div class="source-mode-fields source-remote ${remote ? "" : "hidden"}">
             <label class="field"><span>데이터 원천 URL</span><input data-source-field="url" value="${esc(config.url ?? "")}" placeholder="http://127.0.0.1:8000/"></label>
             <label class="field"><span>인증 토큰 환경변수</span><input data-source-field="authEnv" value="${esc(config.authEnv ?? "")}" placeholder="MY_SOURCE_TOKEN"></label>
-            <p class="help">토큰 값은 설정이나 Graph 파일에 저장하지 않습니다. 브리지 terminal의 환경변수 이름만 기록합니다.</p>
+            <p class="help">토큰 값은 설정이나 Graph 파일에 저장하지 않습니다. 저장 명령을 보낼 터미널의 환경변수 이름만 기록합니다.</p>
           </div>
           <div class="source-mapping ${unstructured ? "" : "hidden"}">
             <label class="field"><span>레코드 배열 경로 · 선택</span><input data-source-field="recordsPath" value="${esc(config.recordsPath ?? "")}" placeholder="data.items"></label>
@@ -2626,7 +2627,7 @@ function renderModal(): string {
     }
     const route = routingValue(modal.routing);
     const taskTargetProjects = modal.itemKind === "task"
-      ? (taskProjectContextState?.taskId === item.id ? taskProjectContextState.projects : (item as LocalTask).projects ?? [])
+      ? ((item as LocalTask).projects ?? [])
         .filter((project) => project.role === "target" && project.locatorKind === "folder")
         .sort((left, right) => left.position - right.position)
       : [];
@@ -2711,21 +2712,9 @@ function renderModal(): string {
     const analysis = analyzeGraph(graph, { targets });
     const draftGraphs = store.graphs.map((item) => item.id === graph.id ? graph : item);
     const linkFindings = validateGraphLinks(draftGraphs).filter((finding) => finding.graphId === graph.id);
-    const hasLoop = graph.edges.some((edge) => edge.kind === "loop");
-    const remote = remoteExecution();
-    const remoteUnsupported = remote
-      ? graph.nodes.filter((node) => !remote.nodeKinds.includes(node.kind))
-      : [];
+    // 실행 자체는 대상 세션의 에이전트가 수행하므로 실행기 종류에 따른 제약은 없다.
+    // 여기 남는 것은 그래프 구조가 실제로 잘못됐을 때뿐이다.
     const blockers = [
-      ...(dataSource.config.mode === "structured" && !remote
-        ? ["연결된 데이터 원천이 Orca 원격 실행을 지원하지 않습니다."]
-        : []),
-      ...(view.modal.live
-        ? remoteUnsupported.map((node) => `${node.label || node.id}: 이 노드는 원천 Workspace에서 실행해야 합니다.`)
-        : []),
-      ...(view.modal.live ? [
-        ...(hasLoop ? ["로컬 브리지는 loop 재진입을 아직 실행하지 않습니다."] : []),
-      ] : []),
       ...analysis.findings.filter((finding) => finding.severity === "error").map((finding) => finding.message),
       ...linkFindings.filter((finding) => finding.severity === "error").map((finding) => finding.message),
     ];
@@ -2867,13 +2856,12 @@ function renderGraphList(): string {
         const run = latestRun(item);
         const runStage = graphRunStage(item);
         const progress = graphProgress(item);
-        const runtime = latestExecution("graph", item.id);
-        const runtimePercent = runtime ? executionPercent(runtime) : progress.percent;
+        const dispatched = latestDispatch("graph", item.id);
         return `<article class="graph-list-row ${item.id === store.activeGraphId ? "active" : ""}">
           <button class="graph-row-main" data-action="open-list-graph" data-id="${esc(item.id)}">
             <span class="graph-status-dot run-${runStage}" title="${esc(graphRunTitle(item))}"></span>
             <span class="graph-row-copy"><span class="graph-row-name">${item.pinned ? "📌 " : ""}${item.processEnabled ? "🧭 " : ""}${esc(item.name)}</span><span class="graph-row-summary">${esc(item.summary || "설명이 없습니다.")}</span></span>
-            <span class="graph-row-badges">${executionInline(runtime)}${item.processEnabled ? '<span class="badge process">🧭 업무프로세스</span>' : ""}<span class="badge status-${item.status}" title="원천 그래프 상태: ${graphStatusLabel[item.status]}">${graphStatusBadgeLabel(item)}</span><span class="badge run-${runStage}" title="${esc(graphRunTitle(item))}">최근 실행 · ${graphRunLabel(item)}</span></span>
+            <span class="graph-row-badges">${dispatched ? `<span class="dispatch-inline" title="${esc(new Date(dispatched.dispatchedAt).toLocaleString("ko-KR"))} 세션으로 보냄">↗ 보냄</span>` : ""}${item.processEnabled ? '<span class="badge process">🧭 업무프로세스</span>' : ""}<span class="badge status-${item.status}" title="원천 그래프 상태: ${graphStatusLabel[item.status]}">${graphStatusBadgeLabel(item)}</span><span class="badge run-${runStage}" title="${esc(graphRunTitle(item))}">최근 실행 · ${graphRunLabel(item)}</span></span>
           </button>
           <div class="graph-row-meta">
             <span>${item.nodes.length} nodes · ${item.edges.length} edges</span>
@@ -2882,7 +2870,7 @@ function renderGraphList(): string {
             ${runStage === "stale" ? `<button class="inline-warning-action" data-action="clear-stale-run" data-id="${esc(item.id)}">남은 실행 상태 정리</button>` : ""}
             <span>${new Date(item.updatedAt).toLocaleString("ko-KR", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
           </div>
-          <div class="graph-progress" title="${runtime ? `${executionStatusLabel[runtime.status]} ${runtime.progress.completed}/${runtime.progress.total}` : `완료 ${progress.complete}/${progress.total}`}"><span class="${runtime ? `status-${runtime.status}` : ""}" style="width:${runtimePercent}%"></span></div>
+          <div class="graph-progress" title="완료 ${progress.complete}/${progress.total}"><span style="width:${progress.percent}%"></span></div>
         </article>`;
       }).join("") : `<div class="graph-list-empty"><strong>조건에 맞는 그래프가 없습니다.</strong><span>검색어나 필터를 바꾸어 보십시오.</span><button data-action="clear-list-filters">필터 초기화</button></div>`}
     </div>
@@ -2924,18 +2912,11 @@ function promptPairEditor(kind: "task" | "todo", item: LocalTask | LocalTodo): s
   const state = promptState(item);
   const currentDraft = currentDraftRevision(item);
   const stateLabel = ({ running: "생성 중", failed: "생성 실패", current: "최신", stale: "원문 변경됨", missing: "없음" } as const)[state];
-  const disabled = !item.draft.trim() || state === "running" || !store.bridgeTerminalId;
   return `<section class="prompt-pair" aria-label="Draft와 Meta Draft">
     <header><div><strong>사람 Draft</strong><span class="badge good">r${currentDraft?.revision ?? 1}</span></div><span class="badge meta-${state}">Meta · ${stateLabel}</span></header>
     <label class="field"><span>사람이 작성한 원문</span><textarea class="prompt-editor" data-scope="local-${kind}" data-field="draft">${esc(item.draft)}</textarea></label>
-    <div class="prompt-actions">
-      <button class="primary" data-action="request-meta-prompt" data-kind="${kind}" data-id="${esc(item.id)}" ${disabled ? "disabled" : ""}>${state === "running" ? "Meta Prompt 생성 중…" : item.metaDraft ? "Meta Prompt 다시 만들기" : "Meta Prompt 만들기"}</button>
-      <span class="help">새 Codex 세션 · 사람 Draft의 현재 revision 기준</span>
-    </div>
-    ${!store.bridgeTerminalId ? '<p class="help warning-inline">먼저 상단의 브리지에서 Orca 터미널을 연결하십시오.</p>' : ""}
-    ${item.metaPromptRun?.status === "failed" ? `<p class="help warning-inline">${esc(item.metaPromptRun.error || "Meta Prompt 생성에 실패했습니다.")}</p>` : ""}
-    <label class="field"><span>Meta Draft · ${state === "stale" ? "이전 사람 Draft 기준" : "실행에 사용할 정제본"}</span><textarea class="prompt-editor meta" readonly aria-label="Meta Draft">${esc(item.metaDraft ?? "")}</textarea></label>
-    ${!item.metaDraft ? '<p class="help">Meta Prompt를 만들면 Meta Draft가 이 영역에 표시됩니다.</p>' : ""}
+    <label class="field"><span>Meta Draft · ${state === "stale" ? "이전 사람 Draft 기준" : "실행에 사용할 정제본"}</span><textarea class="prompt-editor meta" data-scope="local-${kind}" data-field="metaDraft" aria-label="Meta Draft">${esc(item.metaDraft ?? "")}</textarea></label>
+    <p class="help">Meta Draft를 비워 두면 실행할 때 사람 Draft를 그대로 보냅니다.</p>
     <details class="prompt-history"><summary>Prompt 이력 ${item.promptRevisions.length}</summary><ol>${[...item.promptRevisions].reverse().map((revision) => `<li><span class="badge">${revision.kind === "draft" ? "Draft" : "Meta"} r${revision.revision}</span><span>${revision.status === "current" ? "현재" : "이전"}</span><time>${new Date(revision.createdAt).toLocaleString("ko-KR")}</time></li>`).join("")}</ol></details>
   </section>`;
 }
@@ -2968,167 +2949,45 @@ function createLocalTaskFromTodo(todo: LocalTodo): { task: LocalTask; created: b
   return { task, created: true };
 }
 
-function registryProjectWorktrees(project: RegistryProject | undefined): NonNullable<RegistryProject["worktrees"]> {
-  const seen = new Set<string>();
-  return [...(project?.worktrees ?? [])]
-    .sort((left, right) => Number(Boolean(right.is_main)) - Number(Boolean(left.is_main)))
-    .filter((worktree) => {
-      const branch = worktree.branch ? shortBranch(worktree.branch.trim()) : "";
-      if (!branch || seen.has(branch)) return false;
-      seen.add(branch);
-      return true;
-    });
-}
-
-function preferredRegistryBranch(project: RegistryProject): string {
-  return registryProjectWorktrees(project)[0]?.branch
-    ? shortBranch(registryProjectWorktrees(project)[0]!.branch!)
-    : "";
-}
-
-type PickerRegistryProject = RegistryProject & {
-  availableOnEnvironment: boolean;
-  sourcePath: string;
-  sourceWorktrees: NonNullable<RegistryProject["worktrees"]>;
-};
-
-function registryProjectIdentity(project: RegistryProject): string {
-  return project.remote?.trim().toLocaleLowerCase("en-US")
-    || `${project.kind ?? "folder"}:${project.name.trim().toLocaleLowerCase("ko-KR")}`;
-}
-
-function mergeRegistryWorktrees(...collections: Array<NonNullable<RegistryProject["worktrees"]>>): NonNullable<RegistryProject["worktrees"]> {
-  const merged = new Map<string, NonNullable<RegistryProject["worktrees"]>[number]>();
-  for (const worktree of collections.flat()) {
-    const branch = worktree.branch ? shortBranch(worktree.branch) : "";
-    const key = branch || worktree.path;
-    if (!merged.has(key)) merged.set(key, worktree);
-  }
-  return [...merged.values()];
-}
-
-/** registry의 기준 장치. 원천이 알려 주지 않으면 현재 장치를 기준으로 본다. */
-function primaryRegistryEnvironment(context: TaskProjectContext): string {
-  return context.primaryEnvironment || context.environment;
-}
-
-function pickerRegistryProjects(context: TaskProjectContext, environment: string): PickerRegistryProject[] {
-  const primary = primaryRegistryEnvironment(context);
-  const source = context.registry.filter((project) => project.environment === primary);
-  const target = context.registry.filter((project) => project.environment === environment);
-  const sourceByIdentity = new Map(source.map((project) => [registryProjectIdentity(project), project]));
-  const targetIdentities = new Set(target.map(registryProjectIdentity));
-  const choices: PickerRegistryProject[] = target.map((project) => {
-    const sourceProject = sourceByIdentity.get(registryProjectIdentity(project));
-    return {
-      ...project,
-      availableOnEnvironment: true,
-      sourcePath: sourceProject?.path ?? project.path,
-      sourceWorktrees: mergeRegistryWorktrees(project.worktrees ?? [], sourceProject?.worktrees ?? []),
-    };
-  });
-  if (environment !== primary) {
-    for (const project of source) {
-      if (targetIdentities.has(registryProjectIdentity(project))) continue;
-      choices.push({
-        ...project,
-        availableOnEnvironment: false,
-        sourcePath: project.path,
-        sourceWorktrees: project.worktrees ?? [],
-      });
-    }
-  }
-  return choices;
-}
-
-function registryProjectGroup(project: RegistryProject): string {
-  const remoteParts = (project.remote ?? "").split("/").filter(Boolean);
-  if (remoteParts.length >= 3) return remoteParts.slice(1, -1).slice(0, 2).join(" / ");
-  if (remoteParts.length === 2) return remoteParts[0]!;
-  const pathParts = project.path.split("/").filter(Boolean);
-  const marker = pathParts.findIndex((part) => part === "source" || part === "soruce");
-  return (marker >= 0 ? pathParts.slice(marker + 1, -1) : pathParts.slice(-2, -1)).slice(0, 2).join(" / ") || "기타 프로젝트";
-}
-
-function pickerProjectBranches(project: PickerRegistryProject): NonNullable<RegistryProject["worktrees"]> {
-  return registryProjectWorktrees({ ...project, worktrees: project.sourceWorktrees });
-}
-
-function pickerProjectNeedsProvision(project: PickerRegistryProject, branch: string): boolean {
-  if (!project.availableOnEnvironment) return true;
-  if (!branch) return false;
-  return !registryProjectWorktrees(project).some((worktree) => shortBranch(worktree.branch ?? "") === branch);
-}
-
-// 장치 이름은 사용자가 정하고 원천이 registry로 알려 준다. 코드가 이름을 알고 있으면
-// 그 목록에 없는 설치본은 라벨도 선택지도 얻지 못한다.
-function projectEnvironmentLabel(environment: string, current: string): string {
-  return environment === current ? `${environment} · 이 장치` : environment;
-}
-
+/**
+ * Task의 대상 프로젝트 편집기.
+ *
+ * 이전에는 원격 registry를 조회해 다른 장치에 워크트리를 provision까지 했지만,
+ * 그 왕복은 패널이 응답을 받을 수 없어 성립하지 않는다. 지금은 `refresh`가 읽어
+ * 둔 Orca 프로젝트 목록에서 골라 Task에 붙이고, 다른 편집과 똑같이 저장한다.
+ */
 function taskProjectSection(task: LocalTask): string {
-  if (dataSource.config.mode !== "structured") return "";
-  const context = taskProjectContextState?.taskId === task.id ? taskProjectContextState : null;
-  if (taskProjectContextLoading) return '<section class="section task-projects"><div class="section-title">대상 프로젝트</div><p class="help">현재 Orca 컨텍스트와 프로젝트 레지스트리를 확인하는 중…</p></section>';
-  if (taskProjectContextError) return `<section class="section task-projects"><div class="section-title">대상 프로젝트</div><p class="warning-list">${esc(taskProjectContextError)}</p><button data-action="reload-task-projects" data-id="${esc(task.id)}">다시 확인</button></section>`;
-  if (!context) return `<section class="section task-projects"><div class="section-title">대상 프로젝트</div><button data-action="reload-task-projects" data-id="${esc(task.id)}">현재 Orca 프로젝트 감지</button></section>`;
-  const taskProjects = [...context.projects].sort((left, right) => left.position - right.position);
-  const targetProjects = taskProjects.filter((project) => project.role === "target" && project.locatorKind === "folder");
-  const connectedPaths = new Set(taskProjects.map((project) => project.locator));
-  const recommendedPaths = new Set(context.recommended.map((project) => project.path));
-  const environment = taskProjectPickerEnvironment || context.environment;
-  const choices = pickerRegistryProjects(context, environment);
-  const needle = taskProjectPickerQuery.trim().toLocaleLowerCase("ko-KR");
-  const filtered = needle ? choices.filter((project) => [
-    project.name, project.path, project.remote ?? "",
-    ...project.sourceWorktrees.map((worktree) => worktree.branch ?? ""),
-  ].join(" ").toLocaleLowerCase("ko-KR").includes(needle)) : choices;
-  const groups = new Map<string, PickerRegistryProject[]>();
-  for (const project of filtered) groups.set(registryProjectGroup(project), [...(groups.get(registryProjectGroup(project)) ?? []), project]);
-  const grouped = [...groups.entries()].sort(([left], [right]) => left.localeCompare(right, "ko"));
-  const selectedProjects = choices.filter((project) => selectedTaskProjectBundles.has(project.sourcePath));
-  const provisionCount = selectedProjects.filter((project) => pickerProjectNeedsProvision(
-    project, selectedTaskProjectBundles.get(project.sourcePath) ?? "",
-  )).length;
-  const environments = [...new Set([
-    context.environment,
-    primaryRegistryEnvironment(context),
-    ...context.registry.map((project) => project.environment),
-  ].filter(Boolean))];
-  return `<section class="section task-projects"><div class="section-title">대상 프로젝트 · ${targetProjects.length} ${!targetProjects.length && context.recommended.length ? '<span class="badge">현재 컨텍스트 추천</span>' : ""}<button class="icon ghost" data-action="reload-task-projects" data-id="${esc(task.id)}" aria-label="프로젝트 다시 감지">↻</button></div>
-    ${taskProjects.length ? `<ul class="work-link-list task-project-list">${taskProjects.map((project) => `<li><span><strong>${esc(project.label ?? project.locator.split("/").at(-1) ?? project.locator)}</strong><code>${esc(project.locator)}</code><small>${project.role === "target" ? "대상" : "관련"} · ${project.locatorKind}</small></span><label class="task-project-branch"><span>작업 브랜치</span><input data-scope="task-project-branch" data-task-id="${esc(task.id)}" data-project-id="${esc(project.id ?? "")}" data-locator="${esc(project.locator)}" value="${esc(project.branch ?? "")}" placeholder="예: feature/task-42"></label></li>`).join("")}</ul>` : '<p class="help">연결된 대상 프로젝트가 없습니다.</p>'}
-    <p class="help">Task 실행 시 target · folder 경로와 작업 브랜치에 정확히 일치하는 Orca 워크트리를 우선 선택합니다.</p>
-    <details class="registry-project-picker" ${!targetProjects.length ? "open" : ""}><summary>Orca 프로젝트·브랜치 선택</summary>
-      <div class="registry-picker-toolbar"><label class="field"><span>실행 장치</span><select data-scope="task-project-picker" data-field="environment">${environments.map((value) => option(value, projectEnvironmentLabel(value, context.environment), environment)).join("")}</select></label><label class="field"><span>프로젝트 검색</span><input data-action="task-project-search" value="${esc(taskProjectPickerQuery)}" placeholder="프로젝트명, 경로, remote, 브랜치"></label></div>
-      <p class="help">프로젝트와 실제 Orca 워크트리 브랜치를 한 묶음으로 여러 개 선택합니다. 선택 장치에 없으면 Git remote를 사용해 준비합니다.</p>
-      ${choices.length ? `<div class="registry-project-groups" role="group" aria-label="Orca 프로젝트·브랜치 다중 선택">${grouped.map(([label, projects]) => `<section class="registry-project-group"><header><strong>${esc(label)}</strong><span>${projects.length}</span></header><div class="registry-project-list">${projects.sort((left, right) => left.name.localeCompare(right.name, "ko")).map((project) => {
-        const selected = selectedTaskProjectBundles.has(project.sourcePath);
-        const selectedBranch = selectedTaskProjectBundles.get(project.sourcePath) ?? preferredRegistryBranch({ ...project, worktrees: project.sourceWorktrees });
-        const connected = connectedPaths.has(project.path);
-        const needsProvision = pickerProjectNeedsProvision(project, selectedBranch);
-        const recommended = environment === context.environment && recommendedPaths.has(project.path);
-        return `<article class="registry-project ${recommended ? "recommended" : ""} ${selected ? "selected" : ""} ${connected ? "connected" : ""}"><input type="checkbox" data-action="toggle-task-project" data-source-path="${esc(project.sourcePath)}" aria-label="${esc(project.name)} 프로젝트 선택" ${selected ? "checked" : ""} ${connected ? "disabled" : ""}><span><strong>${esc(project.name)}</strong><code title="${esc(project.path)}">${esc(project.path)}</code><small>${project.availableOnEnvironment ? `워크트리 ${project.worktrees?.length ?? 0}` : "이 장치에 없음"}${recommended ? " · 추천" : ""}${connected ? " · 연결됨" : ""}${needsProvision ? " · 준비 필요" : ""}</small><select aria-label="${esc(project.name)} 작업 브랜치" data-scope="task-project-picker" data-field="branch" data-source-path="${esc(project.sourcePath)}" ${connected ? "disabled" : ""}>${option("", "브랜치 지정 안 함", selectedBranch)}${pickerProjectBranches(project).map((worktree) => {
-          const branch = shortBranch(worktree.branch!);
-          return option(branch, `${branch}${worktree.is_main ? " · 기본" : ""}`, selectedBranch);
-        }).join("")}</select></span></article>`;
-      }).join("")}</div></section>`).join("")}${!grouped.length ? '<p class="help">검색 결과가 없습니다.</p>' : ""}</div>` : '<p class="warning-list">선택한 장치에 게시되었거나 기준 장치에서 준비할 수 있는 Orca 프로젝트가 없습니다.</p>'}
-      <div class="registry-picker-actions"><span>현재 ${selectedProjects.length}개 선택${provisionCount ? ` · ${provisionCount}개 장치 준비 필요` : ""}</span><button class="primary" data-action="connect-task-projects" data-id="${esc(task.id)}" ${selectedProjects.length ? "" : "disabled"}>선택 ${selectedProjects.length}개 작업대상으로 추가</button></div>
-    </details>
+  const projects = [...(task.projects ?? [])].sort((left, right) => left.position - right.position);
+  const targetProjects = projects.filter((project) => project.role === "target" && project.locatorKind === "folder");
+  const connected = new Set(projects.map((project) => project.locator));
+  const available = targets.projects.filter((project) => project.path && !connected.has(project.path));
+  return `<section class="section task-projects"><div class="section-title">대상 프로젝트 · ${targetProjects.length}</div>
+    ${projects.length
+      ? `<ul class="work-link-list task-project-list">${projects.map((project) => `<li>
+          <span><strong>${esc(project.label ?? project.locator.split("/").at(-1) ?? project.locator)}</strong><code>${esc(project.locator)}</code><small>${project.role === "target" ? "대상" : "관련"} · ${project.locatorKind}</small></span>
+          <label class="task-project-branch"><span>작업 브랜치</span><input data-scope="task-project-branch" data-task-id="${esc(task.id)}" data-locator="${esc(project.locator)}" value="${esc(project.branch ?? "")}" placeholder="예: feature/task-42"></label>
+          <button class="icon danger" data-action="remove-task-project" data-id="${esc(task.id)}" data-locator="${esc(project.locator)}" aria-label="대상 프로젝트 제거">×</button>
+        </li>`).join("")}</ul>`
+      : '<p class="help">연결된 대상 프로젝트가 없습니다.</p>'}
+    <p class="help">실행할 때 이 경로와 작업 브랜치에 일치하는 Orca 워크트리를 우선 선택합니다.</p>
+    <label class="field"><span>Orca 프로젝트 추가</span><select data-action="add-task-project" data-id="${esc(task.id)}" ${available.length ? "" : "disabled"}>
+      ${option("", available.length ? "프로젝트 선택…" : "추가할 수 있는 프로젝트가 없습니다", "")}
+      ${available.map((project) => option(project.path!, `${project.name}${project.branch ? ` · ${shortBranch(project.branch)}` : ""}`, "")).join("")}
+    </select></label>
+    ${targets.projects.length ? "" : '<p class="help">프로젝트 목록이 비어 있습니다. 도구 모음의 <b>Orca 대상 갱신</b>을 먼저 실행하십시오.</p>'}
   </section>`;
 }
 
 function taskInspector(task: LocalTask): string {
   const links = taskGraphLinks(task.id);
-  const runtime = latestExecution("task", task.id);
   return `<section class="work-detail-page" aria-label="Task 상세">
     <header class="work-detail-header">
       <button class="back-button" data-action="back-to-task-list" aria-label="Task 목록으로 돌아가기">← Task 목록</button>
       <div><span class="badge priority-${task.priority}">${priorityLabel[task.priority]}</span><strong>${esc(task.title)}</strong><small>${esc(task.id)}</small></div>
-      <span class="work-detail-actions"><button data-action="open-quick-graph" data-id="${esc(task.id)}" ${task.status === "archived" ? "disabled" : ""}>빠른 그래프 구성</button><button class="primary task-run-button" data-action="open-task-run" data-id="${esc(task.id)}" ${runtime && executionActive(runtime) ? "disabled" : ""}>${runtime && executionActive(runtime) ? "● 실행 중" : "▶ 실행"}</button></span>
+      <span class="work-detail-actions"><button data-action="open-quick-graph" data-id="${esc(task.id)}" ${task.status === "archived" ? "disabled" : ""}>빠른 그래프 구성</button><button class="primary task-run-button" data-action="open-task-run" data-id="${esc(task.id)}">▶ 실행</button></span>
     </header>
     <div class="work-detail-body">
-      ${executionBanner(runtime)}
-      <label class="field"><span>제목</span><input data-scope="local-task" data-field="title" value="${esc(task.title)}"></label>
+        <label class="field"><span>제목</span><input data-scope="local-task" data-field="title" value="${esc(task.title)}"></label>
       ${scopeSelectors("local-task", task)}
       ${taskProjectSection(task)}
       ${promptPairEditor("task", task)}
@@ -3232,13 +3091,13 @@ function renderWorkCards(items: Array<LocalTask | LocalTodo>, isTask: boolean, s
       const detail = item.draft;
       const link = isTask ? `${taskGraphLinks(item.id).length} graph nodes` : ((item as LocalTodo).taskId ? "Task 연결됨" : "Task 미연결");
       const metaState = promptState(item);
-      const runtime = latestExecution(isTask ? "task" : "todo", item.id);
+      const dispatched = latestDispatch(isTask ? "task" : "todo", item.id);
       const todo = isTask ? undefined : item as LocalTodo;
       const todoBusy = Boolean(todo && busyTodoActions.has(todo.id));
       const todoClosed = Boolean(todo && ["done", "cancelled"].includes(todo.status));
       const todoArchived = Boolean(todo?.archivedAt);
       const actionSurface = isTask
-        ? `<button class="quick-worktree-run" data-action="open-task-run" data-id="${esc(item.id)}" aria-label="Task 실행 · ${esc(item.title)}" title="실행" ${item.status === "archived" || Boolean(runtime && executionActive(runtime)) ? "disabled" : ""}>${runtime && executionActive(runtime) ? "●" : "▶"}</button>`
+        ? `<button class="quick-worktree-run" data-action="open-task-run" data-id="${esc(item.id)}" aria-label="Task 실행 · ${esc(item.title)}" title="실행" ${item.status === "archived" ? "disabled" : ""}>▶</button>`
         : `<span class="todo-card-actions">
             ${todo!.taskId
               ? `<button data-action="open-linked-task" data-id="${esc(todo!.taskId)}">Task 열기</button>`
@@ -3247,7 +3106,7 @@ function renderWorkCards(items: Array<LocalTask | LocalTodo>, isTask: boolean, s
             ${!todo!.taskId ? '<small>먼저 Task를 생성하십시오</small>' : ""}
           </span>`;
       return `<div class="work-card-row ${isTask ? "" : "todo-card-row"}"><button class="work-card ${selected ? "selected" : ""}" data-action="${isTask ? "select-local-task" : "select-local-todo"}" data-id="${esc(item.id)}">
-        <span class="work-card-head"><span class="work-status-dot status-${esc(item.status)}"></span><strong>${esc(item.title)}</strong>${executionInline(runtime, true)}<span class="badge priority-${item.priority}">${priorityLabel[item.priority]}</span></span>
+        <span class="work-card-head"><span class="work-status-dot status-${esc(item.status)}"></span><strong>${esc(item.title)}</strong>${dispatched ? `<span class="dispatch-inline" title="${esc(new Date(dispatched.dispatchedAt).toLocaleString("ko-KR"))} 세션으로 보냄">↗</span>` : ""}<span class="badge priority-${item.priority}">${priorityLabel[item.priority]}</span></span>
         <span class="work-card-detail">${esc(detail || "Draft 없음")}</span>
         <span class="work-card-meta"><span>${esc(status)}</span><span>${esc(itemScope(item).label)}</span><span class="meta-label meta-${metaState}">Meta ${metaState === "current" ? "최신" : metaState === "running" ? "생성 중" : metaState === "stale" ? "이전본" : metaState === "failed" ? "실패" : "없음"}</span><span>${esc(link)}</span>${item.dueDate ? `<span>마감 ${esc(item.dueDate)}</span>` : ""}</span>
       </button>${actionSurface}${todo?.notes ? `<button class="todo-card-comment" data-action="select-local-todo" data-id="${esc(todo.id)}" ${todoArchived ? "disabled" : ""} aria-label="코멘트 ${todoArchived ? "보기" : "수정"}"><span aria-hidden="true">💬</span><span>${esc(todo.notes)}</span></button>` : ""}</div>`;
@@ -3381,39 +3240,26 @@ function renderScopeManager(kind: "domain" | "milestone"): string {
   </section>`;
 }
 
-const executionStatusLabel: Record<RuntimeExecution["status"], string> = {
-  queued: "대기 중",
-  running: "실행 중",
-  completed: "완료",
-  failed: "실패",
-  cancelled: "취소",
-};
-
-function executionActive(execution: RuntimeExecution): boolean {
-  return execution.status === "queued" || execution.status === "running";
-}
-
-type VisualNodeStatus = GraphNode["status"] | "queued" | "blocked";
+type VisualNodeStatus = GraphNode["status"];
 
 const visualNodeStatusLabel: Record<VisualNodeStatus, string> = {
   pending: "대기",
-  queued: "실행 대기",
   running: "실행 중",
   waiting: "승인 대기",
   done: "완료",
   skipped: "건너뜀",
   failed: "실패",
-  blocked: "시작 실패",
 };
 
-function visualNodeStatus(graph: GraphDefinition, node: GraphNode, execution = latestExecution("graph", graph.id)): VisualNodeStatus {
+/**
+ * 노드 상태는 그래프와 run 기록에서만 읽는다. 패널은 세션이 지금 무엇을 하는지
+ * 관측할 수 없으므로, 보낸 사실을 진행 중으로 바꿔 표시하지 않는다.
+ */
+function visualNodeStatus(graph: GraphDefinition, node: GraphNode): VisualNodeStatus {
   if (node.status !== "pending") return node.status;
   const result = latestRun(graph)?.nodeResults?.find((item) => item.nodeId === node.id);
   if (result?.status === "failed") return "failed";
   if (result?.status === "done" || result?.status === "skipped") return result.status;
-  if (execution?.status === "queued" || execution?.status === "running") return "queued";
-  if (execution?.status === "failed") return "blocked";
-  if (execution?.status === "completed") return "skipped";
   return "pending";
 }
 
@@ -3463,77 +3309,48 @@ function nodeRunTooltip(graph: GraphDefinition, node: GraphNode, status: VisualN
   return lines.join("\n");
 }
 
-function nodeRunMetaMarkup(graph: GraphDefinition, node: GraphNode, status: VisualNodeStatus, execution: RuntimeExecution | undefined): string {
+function nodeRunMetaMarkup(graph: GraphDefinition, node: GraphNode, status: VisualNodeStatus): string {
   const result = nodeRunResult(graph, node)?.result;
-  // 실행 기록이 남아 있으면 실행 레코드가 사라진 뒤에도 계속 보여야 한다.
-  if (!execution && !result) return "";
-  return `<div class="node-run-meta status-${status}"><strong>${esc(visualNodeStatusLabel[status])}</strong>${result?.attempt ? `<span>시도 ${result.attempt}</span>` : ""}${result?.durationMs ? `<span>${esc(runSeconds(result.durationMs))}</span>` : ""}${result?.message ? `<span class="node-run-message" title="${esc(result.message)}">${esc(result.message)}</span>` : ""}</div>`;
+  if (!result) return "";
+  return `<div class="node-run-meta status-${status}"><strong>${esc(visualNodeStatusLabel[status])}</strong>${result.attempt ? `<span>시도 ${result.attempt}</span>` : ""}${result.durationMs ? `<span>${esc(runSeconds(result.durationMs))}</span>` : ""}${result.message ? `<span class="node-run-message" title="${esc(result.message)}">${esc(result.message)}</span>` : ""}</div>`;
 }
 
-function latestExecution(itemKind: RuntimeExecution["itemKind"], itemId: string): RuntimeExecution | undefined {
-  return executions
-    .filter((execution) => execution.itemKind === itemKind && execution.itemId === itemId)
-    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+/* ── 실행 현황 ────────────────────────────────────────────────────────────────
+ *
+ * 패널이 하는 일은 Orca 세션에 프롬프트를 꽂는 것까지다. 그 뒤 진행은 세션의
+ * 에이전트가 소유하고, 패널에는 되돌아오는 채널이 없다. 그래서 이 화면은 두 가지
+ * 사실만 보여 준다.
+ *
+ *   1. 패널이 무엇을 어디로 언제 보냈는가 (dispatch 로그)
+ *   2. 그래프에 기록된 run 이력 (원천이 알려 준 것)
+ *
+ * 진행률을 추정하거나 확인하지 못한 상태를 지어내지 않는다.
+ */
+
+function dispatchTargetLine(target: DispatchTarget): string {
+  const where = [target.projectName || target.label, target.branch].filter(Boolean).join(" · ");
+  const session = target.opened === "new-session"
+    ? `새 세션 생성 요청${target.model ? ` · ${modelName(target.model)}` : ""}`
+    : `기존 세션 · ${target.sessionTitle || target.sessionId?.slice(0, 12) || ""}`;
+  return `<div class="dispatch-target"><strong>${esc(where || "대상")}</strong><span>${esc(session)}</span></div>`;
 }
 
-function executionPercent(execution: RuntimeExecution): number {
-  const total = Math.max(1, execution.progress.total);
-  return Math.max(0, Math.min(100, Math.round(((execution.progress.completed + execution.progress.failed) / total) * 100)));
-}
-
-function executionInline(execution: RuntimeExecution | undefined, compact = false): string {
-  if (!execution) return "";
-  const percent = executionPercent(execution);
-  return `<span class="execution-inline status-${execution.status}" title="${esc(executionStatusLabel[execution.status])} · ${execution.progress.completed}/${execution.progress.total}"><span class="execution-pulse"></span><b>${esc(executionStatusLabel[execution.status])}</b>${compact ? "" : `<span>${percent}%</span>`}</span>`;
-}
-
-function executionBanner(execution: RuntimeExecution | undefined): string {
-  if (!execution) return "";
-  const percent = executionPercent(execution);
-  return `<section class="execution-banner status-${execution.status}" aria-label="현재 실행 상태"><div><span class="execution-pulse"></span><strong>${esc(executionStatusLabel[execution.status])}</strong><span>${execution.progress.completed}/${execution.progress.total} 완료${execution.progress.failed ? ` · ${execution.progress.failed} 실패` : ""}</span></div><div class="execution-progress"><span style="width:${percent}%"></span></div><button data-action="set-view" data-id="executions">실행 현황 보기</button></section>`;
-}
-
-function executionTargetSession(target: RuntimeExecutionTarget): string {
-  const more = target.sessionCount && target.sessionCount > 1 ? ` 외 ${target.sessionCount - 1}개` : "";
-  if (target.sessionTitle) return `Orca 세션 · ${target.sessionTitle}${more}`;
-  if (target.sessionId) return `Orca 세션 · ${target.sessionId.slice(0, 12)}${more}`;
-  return target.status === "queued" ? "세션 생성 대기" : "새 Orca 세션";
-}
-
-function renderExecutionCard(execution: RuntimeExecution, grouped = false, groupIndex = 0): string {
-  const percent = executionPercent(execution);
-  const kindLabel = execution.itemKind === "graph" ? "Graph" : execution.itemKind === "task" ? "Task" : "Todo";
-  const cardTitle = grouped ? groupIndex === 0 ? "최근 실행" : `이전 실행 ${groupIndex}` : execution.title;
-  const cardMeta = grouped
-    ? `${new Date(execution.createdAt).toLocaleString("ko-KR")} · ${execution.executionMode === "per_project" ? "프로젝트별 배정" : "통합 배정"}`
-    : `${execution.itemId} · ${execution.executionMode === "per_project" ? "프로젝트별 배정" : "통합 배정"}`;
-  return `<article class="execution-card status-${execution.status}">
-    <header><span class="execution-kind">${grouped ? "RUN" : kindLabel}</span><div><strong>${esc(cardTitle)}</strong><small>${esc(cardMeta)}</small></div>${executionInline(execution)}</header>
-    <div class="execution-progress-copy"><span>${execution.progress.completed}/${execution.progress.total} 완료${execution.progress.failed ? ` · ${execution.progress.failed} 실패` : ""}</span><time>${new Date(execution.updatedAt).toLocaleString("ko-KR")}</time></div>
-    <div class="execution-progress" role="progressbar" aria-label="${esc(execution.title)} 실행 진행률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span style="width:${percent}%"></span></div>
-    <div class="execution-targets">${execution.targets.map((target) => `<div class="execution-target status-${target.status}"><span class="execution-pulse"></span><strong>${esc(target.projectName || target.label)}</strong><span>${esc(target.branch || "기본 브랜치")}</span><span title="${esc(target.sessionId ?? "")}">${esc(executionTargetSession(target))}</span><span>${esc(modelName(target.model))}</span>${target.error ? `<small class="execution-target-error">${esc(target.error)}</small>` : ""}</div>`).join("")}</div>
-    ${execution.error ? `<p class="execution-error" role="alert">${esc(execution.error)}</p>` : ""}
-    ${executionActive(execution) ? `<p class="execution-cancel-row">${execution.cancelRequestedAt
-      ? '<span class="execution-cancelling">중단 요청함 · 진행 중인 노드가 끝나면 멈춥니다</span>'
-      : `<button class="ghost" data-action="cancel-execution" data-id="${esc(execution.id)}">■ 실행 중단</button>`}</p>` : ""}
-    ${grouped ? "" : `<footer><button data-action="open-execution-item" data-kind="${execution.itemKind}" data-id="${esc(execution.itemId)}">${kindLabel} 열기</button></footer>`}
+function renderDispatchRecord(record: DispatchRecord): string {
+  const kindLabel = record.itemKind === "graph" ? "Graph" : record.itemKind === "task" ? "Task" : "Todo";
+  return `<article class="dispatch-card ${record.error ? "failed" : ""}">
+    <header>
+      <span class="execution-kind">${kindLabel}</span>
+      <div><strong>${esc(record.title)}</strong><small>${esc(record.itemId)}</small></div>
+      <time>${esc(new Date(record.dispatchedAt).toLocaleString("ko-KR"))}</time>
+    </header>
+    ${record.error
+      ? `<p class="dispatch-error" role="alert">세션에 전달하지 못했습니다 · ${esc(record.error)}</p>`
+      : `<div class="dispatch-targets">${record.targets.map(dispatchTargetLine).join("")}</div>`}
+    <footer><button data-action="open-execution-item" data-kind="${record.itemKind}" data-id="${esc(record.itemId)}">${kindLabel} 열기</button></footer>
   </article>`;
 }
 
-function executionGroups(records: RuntimeExecution[]): RuntimeExecution[][] {
-  const groups = new Map<string, RuntimeExecution[]>();
-  for (const execution of records) {
-    const key = `${execution.itemKind}:${execution.itemId}`;
-    const group = groups.get(key) ?? [];
-    group.push(execution);
-    groups.set(key, group);
-  }
-  return [...groups.values()]
-    .map((group) => group.sort((left, right) => right.createdAt.localeCompare(left.createdAt)))
-    .sort((left, right) => right[0]!.createdAt.localeCompare(left[0]!.createdAt));
-}
-
-/** 실행 현황의 핵심 — 실행 레코드는 "어디에 보냈는지"만 안다. 무슨 일이 있었는지는 run의 노드별 결과에 있다. */
+/** 그래프에 기록된 run 이력. 원천이 노드별 결과를 주면 그것까지 펼친다. */
 function renderGraphRunTimeline(graphId: string): string {
   const graph = store.graphs.find((item) => item.id === graphId);
   if (!graph) return "";
@@ -3573,46 +3390,45 @@ function renderGraphRunTimeline(graphId: string): string {
               ${result.message ? `<pre class="run-node-message ${result.status === "failed" ? "failed" : ""}">${esc(result.message)}</pre>` : ""}
             </div>
           </li>`).join("")}</ol>`
-        : '<p class="run-nodes-empty">이 run에는 노드별 기록이 없습니다. 다른 실행기가 처리했거나 첫 노드 전에 멈춘 run입니다.</p>'}
+        : '<p class="run-nodes-empty">이 run에는 노드별 기록이 없습니다. 세션이 아직 진행 중이거나, 원천이 노드별 결과를 남기지 않았습니다.</p>'}
     </details>`;
   }).join("")}</div>`;
 }
 
-function renderExecutionGroup(records: RuntimeExecution[]): string {
-  const latest = records[0]!;
-  const kindLabel = latest.itemKind === "graph" ? "Graph" : latest.itemKind === "task" ? "Task" : "Todo";
-  const active = records.filter(executionActive).length;
-  return `<article class="execution-group" data-execution-kind="${latest.itemKind}" data-execution-item-id="${esc(latest.itemId)}">
-    <header class="execution-group-header"><span class="execution-kind">${kindLabel}</span><div><strong>${esc(latest.title)}</strong><small>${esc(latest.itemId)} · 실행 ${records.length}회${active ? ` · 진행 중 ${active}` : ""}</small></div>${executionInline(latest)}<button data-action="open-execution-item" data-kind="${latest.itemKind}" data-id="${esc(latest.itemId)}">${kindLabel} 열기</button></header>
-    ${latest.itemKind === "graph" ? `<section class="execution-run-history"><header><strong>노드별 진행 경과</strong><span>최근 run 5회</span></header>${renderGraphRunTimeline(latest.itemId)}</section>` : ""}
-    <div class="execution-group-runs">${records.map((execution, index) => renderExecutionCard(execution, true, index)).join("")}</div>
-  </article>`;
-}
-
 function renderExecutionManager(): string {
-  const ordered = [...executions].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-  const active = ordered.filter(executionActive);
-  const recent = ordered.filter((item) => !executionActive(item)).slice(0, 30);
-  const visible = [...active, ...recent].filter((execution, index, all) => all.findIndex((candidate) => candidate.id === execution.id) === index);
-  const grouped = executionGroups(visible);
-  const graphGroups = grouped.filter((group) => group[0]?.itemKind === "graph");
-  const workGroups = grouped.filter((group) => group[0]?.itemKind !== "graph");
+  const records = store.dispatchLog;
+  const dispatchedGraphIds = [...new Set(records.filter((record) => record.itemKind === "graph").map((record) => record.itemId))];
   return `<section class="execution-manager" aria-label="실행 현황">
-    <header class="execution-manager-header"><div><strong>실행 현황</strong><span>Graph ${graphGroups.length} · 단건 ${workGroups.length} · 실행 중 ${active.length}</span></div><button data-action="refresh-executions" aria-label="실행 현황 새로고침">↻ 새로고침</button></header>
+    <header class="execution-manager-header">
+      <div><strong>실행 현황</strong><span>보낸 작업 ${records.length}건</span></div>
+      <button data-action="refresh-data" aria-label="데이터 다시 읽기">↻ 다시 읽기</button>
+    </header>
+    <p class="help execution-scope-note">패널은 Orca 세션에 작업을 전달하는 데까지 관여합니다. 전달 뒤의 진행은 각 세션에서 확인하십시오.</p>
     <div class="execution-manager-body">
-      ${graphGroups.length ? `<section class="execution-section"><header><strong>Graph 실행</strong><span>${graphGroups.length}개 Graph · ${graphGroups.reduce((count, group) => count + group.length, 0)}회</span></header><div class="execution-groups">${graphGroups.map(renderExecutionGroup).join("")}</div></section>` : ""}
-      ${workGroups.length ? `<section class="execution-section"><header><strong>Task·Todo 단건 실행</strong><span>${workGroups.length}개 항목 · ${workGroups.reduce((count, group) => count + group.length, 0)}회</span></header><div class="execution-groups">${workGroups.map(renderExecutionGroup).join("")}</div></section>` : ""}
-      ${grouped.length ? "" : '<div class="execution-empty"><strong>실행 이력이 없습니다.</strong><span>Task 또는 Graph의 실행 버튼에서 바로 시작할 수 있습니다.</span></div>'}
+      ${records.length
+        ? `<section class="execution-section"><header><strong>보낸 작업</strong><span>최근 ${records.length}건</span></header>
+            <div class="dispatch-list">${records.map(renderDispatchRecord).join("")}</div>
+          </section>`
+        : '<div class="execution-empty"><strong>보낸 작업이 없습니다.</strong><span>Task 또는 Graph의 실행 버튼에서 세션으로 작업을 보낼 수 있습니다.</span></div>'}
+      ${dispatchedGraphIds.length
+        ? `<section class="execution-section"><header><strong>Graph run 이력</strong><span>원천에 기록된 실행</span></header>
+            ${dispatchedGraphIds.map((graphId) => {
+              const graph = store.graphs.find((item) => item.id === graphId);
+              if (!graph) return "";
+              return `<article class="execution-group"><header class="execution-group-header"><span class="execution-kind">Graph</span><div><strong>${esc(graph.name)}</strong><small>${esc(graph.id)}</small></div><button data-action="open-execution-item" data-kind="graph" data-id="${esc(graph.id)}">Graph 열기</button></header>${renderGraphRunTimeline(graphId)}</article>`;
+            }).join("")}
+          </section>`
+        : ""}
     </div>
   </section>`;
 }
 
+
 function renderSectionNav(): string {
-  const running = executions.filter(executionActive).length;
   return `<nav class="section-tabs" aria-label="플러그인 메뉴">
     <button class="${view.mode === "list" ? "active" : ""}" data-action="set-view" data-id="list">그래프 목록</button>
     <button class="${view.mode === "canvas" ? "active" : ""}" data-action="set-view" data-id="canvas">그래프 보기</button>
-    <button class="${view.mode === "executions" ? "active" : ""}" data-action="set-view" data-id="executions">실행 현황${running ? ` <span class="nav-count">${running}</span>` : ""}</button>
+    <button class="${view.mode === "executions" ? "active" : ""}" data-action="set-view" data-id="executions">실행 현황${store.dispatchLog.length ? ` <span class="nav-count">${store.dispatchLog.length}</span>` : ""}</button>
     <button class="${view.mode === "domains" ? "active" : ""}" data-action="set-view" data-id="domains">Domain 관리</button>
     <button class="${view.mode === "milestones" ? "active" : ""}" data-action="set-view" data-id="milestones">Milestone 관리</button>
     <button class="${view.mode === "tasks" ? "active" : ""}" data-action="set-view" data-id="tasks">Task 관리</button>
@@ -3630,26 +3446,22 @@ function renderGraphTrail(): string {
 
 function render(): void {
   const graph = activeGraph();
-  const graphExecution = latestExecution("graph", graph.id);
-  const bridgeReady = Boolean(store.bridgeTerminalId);
   const runCount = graph.runs.length;
   const previousSemanticFocus = returnFocusFor(document.activeElement);
   const previousDialog = app.querySelector<HTMLElement>('[role="dialog"]');
   const previousFocusables = previousDialog ? focusableElements(previousDialog) : [];
   const previousFocusIndex = previousFocusables.indexOf(document.activeElement as HTMLElement);
-  app.innerHTML = `<div class="app-shell mode-${view.editorMode} ${isWideMode ? "wide-mode" : ""}">
+  app.innerHTML = `<div class="app-shell mode-${view.editorMode}">
     <header class="topbar">
       <div class="brand"><span class="brand-mark">⌘</span><span class="brand-copy"><strong>Graph Engineering</strong><small>Orca-native execution graph</small></span></div>
       <select class="graph-switcher" data-action="switch-graph" aria-label="그래프 선택">${graphOptions(graph.id)}</select>
       <button class="icon always" data-action="new-graph" title="새 그래프">＋</button>
       <button class="icon" data-action="clone-graph" title="그래프 복제">⧉</button>
-      ${isWideMode ? '<span class="badge wide-badge">넓게 보기</span>' : '<button class="icon always" data-action="open-wide" title="Orca 중앙 탭에서 넓게 열기">⛶</button>'}
       <span class="topbar-spacer"></span>
       ${view.dirty ? '<span class="status-pill warn" role="status" aria-live="polite"><span class="dirty-dot"></span>저장 안 됨</span>' : '<span class="status-pill good" role="status" aria-live="polite">저장됨</span>'}
       <button class="ghost" data-action="open-data-source" title="그래프 데이터 원천 설정">데이터 원천</button>
       <button class="ghost" data-action="refresh-source" title="연결된 데이터 원천에서 최신 snapshot 가져오기" aria-label="데이터 원천 새로고침" aria-busy="${view.sourceRefreshing}" ${dataSource.config.mode === "local" || view.sourceRefreshing ? "disabled" : ""}>${view.sourceRefreshing ? "새로고침 중…" : "새로고침"}</button>
-      <button class="ghost" data-action="connect-bridge">${bridgeReady ? "브리지 ✓" : "브리지"}</button>
-      ${view.mode === "canvas" ? `<button class="primary always topbar-run" data-action="open-run" title="그래프 실행" ${graphExecution && executionActive(graphExecution) ? "disabled" : ""}>${graphExecution && executionActive(graphExecution) ? "● 실행 중" : "▶ 실행"}</button>` : ""}
+      ${view.mode === "canvas" ? '<button class="primary always topbar-run" data-action="open-run" title="그래프 실행">▶ 실행</button>' : ""}
       <button class="primary always" data-action="save">저장</button>
     </header>
     ${renderSectionNav()}
@@ -3662,7 +3474,7 @@ function render(): void {
             <span class="toolbar-group"><button data-action="add-task">＋ Task</button><button data-action="open-batch-tasks">＋ Task 묶음</button><button data-action="add-condition">＋ ◇ 조건</button><button data-action="add-graph-call">＋ ▦ 호출</button></span>
             <span class="toolbar-group"><button data-action="undo" ${view.historyUndo.length ? "" : "disabled"}>↶</button><button data-action="redo" ${view.historyRedo.length ? "" : "disabled"}>↷</button><button data-action="open-templates">Topology</button><button data-action="auto-layout">자동 정렬 미리보기 ${view.layoutDirection}</button><button data-action="toggle-layout">${view.layoutDirection === "LR" ? "가로 → 세로" : "세로 → 가로"}</button></span>
             <span class="toolbar-group"><label class="node-search"><span>⌕</span><input data-action="node-search" value="${esc(view.nodeQuery)}" placeholder="노드 검색 ⌘K" aria-label="노드 검색"></label><select data-action="group-mode" aria-label="캔버스 그룹">${option("none", "그룹 없음", graphGroupMode(graph))}${option("domain", "Domain", graphGroupMode(graph))}${option("milestone", "Milestone", graphGroupMode(graph))}${option("superstep", "Superstep", graphGroupMode(graph))}${option("loop", "Loop", graphGroupMode(graph))}</select></span>
-            <span class="toolbar-group"><button data-action="refresh-targets">Orca 대상 갱신</button><button data-action="reset-graph-history" title="노드와 연결은 그대로 두고 실행 상태만 되돌립니다" ${graphExecution && executionActive(graphExecution) ? "disabled" : ""}>↺ 실행 초기화</button></span>
+            <span class="toolbar-group"><button data-action="refresh-targets">Orca 대상 갱신</button><button data-action="reset-graph-history" title="노드와 연결은 그대로 두고 실행 상태만 되돌립니다">↺ 실행 초기화</button></span>
             <span class="toolbar-group"><button data-action="show-analysis">그래프 설정</button><button data-action="toggle-problems">Problems</button><button data-action="open-history">실행 이력</button><button data-action="export-json">JSON</button><button data-action="import-json">가져오기</button><button data-action="open-shortcuts">?</button><span class="badge">run ${runCount}</span></span>
           </span>
           <span class="toolbar-compact">
@@ -3679,7 +3491,7 @@ function render(): void {
                 <button data-action="toggle-layout">레이아웃 방향 전환</button>
                 <button data-action="editor-mode" data-id="${view.editorMode === "design" ? "run" : "design"}">${view.editorMode === "design" ? "실행 보기" : "설계 모드"}</button>
                 <button data-action="redo" ${view.historyRedo.length ? "" : "disabled"}>다시 실행</button>
-                <button data-action="reset-graph-history" ${graphExecution && executionActive(graphExecution) ? "disabled" : ""}>↺ 실행 초기화</button>
+                <button data-action="reset-graph-history">↺ 실행 초기화</button>
                 <button data-action="show-analysis">그래프 설정</button>
                 <button data-action="toggle-problems">Problems</button>
                 <button data-action="open-data-source">데이터 원천</button>
@@ -3698,13 +3510,11 @@ function render(): void {
       ${renderInspector(graph)}
     </div>`}
     <footer class="bottom-status" role="status" aria-live="polite" aria-atomic="true">
-      <span class="status-pill ${bridgeReady ? "good" : "warn"}">${bridgeReady ? "● bridge" : "○ bridge off"}</span>
-      <span class="message">${esc(store.lastBridgeMessage ?? "그래프를 편집한 뒤 저장하십시오.")}</span>
+      <span class="message">${esc(store.lastSaveMessage ?? "그래프를 편집한 뒤 저장하십시오.")}</span>
       <span class="status-pill ${dataSource.status === "ready" ? "good" : dataSource.status === "error" ? "bad" : "warn"}">${esc(dataSource.config.mode)} · ${esc(dataSource.status)}</span>
       <span>${targets.environments?.length ?? 1} environments · ${targets.projects.length} projects · ${targets.sessions.length} sessions · built ${new Date(bootstrap.builtAt).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}</span>
     </footer>
     ${renderModal()}
-    ${isWideMode && view.mode !== "canvas" ? '<button class="graph-fab" data-action="set-view" data-id="canvas" title="그래프 보기"><strong>그래프 보기</strong></button>' : ""}
     ${toastMarkup()}
   </div>`;
   const dialog = app.querySelector<HTMLElement>('[role="dialog"]');
@@ -3719,7 +3529,6 @@ function render(): void {
   } else {
     focusReturnTarget(previousSemanticFocus);
   }
-  scheduleExecutionPolling();
 }
 
 function addNode(kind: GraphNode["kind"], position?: Point): GraphNode {
@@ -3782,6 +3591,65 @@ function addBatchTasks(labels: string[]): void {
   setNodeSelection(ids, ids.at(-1));
   view.inspectorOpen = true;
   recordGraphHistory(before, `Task 노드 ${labels.length}개 추가`, graph);
+}
+
+/**
+ * Task 몇 개를 순서대로 잇는 그래프를 만든다.
+ *
+ * 예전에는 원천의 quick-create 경계를 호출했지만, 그 왕복은 응답 채널이 없어
+ * 성립하지 않는다. 지금은 다른 편집과 똑같이 로컬에서 만들고 저장할 때 원천에
+ * 커밋한다.
+ */
+function createQuickGraphLocally(source: LocalTask, name: string, taskIds: string[]): void {
+  const now = new Date().toISOString();
+  const ordered = [source.id, ...taskIds.filter((id) => id !== source.id)];
+  const graphId = newId("graph");
+  const nodes: GraphNode[] = ordered.flatMap((taskId, index) => {
+    const task = store.tasks.find((item) => item.id === taskId);
+    if (!task) return [];
+    return [{
+      id: newId("NODE"),
+      kind: "task",
+      label: task.title,
+      x: 48 + index * 270,
+      y: 48,
+      status: "pending",
+      joinMode: "all",
+      task: {
+        id: task.id,
+        title: task.title,
+        prompt: task.prompt,
+        ...(task.version !== undefined ? { version: task.version } : {}),
+        ...(task.metadata ? { metadata: structuredClone(task.metadata) } : {}),
+      },
+      routing: {},
+      engineering: { role: "worker", contextMode: "inherit", maxAttempts: 1, permissions: ["read"] },
+    } satisfies GraphNode];
+  });
+  const edges = nodes.slice(1).map((node, index) => ({
+    id: newId("EDGE"),
+    from: nodes[index]!.id,
+    to: node.id,
+    kind: "sequence" as const,
+  }));
+  store.graphs.push({
+    id: graphId,
+    name: name || `${source.title} 그래프`,
+    summary: "",
+    status: "draft",
+    version: dataSource.config.mode === "structured" ? 0 : 1,
+    pinned: false, processEnabled: false, routineEnabled: false, repeatMode: "none",
+    defaults: {},
+    runGuards: { claimLeaseSeconds: 21600, stagnationRuns: 3 },
+    engineering: { checkpointPolicy: "superstep", requireProvenance: true, humanGateForIrreversible: true, maturity: "experimental" },
+    nodes, edges, runs: [], createdAt: now, updatedAt: now,
+  });
+  store.activeGraphId = graphId;
+  view.mode = "canvas";
+  view.graphTrail = [];
+  clearGraphSelection();
+  view.dirty = true;
+  render();
 }
 
 function addLocalTaskNode(task: LocalTask): void {
@@ -4007,90 +3875,73 @@ function centerSelectedNode(): void {
   render();
 }
 
-async function chooseBridge(): Promise<void> {
-  openModal({ kind: "bridge", loading: true, context: null });
-  try {
-    const context = await hostCall<WorkspaceContext>("workspace.readContext", {});
-    const staleSelection = Boolean(store.bridgeTerminalId)
-      && !context?.terminals.some((terminal) => terminal.id === store.bridgeTerminalId);
-    if (staleSelection) {
-      delete store.bridgeTerminalId;
-      delete store.bridgeWorkspace;
-      view.dirty = true;
-    }
-    view.modal = {
-      kind: "bridge",
-      loading: false,
-      context,
-      ...(staleSelection ? { error: "저장된 브리지 터미널이 현재 Orca worktree에 없어 선택을 해제했습니다. 현재 worktree의 셸 터미널을 다시 선택하십시오." } : {}),
-    };
-  } catch (error) {
-    view.modal = { kind: "bridge", loading: false, context: null, error: error instanceof Error ? error.message : String(error) };
+/* ── 터미널 채널 ──────────────────────────────────────────────────────────────
+ *
+ * 패널이 밖으로 나갈 수 있는 유일한 호스트 액션은 `terminal.sendText`이고, 한 번에
+ * 4096자까지, 10초에 30번까지 보낼 수 있다. 그래서 긴 텍스트는 `enter: false`로
+ * 이어 붙여 한 줄을 완성한 뒤 마지막에만 Enter를 보낸다. 응답을 받을 방법은 없다.
+ */
+
+const TERMINAL_TEXT_LIMIT = 4_000;
+const TERMINAL_TEXT_TOTAL_LIMIT = 96 * 1024;
+
+async function sendTerminalLine(terminalId: string, text: string): Promise<void> {
+  if (text.length > TERMINAL_TEXT_TOTAL_LIMIT) {
+    throw new Error("보낼 내용이 한 번에 터미널로 전달할 수 있는 크기를 넘었습니다. 나누어 저장하거나 실행하십시오.");
   }
-  render();
+  // 줄에 남아 있을지 모르는 입력을 먼저 지운다. 남은 문자가 앞에 붙으면 명령이
+  // 통째로 다른 뜻이 된다.
+  await hostCall("terminal.sendText", { terminalId, text: "", enter: false });
+  for (let offset = 0; offset < text.length; offset += TERMINAL_TEXT_LIMIT) {
+    const chunk = text.slice(offset, offset + TERMINAL_TEXT_LIMIT);
+    const last = offset + TERMINAL_TEXT_LIMIT >= text.length;
+    await hostCall("terminal.sendText", { terminalId, text: chunk, enter: last });
+  }
 }
 
-async function requireCurrentBridgeTerminal(): Promise<string> {
-  const terminalId = store.bridgeTerminalId;
-  if (!terminalId) throw new Error("먼저 브리지 터미널을 선택하십시오.");
+/** JSON을 gzip + base64url로 만든다. 압축하지 않으면 Task 하나도 한 줄에 못 담는다. */
+async function encodePayload(value: unknown): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  const compressed = new Uint8Array(await new Response(
+    new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip")),
+  ).arrayBuffer());
+  let binary = "";
+  for (const byte of compressed) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+}
+
+async function currentTerminals(): Promise<Array<{ id: string }>> {
   const context = await hostCall<WorkspaceContext>("workspace.readContext", {});
-  if (context?.terminals.some((terminal) => terminal.id === terminalId)) return terminalId;
-  delete store.bridgeTerminalId;
-  delete store.bridgeWorkspace;
-  view.dirty = true;
+  return context?.terminals ?? [];
+}
+
+/**
+ * 저장 명령을 보낼 터미널. 한 번 고르면 기억한다. Orca가 패널에 터미널 id만
+ * 알려주므로 어느 것이 셸인지 패널은 알 수 없다 — 그래서 사용자가 고른다.
+ */
+async function resolveSaveTerminal(): Promise<string> {
+  const terminals = await currentTerminals();
+  if (!terminals.length) {
+    throw new Error("현재 워크트리에 열린 터미널이 없습니다. Orca에서 터미널 탭을 하나 열어 주십시오.");
+  }
+  const remembered = store.saveTerminalId;
+  if (remembered && terminals.some((terminal) => terminal.id === remembered)) return remembered;
+  if (terminals.length === 1) {
+    store.saveTerminalId = terminals[0]!.id;
+    return store.saveTerminalId;
+  }
+  openModal({ kind: "save-terminal", terminals });
   render();
-  throw new Error("브리지 터미널이 현재 Orca worktree에 없습니다. 브리지에서 현재 worktree의 셸 터미널을 다시 선택하십시오.");
+  throw new Error("저장할 터미널을 선택하십시오.");
 }
 
-async function startBridge(): Promise<void> {
-  const terminalId = await requireCurrentBridgeTerminal();
-  const command = `node ${JSON.stringify(`${bootstrap.pluginRoot}/bridge/index.mjs`)}`;
-  await hostCall("terminal.sendText", { terminalId, text: command, enter: true });
-  closeModal();
-  toast("브리지 시작 명령을 보냈습니다. 1초 뒤 저장해 보십시오.");
+/** 저장 CLI 한 줄을 보낸다. 상주 프로세스가 아니라 호출당 한 번 돌고 끝난다. */
+async function runStoreCommand(command: "save" | "dispatch" | "source" | "refresh", payload?: unknown): Promise<void> {
+  const terminalId = await resolveSaveTerminal();
+  const script = `${bootstrap.pluginRoot}/scripts/graph-store.mjs`;
+  const encoded = payload === undefined ? "" : ` ${await encodePayload(payload)}`;
+  await sendTerminalLine(terminalId, `node ${JSON.stringify(script)} ${command}${encoded}`);
 }
-
-async function requestBridge<T>(payload: unknown): Promise<T> {
-  if (!responseBridgeApi) throw new Error("브리지 응답 연결이 준비되지 않았습니다.");
-  const response = await fetch(responseBridgeApi, {
-    method: "POST",
-    headers: { "content-type": "text/plain;charset=UTF-8" },
-    body: JSON.stringify(payload),
-  });
-  const result = await response.json() as BridgeEnvelope<T>;
-  if (!response.ok || !result.ok) throw new Error(result.error ?? `브리지 요청 실패 (${response.status})`);
-  return result.value as T;
-}
-
-async function sendBridge<T = unknown>(payload: unknown): Promise<T | undefined> {
-  if (responseBridgeApi) {
-    try {
-      return await requestBridge<T>(payload);
-    } catch (error) {
-      if (isWideMode || !store.bridgeTerminalId) throw error;
-      // A restarted bridge has a new loopback port/token. Fall through once to
-      // the terminal channel; the bootstrap reload below discovers the new API.
-    }
-  }
-  if (!store.bridgeTerminalId) throw new Error("먼저 브리지 터미널을 선택하십시오.");
-  const terminalId = await requireCurrentBridgeTerminal();
-  const frames = encodeBridgeFrames(payload);
-  if (frames.length > 128) throw new Error("Graph·Domain·Milestone·Task·Todo 데이터가 현재 패널 전송 한도를 넘었습니다. Graph 또는 업무 목록을 나누어 주십시오.");
-  for (const frame of frames) {
-    // Some Orca terminal backends expose a line-buffered PTY even though the
-    // bridge requests raw mode. Enter commits the frame in both modes; the
-    // bridge strips the trailing control character before parsing it.
-    await hostCall("terminal.sendText", { terminalId, text: frame, enter: true });
-  }
-  try { window.sessionStorage.setItem(pendingBridgeSyncKey, new Date().toISOString()); } catch { /* optional WebView storage */ }
-  window.setTimeout(() => {
-    if (!window.closed) window.location.reload();
-  }, 750);
-  return undefined;
-}
-
-let executionPollTimer: number | undefined;
-let executionPollPending = false;
 
 function elementFromMarkup(markup: string): HTMLElement | null {
   const template = document.createElement("template");
@@ -4129,36 +3980,13 @@ function morphElement(current: Element, fresh: Element): void {
   }
 }
 
-function patchExecutionBanner(container: ParentNode, execution: RuntimeExecution | undefined): void {
-  const current = container.querySelector<HTMLElement>(":scope > .execution-banner");
-  if (!execution) {
-    current?.remove();
-    return;
-  }
-  const fresh = elementFromMarkup(executionBanner(execution));
-  if (!fresh) return;
-  if (!current) {
-    (container as HTMLElement).insertAdjacentElement("afterbegin", fresh);
-    return;
-  }
-  current.className = fresh.className;
-  const currentSummary = current.querySelector<HTMLElement>(":scope > div:first-child");
-  const freshSummary = fresh.querySelector<HTMLElement>(":scope > div:first-child");
-  if (currentSummary && freshSummary) currentSummary.innerHTML = freshSummary.innerHTML;
-  const currentProgress = current.querySelector<HTMLElement>(".execution-progress > span");
-  const freshProgress = fresh.querySelector<HTMLElement>(".execution-progress > span");
-  if (currentProgress && freshProgress) currentProgress.style.width = freshProgress.style.width;
-}
-
 function patchCanvasExecution(graph: GraphDefinition): void {
   const canvas = app.querySelector<HTMLElement>("[data-canvas]");
   if (!canvas) return;
-  const execution = latestExecution("graph", graph.id);
-  patchExecutionBanner(canvas, execution);
   for (const node of graph.nodes) {
     const element = canvas.querySelector<HTMLElement>(`.node[data-node-id="${selectorEscape(node.id)}"]`);
     if (!element) continue;
-    const status = visualNodeStatus(graph, node, execution);
+    const status = visualNodeStatus(graph, node);
     for (const name of [...element.classList]) {
       if (name.startsWith("execution-") || name.startsWith("status-")) element.classList.remove(name);
     }
@@ -4169,7 +3997,7 @@ function patchCanvasExecution(graph: GraphDefinition): void {
     const freshChip = elementFromMarkup(nodeExecutionChipMarkup(status));
     if (chip && freshChip) chip.replaceWith(freshChip);
     element.querySelector(".node-run-meta")?.remove();
-    const meta = elementFromMarkup(nodeRunMetaMarkup(graph, node, status, execution));
+    const meta = elementFromMarkup(nodeRunMetaMarkup(graph, node, status));
     if (meta) element.append(meta);
     const title = nodeDisplayTitle(node);
     const editorLabel = node.kind === "condition" ? "조건 편집" : node.kind === "graph_call" ? "그래프 호출 편집" : "Task 편집";
@@ -4186,17 +4014,9 @@ function patchCanvasExecution(graph: GraphDefinition): void {
   const failed = graph.nodes.filter((node) => node.status === "failed").length;
   const hud = canvas.querySelector<HTMLElement>(".progress-hud");
   if (hud) hud.innerHTML = `<strong>${progress.percent}%</strong><span>${progress.complete}/${progress.total} 완료${failed ? ` · ${failed} 실패` : ""}</span><i><b style="width:${progress.percent}%"></b></i>`;
-  const runButton = app.querySelector<HTMLButtonElement>(".topbar-run");
-  if (runButton) {
-    runButton.disabled = Boolean(execution && executionActive(execution));
-    runButton.textContent = execution && executionActive(execution) ? "● 실행 중" : "▶ 실행";
-  }
 }
 
 function patchExecutionSurfaces(): void {
-  const running = executions.filter(executionActive).length;
-  const navButton = app.querySelector<HTMLButtonElement>('.section-tabs [data-action="set-view"][data-id="executions"]');
-  if (navButton) navButton.innerHTML = `실행 현황${running ? ` <span class="nav-count">${running}</span>` : ""}`;
   if (view.mode === "executions") {
     const manager = app.querySelector<HTMLElement>(".execution-manager");
     const fresh = elementFromMarkup(renderExecutionManager());
@@ -4213,161 +4033,40 @@ function patchExecutionSurfaces(): void {
   }
 }
 
-async function refreshExecutionStatus(notify = false): Promise<void> {
-  if (!responseBridgeApi || executionPollPending) {
-    if (notify && !responseBridgeApi) toast("브리지 응답 연결이 준비되지 않았습니다.");
-    return;
-  }
-  executionPollPending = true;
-  try {
-    const value = await requestBridge<{ executions?: RuntimeExecution[]; store?: GraphStore }>({ type: "execution-status" });
-    const nextExecutions = Array.isArray(value?.executions) ? value.executions : [];
-    const executionChanged = JSON.stringify(nextExecutions) !== JSON.stringify(executions);
-    const nextStore = value?.store && !view.dirty ? normalizeGraphStore(value.store) : undefined;
-    const graphStateChanged = Boolean(nextStore && JSON.stringify(nextStore.graphs) !== JSON.stringify(store.graphs));
-    executions = nextExecutions;
-    if (nextStore) store = nextStore;
-    if ((executionChanged || graphStateChanged) && !view.modal) patchExecutionSurfaces();
-    scheduleExecutionPolling();
-    if (notify) toast("실행 현황을 갱신했습니다.");
-  } catch (error) {
-    if (notify) toast(error instanceof Error ? error.message : String(error));
-    else scheduleExecutionPolling();
-  } finally {
-    executionPollPending = false;
-  }
-}
-
-function scheduleExecutionPolling(): void {
-  if (executionPollTimer !== undefined) window.clearTimeout(executionPollTimer);
-  executionPollTimer = undefined;
-  if (!responseBridgeApi || !executions.some(executionActive)) return;
-  executionPollTimer = window.setTimeout(() => {
-    executionPollTimer = undefined;
-    void refreshExecutionStatus();
-  }, 1_500);
-}
-
-function resumePendingTerminalBridgeSync(): void {
-  let pending = "";
-  try { pending = window.sessionStorage.getItem(pendingBridgeSyncKey) ?? ""; } catch { return; }
-  if (!pending || !responseBridgeApi) return;
-  void requestBridge({ type: "ping" }).then(() => {
-    try { window.sessionStorage.removeItem(pendingBridgeSyncKey); } catch { /* optional WebView storage */ }
-    window.location.reload();
-  }).catch(() => {
-    window.setTimeout(resumePendingTerminalBridgeSync, 1_000);
-  });
-}
-
 function taskHasTargetProject(taskId: string): boolean {
-  if (taskProjectContextState?.taskId === taskId) {
-    return taskProjectContextState.projects.some((project) => project.role === "target" && project.locatorKind === "folder");
-  }
   return Boolean(store.tasks.find((task) => task.id === taskId)?.projects
     ?.some((project) => project.role === "target" && project.locatorKind === "folder"));
 }
 
-async function loadTaskProjectContext(taskId: string): Promise<TaskProjectContext | null> {
-  if (dataSource.config.mode !== "structured") return null;
-  taskProjectContextLoading = true;
-  taskProjectContextError = "";
-  if (view.selectedTaskId === taskId || view.modal?.kind === "task-run") render();
-  try {
-    const result = await sendBridge<TaskProjectContext>({
-      type: "task-project-context", taskId, workspaceHint: store.bridgeWorkspace ?? "",
-    });
-    if (!result) return null;
-    taskProjectContextState = result;
-    currentOrcaProjectState = result.current;
-    taskProjectPickerEnvironment = result.environment;
-    taskProjectPickerQuery = "";
-    selectedTaskProjectBundles.clear();
-    const connected = new Set(result.projects.map((project) => project.locator));
-    const unconnectedRecommendations = result.recommended.filter((project) => !connected.has(project.path));
-    const hasTargetProject = result.projects.some((project) => project.role === "target" && project.locatorKind === "folder");
-    const recommended = !hasTargetProject && unconnectedRecommendations.length === 1
-      ? unconnectedRecommendations[0]
-      : undefined;
-    if (recommended) {
-      const choice = pickerRegistryProjects(result, result.environment).find((project) => project.path === recommended.path);
-      if (choice) selectedTaskProjectBundles.set(
-        choice.sourcePath,
-        preferredRegistryBranch({ ...choice, worktrees: choice.sourceWorktrees }),
-      );
-    }
-    const task = store.tasks.find((item) => item.id === taskId);
-    if (task) {
-      task.version = result.taskVersion;
-      task.projects = result.projects;
-    }
-    return result;
-  } catch (error) {
-    taskProjectContextError = error instanceof Error ? error.message : String(error);
-    return null;
-  } finally {
-    taskProjectContextLoading = false;
-    if (view.selectedTaskId === taskId || view.modal?.kind === "task-run") render();
-  }
+/** Task에 대상 프로젝트를 붙인다. 다른 편집과 같은 저장 경로를 탄다. */
+function addTaskProject(taskId: string, locator: string): void {
+  const task = store.tasks.find((item) => item.id === taskId);
+  if (!task || !locator) return;
+  const projects = task.projects ?? [];
+  if (projects.some((project) => project.locator === locator)) return;
+  const project = targets.projects.find((item) => item.path === locator);
+  task.projects = [...projects, {
+    role: "target",
+    locatorKind: "folder",
+    locator,
+    ...(project?.name ? { label: project.name } : {}),
+    ...(project?.branch ? { branch: shortBranch(project.branch) } : {}),
+    position: projects.length,
+  }];
+  task.updatedAt = new Date().toISOString();
+  view.dirty = true;
+  render();
 }
 
-async function updateTaskProjectBranch(taskId: string, projectId: string, locator: string, branch: string): Promise<void> {
-  try {
-    const result = await sendBridge<{ context: TaskProjectContext; store?: GraphStore }>({
-      type: "set-task-project-branch", taskId, projectId, locator, branch,
-    });
-    if (result?.store) store = normalizeGraphStore(result.store);
-    if (result?.context) taskProjectContextState = result.context;
-    const task = store.tasks.find((item) => item.id === taskId);
-    if (task && result?.context) task.projects = result.context.projects;
-    render();
-    toast(branch.trim() ? `작업 브랜치를 ${shortBranch(branch)}로 저장했습니다.` : "Task 작업 브랜치를 비웠습니다.");
-  } catch (error) {
-    toast(error instanceof Error ? error.message : String(error));
-    await loadTaskProjectContext(taskId);
-  }
-}
-
-async function connectSelectedTaskProjects(taskId: string): Promise<void> {
-  const context = taskProjectContextState?.taskId === taskId ? taskProjectContextState : null;
-  if (!context) { toast("Task 프로젝트 정본을 먼저 다시 확인하십시오."); return; }
-  const environment = taskProjectPickerEnvironment || context.environment;
-  const choices = pickerRegistryProjects(context, environment);
-  const selected = choices.filter((project) => selectedTaskProjectBundles.has(project.sourcePath));
-  if (!selected.length) { toast("연결할 Orca 프로젝트를 하나 이상 선택하십시오."); return; }
-  try {
-    const result = await sendBridge<{ context: TaskProjectContext; store?: GraphStore; provisioned?: number }>({
-      type: "connect-task-project-bundles",
-      taskId,
-      environment,
-      selections: selected.map((project) => ({
-        sourcePath: project.sourcePath,
-        targetPath: project.availableOnEnvironment ? project.path : undefined,
-        label: project.name,
-        branch: selectedTaskProjectBundles.get(project.sourcePath) ?? "",
-      })),
-    });
-    if (!result) return;
-    if (result.store) store = normalizeGraphStore(result.store);
-    taskProjectContextState = result.context;
-    const task = store.tasks.find((item) => item.id === taskId);
-    if (task) task.projects = result.context.projects;
-    selectedTaskProjectBundles.clear();
-    render();
-    toast(`Task 대상 프로젝트 ${selected.length}개를 연결했습니다.${result.provisioned ? ` · ${result.provisioned}개 장치 준비 완료` : ""}`);
-  } catch (error) {
-    await loadTaskProjectContext(taskId);
-    toast(error instanceof Error ? error.message : String(error));
-  }
-}
-
-async function loadCurrentOrcaProject(): Promise<void> {
-  try {
-    const result = await sendBridge<TaskProjectContext["current"]>({ type: "current-orca-project" });
-    if (result) currentOrcaProjectState = result;
-  } catch (error) {
-    toast(error instanceof Error ? error.message : String(error));
-  }
+function removeTaskProject(taskId: string, locator: string): void {
+  const task = store.tasks.find((item) => item.id === taskId);
+  if (!task?.projects) return;
+  task.projects = task.projects
+    .filter((project) => project.locator !== locator)
+    .map((project, position) => ({ ...project, position }));
+  task.updatedAt = new Date().toISOString();
+  view.dirty = true;
+  render();
 }
 
 function todoTaskCreationIdempotencyKey(todo: LocalTodo): string {
@@ -4387,7 +4086,6 @@ function openTaskDetail(taskId: string): void {
   clearGraphSelection();
   view.inspectorOpen = false;
   render();
-  if (dataSource.config.mode === "structured") void loadTaskProjectContext(taskId);
 }
 
 async function createTaskForTodo(todoId: string): Promise<void> {
@@ -4404,17 +4102,6 @@ async function createTaskForTodo(todoId: string): Promise<void> {
   busyTodoActions.add(todo.id);
   render();
   try {
-    if (dataSource.config.mode === "structured") {
-      const idempotencyKey = todoTaskCreationIdempotencyKey(todo);
-      const prepared = await sendBridge<{ taskId: string; store?: GraphStore }>({
-        type: "create-todo-task", todoId: todo.id, idempotencyKey,
-      });
-      if (!prepared) return;
-      if (prepared.store) store = normalizeGraphStore(prepared.store);
-      openTaskDetail(prepared.taskId);
-      toast("Task를 생성하고 ToDo에 연결했습니다.");
-      return;
-    }
     const { task, created } = createLocalTaskFromTodo(todo);
     openTaskDetail(task.id);
     if (created) void saveStore(false).catch((error) => toast(error instanceof Error ? error.message : String(error)));
@@ -4442,20 +4129,6 @@ async function chooseTodoWorktreeGraph(todoId: string): Promise<void> {
     let graphs: TodoGraphChoice[] = [...new Map(taskGraphLinks(taskId).map(({ graph }) => [graph.id, {
       id: graph.id, name: graph.name, status: graph.status,
     }])).values()];
-    if (dataSource.config.mode === "structured") {
-      const result = await sendBridge<{ taskId: string | null; taskTitle: string | null; graphs: TodoGraphChoice[]; store?: GraphStore }>({
-        type: "todo-graph-choices", todoId: todo.id,
-      });
-      if (!result) return;
-      if (result.store) store = normalizeGraphStore(result.store);
-      if (!result.taskId) {
-        toast("먼저 Task를 생성하십시오.");
-        return;
-      }
-      taskId = result.taskId;
-      taskTitle = result.taskTitle ?? taskId;
-      graphs = result.graphs;
-    }
     if (!graphs.length) {
       toast("연결된 Task가 포함된 워크트리 Graph가 없습니다. Task를 Graph에 먼저 추가하십시오.");
       return;
@@ -4469,19 +4142,232 @@ async function chooseTodoWorktreeGraph(todoId: string): Promise<void> {
   }
 }
 
-async function saveStore(showNotice = true, rebuildPanel = true): Promise<void> {
-  const result = await sendBridge<{ mode?: string; graph?: GraphDefinition; store?: GraphStore; warnings?: string[] }>({ type: "save", store, rebuildPanel });
-  if (result?.store) store = normalizeGraphStore(result.store);
-  else if (dataSource.config.mode === "structured") activeGraph().version += 1;
+/* ── 실행 (세션으로 내보내기) ────────────────────────────────────────────────
+ *
+ * 패널이 하는 일은 프롬프트를 만들어 대상 세션에 넣는 것까지다. 그래프를 어떤
+ * 순서로 도는지는 세션의 에이전트가 진행한다 — 플러그인 안에 별도 실행기를 두지
+ * 않는다.
+ *
+ * Orca의 `terminal.sendText`는 활성 워크트리 밖의 터미널을 거부하므로, 다른
+ * 프로젝트로 보내는 것은 공개 `orca` CLI를 통해 수행한다.
+ */
+
+type DispatchRequestTarget = {
+  label: string;
+  environmentId?: string;
+  projectId?: string;
+  projectName?: string;
+  locator?: string;
+  branch?: string;
+  worktreeId?: string;
+  sessionId?: string;
+  sessionTitle?: string;
+  model?: string;
+  reasoning?: string;
+  modelDefinition?: { id: string; agent: string };
+  title?: string;
+};
+
+function taskProjectLines(task: LocalTask | undefined): string[] {
+  const projects = [...(task?.projects ?? [])].sort((left, right) => left.position - right.position);
+  if (!projects.length) return [];
+  return ["", "대상 프로젝트:", ...projects.map((project) =>
+    `- ${project.role} · ${project.locatorKind}: ${project.locator}${project.branch ? ` · branch ${project.branch}` : ""}`)];
+}
+
+function routingContractLines(routing: RoutingTarget): string[] {
+  return [
+    "",
+    "실행 컨텍스트:",
+    `- environment: ${routing.environmentId || "local"}`,
+    `- project: ${routing.projectId ? projectName(routing.projectId) : "current"}`,
+    `- branch: ${routing.branch || "선택한 워크트리"}`,
+    `- model: ${routing.model || "agent default"}`,
+  ];
+}
+
+function workItemPrompt(itemKind: "task" | "todo", item: LocalTask | LocalTodo, routing: RoutingTarget): string {
+  const body = (item.metaDraft?.trim() || item.draft.trim()
+    || (itemKind === "task" ? (item as LocalTask).prompt : "") || item.title);
+  return [
+    `${itemKind === "task" ? "Task" : "Todo"}: ${item.title} (${item.id})`,
+    "",
+    body,
+    ...taskProjectLines(itemKind === "task" ? item as LocalTask : undefined),
+    ...routingContractLines(routing),
+    "",
+    "이 작업만 수행한 뒤 마지막 응답의 첫 줄을 정확히 `RESULT: done` 또는 `RESULT: failed — <사유>`로 시작하십시오.",
+  ].join("\n");
+}
+
+function graphPrompt(graph: GraphDefinition, routing: RoutingTarget, workInput: string): string {
+  const ordered = graph.nodes.map((node) => {
+    const nodeRouting = effectiveRouting(graph, node);
+    const kind = node.kind === "condition" ? "조건" : node.kind === "graph_call" ? "그래프 호출" : "작업";
+    return `- [${kind}] ${nodeDisplayTitle(node)} (${node.id})${nodeRouting.model ? ` · ${modelName(nodeRouting.model)}` : ""}`;
+  });
+  const edges = graph.edges.map((edge) =>
+    `- ${edge.from} → ${edge.to}${edge.branch ? ` · branch ${edge.branch}` : ""}${edge.kind === "loop" ? " · loop" : ""}`);
+  return [
+    `Graph: ${graph.name} (${graph.id})`,
+    graph.summary ? `개요: ${graph.summary}` : "",
+    "",
+    "이 그래프를 실행하십시오. 노드를 엣지 순서대로 하나씩 처리하고, 각 노드의 결과를 기록한 뒤 다음 ready 노드로 진행합니다.",
+    ...(workInput.trim() ? ["", "이번 실행의 업무 입력:", workInput.trim()] : []),
+    "",
+    `노드 ${graph.nodes.length}개:`,
+    ...ordered,
+    "",
+    `엣지 ${graph.edges.length}개:`,
+    ...edges,
+    ...routingContractLines(routing),
+    "",
+    "각 노드를 마칠 때 진행 상황을 남기고, 마지막 응답의 첫 줄을 정확히 `RESULT: done` 또는 `RESULT: failed — <사유>`로 시작하십시오.",
+  ].filter(Boolean).join("\n");
+}
+
+/** 라우팅 하나를 실제로 보낼 수 있는 대상으로 푼다. */
+function resolveDispatchTarget(routing: RoutingTarget, label: string, locator?: string): DispatchRequestTarget {
+  const environmentId = routeEnvironmentId(routing.environmentId);
+  const session = routing.sessionId
+    ? targets.sessions.find((item) => item.id === routing.sessionId)
+    : undefined;
+  if (session) {
+    return {
+      label,
+      environmentId,
+      ...(session.projectId ? { projectId: session.projectId, projectName: projectName(session.projectId) } : {}),
+      ...(locator ? { locator } : {}),
+      ...(session.branch ? { branch: shortBranch(session.branch) } : {}),
+      sessionId: session.id,
+      sessionTitle: session.title,
+      ...(routing.model ? { model: routing.model } : {}),
+    };
+  }
+  const project = routing.projectId ? targets.projects.find((item) => item.id === routing.projectId) : undefined;
+  const branch = routing.branch ? shortBranch(routing.branch) : project?.branch ? shortBranch(project.branch) : "";
+  const worktree = branch
+    ? targets.branches?.find((item) => item.projectId === project?.id && shortBranch(item.branch) === branch)
+    : undefined;
+  const worktreeId = worktree?.worktreeId ?? project?.worktreeId;
+  const model = routing.model ? targets.models.find((item) => item.id === routing.model) : undefined;
+  return {
+    label,
+    environmentId,
+    ...(project ? { projectId: project.id, projectName: project.name } : {}),
+    ...(locator ? { locator } : {}),
+    ...(branch ? { branch } : {}),
+    ...(worktreeId ? { worktreeId } : {}),
+    ...(routing.model ? { model: routing.model } : {}),
+    ...(routing.reasoning ? { reasoning: routing.reasoning } : {}),
+    ...(model ? { modelDefinition: { id: model.id, agent: model.agent } } : {}),
+    title: `GE · ${label}`.slice(0, 60),
+  };
+}
+
+function assertDispatchable(requestTargets: DispatchRequestTarget[]): void {
+  if (!requestTargets.length) throw new Error("보낼 대상을 하나 이상 선택하십시오.");
+  const unroutable = requestTargets.filter((target) => !target.sessionId && !target.worktreeId);
+  if (unroutable.length) {
+    throw new Error(`${unroutable.map((target) => target.label).join(", ")}에 사용할 Orca 워크트리를 찾지 못했습니다. 도구 모음의 'Orca 대상 갱신'을 실행한 뒤 다시 시도하십시오.`);
+  }
+  const missingModel = requestTargets.filter((target) => !target.sessionId && !target.modelDefinition);
+  if (missingModel.length) {
+    throw new Error(`${missingModel.map((target) => target.label).join(", ")}에 새 세션을 만들 모델을 선택하십시오.`);
+  }
+}
+
+/**
+ * 대상 세션으로 작업을 내보낸다.
+ *
+ * 응답 채널이 없으므로 전달 기록은 명령을 보낸 시점에 낙관적으로 남긴다. 실제
+ * 세션 생성 결과는 CLI가 같은 기록을 덮어써 다음에 패널을 열 때 정확해진다.
+ */
+async function dispatchWork(
+  itemKind: ExecutionItemKind,
+  itemId: string,
+  title: string,
+  prompt: string,
+  requestTargets: DispatchRequestTarget[],
+  executionMode: ExecutionMode,
+): Promise<void> {
+  assertDispatchable(requestTargets);
+  await runStoreCommand("dispatch", { itemKind, itemId, title, prompt, executionMode, targets: requestTargets });
+  const record: DispatchRecord = {
+    id: `dispatch-${itemKind}-${itemId}-${Date.now().toString(36)}`,
+    itemKind,
+    itemId,
+    title,
+    dispatchedAt: new Date().toISOString(),
+    executionMode,
+    targets: requestTargets.map((target) => ({
+      label: target.label,
+      ...(target.environmentId ? { environmentId: target.environmentId } : {}),
+      ...(target.projectId ? { projectId: target.projectId } : {}),
+      ...(target.projectName ? { projectName: target.projectName } : {}),
+      ...(target.locator ? { locator: target.locator } : {}),
+      ...(target.branch ? { branch: target.branch } : {}),
+      ...(target.sessionId ? { sessionId: target.sessionId } : {}),
+      ...(target.sessionTitle ? { sessionTitle: target.sessionTitle } : {}),
+      ...(target.model ? { model: target.model } : {}),
+      opened: target.sessionId ? "existing-session" : "new-session",
+    })),
+  };
+  store.dispatchLog = [record, ...store.dispatchLog].slice(0, DISPATCH_LOG_LIMIT);
+}
+
+/* ── 변경분 추적 ──────────────────────────────────────────────────────────────
+ *
+ * 저장은 store 전체가 아니라 바뀐 항목만 보낸다. 전체를 보내면 실제 데이터에서
+ * 130KB, 압축해도 터미널 한 줄에 담기지 않는다. 항목 단위로 보내면 대부분의
+ * 저장이 한 줄이면 끝나고, 구조화 원천의 항목별 CAS 계약과도 그대로 맞는다.
+ */
+
+type ChangeSet = {
+  graphs?: GraphDefinition[];
+  domains?: LocalDomain[];
+  milestones?: LocalMilestone[];
+  tasks?: LocalTask[];
+  todos?: LocalTodo[];
+  activeGraphId?: string;
+};
+
+function collectChanges(): ChangeSet {
+  const changes: ChangeSet = {};
+  for (const collection of CHANGE_COLLECTIONS) {
+    const changed = store[collection].filter((item) =>
+      savedBaseline.get(baselineKey(collection, item.id)) !== JSON.stringify(item));
+    if (changed.length) (changes[collection] as typeof changed) = structuredClone(changed);
+  }
+  if (store.activeGraphId) changes.activeGraphId = store.activeGraphId;
+  return changes;
+}
+
+function changedItemCount(changes: ChangeSet): number {
+  return CHANGE_COLLECTIONS.reduce((total, collection) => total + (changes[collection]?.length ?? 0), 0);
+}
+
+async function saveStore(showNotice = true, _unused = true): Promise<void> {
+  const changes = collectChanges();
+  const count = changedItemCount(changes);
+  if (!count) {
+    view.dirty = false;
+    if (showNotice) toast("저장할 변경이 없습니다.");
+    return;
+  }
+  await runStoreCommand("save", changes);
+  // 응답 채널이 없으므로 지금 보낸 것을 새 기준으로 삼는다. 저장이 실패하면
+  // 터미널에 사유가 남고, 다음에 패널을 열 때 원천 값으로 되돌아온다.
+  resetBaseline();
   view.dirty = false;
-  // 원천이 노드 실행 계약을 버렸다면 조용히 넘어가면 안 된다. 저장은 됐지만
-  // 그 노드의 안전 가드는 실행 시 검사할 데이터가 없는 상태가 된다.
-  for (const warning of result?.warnings ?? []) toast(warning);
   if (showNotice) {
-    const destination = dataSource.config.mode === "structured" ? "구조화 원천" : dataSource.config.mode === "folder" ? "폴더 원천" : "로컬 브리지";
-    const subject = dataSource.config.mode === "structured" ? "그래프를" : "Graph·Domain·Milestone·Task·Todo를";
-    await hostCall("notifications.show", { title: "Graph Engineering", body: `${subject} ${destination}에 저장했습니다.` }).catch(() => undefined);
-    toast(`${destination} 저장 요청을 보냈습니다.`);
+    const destination = dataSource.config.mode === "structured" ? "구조화 원천"
+      : dataSource.config.mode === "folder" ? "폴더 원천" : "로컬 저장소";
+    await hostCall("notifications.show", {
+      title: "Graph Engineering",
+      body: `${count}개 항목을 ${destination}에 저장했습니다.`,
+    }).catch(() => undefined);
+    toast(`${destination}에 ${count}개 항목 저장을 요청했습니다.`);
   }
 }
 
@@ -4521,36 +4407,20 @@ function sourceRelatedVersions(kind: SourceWorkKind, item: LocalDomain | LocalMi
   return {};
 }
 
+/**
+ * 항목 하나가 바뀌었음을 표시한다.
+ *
+ * 예전에는 원천에 즉시 CAS mutation을 보냈지만, 이제는 저장 버튼 한 번에 바뀐
+ * 항목만 모아 보낸다. 구조화 원천의 항목별 CAS는 저장 CLI가 그대로 수행한다.
+ */
 function persistStructuredItem(
-  kind: SourceWorkKind,
-  item: LocalDomain | LocalMilestone | LocalTask | LocalTodo,
-  expectedVersion: number,
-  notice = "원천에 변경을 저장했습니다.",
+  _kind: SourceWorkKind,
+  _item: LocalDomain | LocalMilestone | LocalTask | LocalTodo,
+  _expectedVersion: number,
+  _notice = "",
 ): void {
-  if (dataSource.config.mode !== "structured") return;
-  const mutation = {
-    kind,
-    expectedVersion,
-    relatedVersions: sourceRelatedVersions(kind, item),
-    item: structuredClone(item),
-  };
-  view.dirty = false;
-  void sendBridge<Partial<DataSourceState> & { store?: GraphStore }>({
-    type: "mutate-source", mutation, graphId: store.activeGraphId,
-  }).then((result) => {
-    if (result?.store) store = normalizeGraphStore(result.store);
-    if (result) dataSource = { ...dataSource, ...result, config: dataSource.config, catalog: result.catalog ?? dataSource.catalog };
-    render();
-    toast(isWideMode ? notice : "원천 저장 요청을 보냈습니다.");
-  }).catch((error) => {
-    toast(error instanceof Error ? error.message : String(error));
-    void sendBridge<Partial<DataSourceState> & { store?: GraphStore }>({ type: "refresh-source", graphId: store.activeGraphId })
-      .then((result) => {
-        if (result?.store) store = normalizeGraphStore(result.store);
-        if (result) dataSource = { ...dataSource, ...result, config: dataSource.config, catalog: result.catalog ?? [] };
-        render();
-      }).catch(() => undefined);
-  });
+  view.dirty = true;
+  render();
 }
 
 function sourceConfigFromForm(): DataSourceConfig {
@@ -4573,13 +4443,11 @@ function refreshSource(): void {
   view.sourceRefreshing = true;
   if (view.modal?.kind === "data-source") delete view.modal.error;
   render();
-  void sendBridge<Partial<DataSourceState> & { store?: GraphStore }>({ type: "refresh-source", graphId: store.activeGraphId })
-    .then((result) => {
-      dataSource = { ...dataSource, ...result, config: dataSource.config, catalog: result?.catalog ?? [] };
-      if (result?.store) store = normalizeGraphStore(result.store);
+  void runStoreCommand("refresh")
+    .then(() => {
       view.sourceRefreshing = false;
       render();
-      toast("데이터 원천을 새로고침했습니다.");
+      toast("데이터를 다시 읽는 명령을 보냈습니다. 패널을 다시 열면 반영됩니다.");
     })
     .catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
@@ -4679,13 +4547,6 @@ app.addEventListener("click", (event) => {
     case "set-view": {
       const mode = target.dataset.id as ViewState["mode"] | undefined;
       if (!mode || !["canvas", "list", "executions", "domains", "milestones", "tasks", "todos"].includes(mode)) return;
-      if (mode === "executions" && hasSandboxedLoopbackBridge) {
-        toast("실시간 실행 현황을 Orca 탭에서 엽니다.");
-        void sendBridge({ type: "open-wide", view: "executions" }).catch((error) => {
-          toast(error instanceof Error ? error.message : String(error));
-        });
-        return;
-      }
       const enteringTasks = mode === "tasks" && view.mode !== "tasks";
       view.mode = mode;
       if (enteringTasks) view.taskDetailOpen = false;
@@ -4695,11 +4556,12 @@ app.addEventListener("click", (event) => {
       }
       render();
       if (mode === "canvas") window.setTimeout(fitGraph, 0);
-      if (mode === "executions") void refreshExecutionStatus();
       break;
     }
-    case "refresh-executions":
-      void refreshExecutionStatus(true);
+    case "refresh-data":
+      void runStoreCommand("refresh")
+        .then(() => toast("데이터를 다시 읽는 명령을 보냈습니다. 패널을 다시 열면 반영됩니다."))
+        .catch((error) => toast(error instanceof Error ? error.message : String(error)));
       break;
     case "open-execution-item": {
       const kind = target.dataset.kind;
@@ -4889,11 +4751,17 @@ app.addEventListener("click", (event) => {
       view.selectedTaskId = target.dataset.id ?? null;
       view.taskDetailOpen = Boolean(view.selectedTaskId);
       render();
-      if (view.selectedTaskId && dataSource.config.mode === "structured") void loadTaskProjectContext(view.selectedTaskId);
       break;
-    case "reload-task-projects": {
+    case "add-task-project": {
       const taskId = target.dataset.id;
-      if (taskId) void loadTaskProjectContext(taskId);
+      const locator = (target as HTMLSelectElement).value;
+      if (taskId && locator) addTaskProject(taskId, locator);
+      break;
+    }
+    case "remove-task-project": {
+      const taskId = target.dataset.id;
+      const locator = target.dataset.locator;
+      if (taskId && locator) removeTaskProject(taskId, locator);
       break;
     }
     case "open-quick-graph": {
@@ -4960,50 +4828,10 @@ app.addEventListener("click", (event) => {
         render();
         return;
       }
-      modal.busy = true;
-      delete modal.error;
-      render();
-      void sendBridge<{ graphId: string; store?: GraphStore }>({
-        type: "create-quick-graph",
-        sourceTaskId: source.id,
-        expectedTaskVersion,
-        name: modal.name.trim(),
-        taskIds: [...modal.selectedIds],
-      }).then((result) => {
-        if (!result) return;
-        if (result.store) store = normalizeGraphStore(result.store);
-        if (result.graphId && store.graphs.some((graph) => graph.id === result.graphId)) store.activeGraphId = result.graphId;
-        view.mode = "canvas";
-        view.graphTrail = [];
-        clearGraphSelection();
-        closeModal();
-        toast(`Task ${modal.selectedIds.length}개를 순서대로 연결한 그래프를 원천에 만들었습니다.`);
-        window.setTimeout(fitGraph, 0);
-      }).catch((error) => {
-        if (view.modal?.kind !== "quick-graph") return;
-        view.modal.busy = false;
-        view.modal.error = error instanceof Error ? error.message : String(error);
-        render();
-      });
-      break;
-    }
-    case "toggle-task-project": {
-      const sourcePath = target.dataset.sourcePath;
-      const context = taskProjectContextState;
-      if (!sourcePath || !context) return;
-      if (selectedTaskProjectBundles.has(sourcePath)) selectedTaskProjectBundles.delete(sourcePath);
-      else {
-        const project = pickerRegistryProjects(context, taskProjectPickerEnvironment || context.environment)
-          .find((item) => item.sourcePath === sourcePath);
-        if (!project) return;
-        selectedTaskProjectBundles.set(sourcePath, preferredRegistryBranch({ ...project, worktrees: project.sourceWorktrees }));
-      }
-      render();
-      break;
-    }
-    case "connect-task-projects": {
-      const taskId = target.dataset.id;
-      if (taskId) void connectSelectedTaskProjects(taskId);
+      createQuickGraphLocally(source, modal.name.trim(), [...modal.selectedIds]);
+      closeModal();
+      toast(`Task ${modal.selectedIds.length}개를 순서대로 연결한 그래프를 만들었습니다. 저장하면 원천에 반영됩니다.`);
+      window.setTimeout(fitGraph, 0);
       break;
     }
     case "back-to-task-list":
@@ -5015,35 +4843,6 @@ app.addEventListener("click", (event) => {
       view.selectedTodoId = target.dataset.id ?? null;
       render();
       break;
-    case "request-meta-prompt": {
-      const kind = target.dataset.kind as "task" | "todo" | undefined;
-      const item = kind === "task"
-        ? store.tasks.find((candidate) => candidate.id === target.dataset.id)
-        : kind === "todo" ? store.todos.find((candidate) => candidate.id === target.dataset.id) : undefined;
-      if (!kind || !item || !localWorkMutable()) return;
-      const revision = currentDraftRevision(item);
-      if (!revision || !item.draft.trim()) { toast("사람 Draft를 먼저 작성하십시오."); return; }
-      if (!store.bridgeTerminalId) { toast("먼저 브리지 터미널을 연결하십시오."); return; }
-      item.metaPromptRun = { status: "running", requestedAt: new Date().toISOString(), draftRevisionId: revision.id };
-      touchWorkItem(item);
-      render();
-      const prepare = dataSource.config.mode === "structured" ? Promise.resolve() : saveStore(false);
-      void prepare
-        .then(() => sendBridge<Partial<DataSourceState> & { store?: GraphStore }>({ type: "meta-prompt", itemKind: kind, itemId: item.id, draftRevisionId: revision.id }))
-        .then((result) => {
-          if (result?.store) store = normalizeGraphStore(result.store);
-          if (result) dataSource = { ...dataSource, ...result, config: dataSource.config, catalog: result.catalog ?? dataSource.catalog };
-          render();
-          toast(isWideMode ? "Meta Prompt를 생성했습니다." : "Meta Prompt 생성을 요청했습니다. 완료되면 패널을 새로고침하십시오.");
-        })
-        .catch((error) => {
-          item.metaPromptRun = { ...item.metaPromptRun!, status: "failed", completedAt: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) };
-          touchWorkItem(item);
-          render();
-          toast(error instanceof Error ? error.message : String(error));
-        });
-      break;
-    }
     case "add-local-task-node": {
       const task = store.tasks.find((item) => item.id === target.dataset.id);
       if (task) addLocalTaskNode(task);
@@ -5183,19 +4982,7 @@ app.addEventListener("click", (event) => {
       break;
     case "toggle-process": {
       const enabled = (target as HTMLInputElement).checked;
-      if (dataSource.config.mode === "structured") {
-        const expectedVersion = graph.version;
-        void sendBridge<{ store?: GraphStore }>({
-          type: "set-graph-process", graphId: graph.id, expectedVersion, enabled,
-        }).then((result) => {
-          if (result?.store) store = normalizeGraphStore(result.store);
-          render();
-          toast(enabled ? "업무프로세스로 지정했습니다." : "단발성 그래프로 변경했습니다.");
-        }).catch((error) => {
-          render();
-          toast(error instanceof Error ? error.message : String(error));
-        });
-      } else {
+      {
         const before = graphSnapshot(graph);
         graph.processEnabled = enabled;
         touch(graph);
@@ -5397,12 +5184,11 @@ app.addEventListener("click", (event) => {
     case "save-source": {
       try {
         const config = sourceConfigFromForm();
-        void sendBridge<Partial<DataSourceState> & { store?: GraphStore }>({ type: "configure-source", config, store })
-          .then((result) => {
-            dataSource = { ...dataSource, ...result, config, catalog: result?.catalog ?? dataSource.catalog };
-            if (result?.store) store = normalizeGraphStore(result.store);
+        void runStoreCommand("source", config)
+          .then(() => {
+            dataSource = { ...dataSource, config };
             closeModal();
-            toast("데이터 원천 설정을 저장했습니다. 사이드 패널은 새로고침 후 최신 snapshot을 표시합니다.");
+            toast("데이터 원천 설정 명령을 보냈습니다. 패널을 다시 열면 최신 snapshot을 표시합니다.");
           })
           .catch((error) => {
             if (view.modal?.kind === "data-source") view.modal.error = error instanceof Error ? error.message : String(error);
@@ -5487,32 +5273,17 @@ app.addEventListener("click", (event) => {
       resetGraphRunState(graph);
       touch(graph); recordGraphHistory(before, "실행 상태 리셋", graph); render(); break;
     }
-    case "cancel-execution": {
-      const executionId = target.dataset.id;
-      if (!executionId) return;
-      // 이미 보낸 에이전트 턴은 되돌릴 수 없다. 무엇이 멈추고 무엇이 안 멈추는지
-      // 먼저 알려 준 뒤 요청한다.
-      if (!window.confirm("진행 중인 노드가 끝나면 실행을 중단합니다.\n이미 에이전트에게 보낸 작업은 그대로 진행됩니다. 계속할까요?")) return;
-      void sendBridge<{ message?: string }>({ type: "cancel-execution", executionId })
-        .then((result) => {
-          void refreshExecutionStatus();
-          toast(result?.message ?? "실행 중단을 요청했습니다.");
-        })
-        .catch((error) => toast(error instanceof Error ? error.message : String(error)));
-      break;
-    }
     case "reset-graph-history": {
-      // 구조는 건드리지 않는다. 원천이 상태를 소유하면 그쪽 reset 계약을 쓰고,
-      // 로컬 원천이면 브리지가 같은 의미로 되돌린다. run 이력 자체는 보존된다.
+      // 구조는 건드리지 않는다. 노드 상태만 되돌리고 run 이력 자체는 보존한다.
+      // 저장하면 원천에도 같은 의미로 반영된다.
       if (!window.confirm(`${graph.name}의 실행 이력을 초기화합니다.\n노드와 연결은 그대로 두고 실행 상태만 되돌립니다. 계속할까요?`)) return;
-      void sendBridge<{ store?: GraphStore }>({ type: "reset-graph-run", graphId: graph.id })
-        .then((result) => {
-          if (result?.store) store = normalizeGraphStore(result.store);
-          clearGraphSelection();
-          render();
-          toast("실행 이력을 초기화했습니다.");
-        })
-        .catch((error) => toast(error instanceof Error ? error.message : String(error)));
+      const before = graphSnapshot(graph);
+      resetGraphRunState(graph);
+      touch(graph);
+      recordGraphHistory(before, "실행 이력 초기화", graph);
+      clearGraphSelection();
+      render();
+      toast("실행 상태를 초기화했습니다. 저장하면 데이터 원천에도 반영됩니다.");
       break;
     }
     case "clear-stale-run": {
@@ -5532,32 +5303,19 @@ app.addEventListener("click", (event) => {
     case "zoom-reset": view.zoom = 1; render(); break;
     case "center-selection": centerSelectedNode(); break;
     case "fit": fitGraph(); break;
-    case "open-wide":
-      void saveStore(false)
-        .then(() => sendBridge({ type: "open-wide" }))
-        .then(() => toast("Orca 중앙 탭에서 넓게 보기를 열고 있습니다."))
-        .catch((error) => toast(error instanceof Error ? error.message : String(error)));
-      break;
-    case "connect-bridge": void chooseBridge(); break;
-    case "choose-terminal": {
+    case "choose-save-terminal": {
       const terminalId = target.dataset.id;
       if (!terminalId) return;
-      store.bridgeTerminalId = terminalId;
-      if (view.modal?.kind === "bridge" && view.modal.context) store.bridgeWorkspace = view.modal.context.displayName;
-      view.dirty = true; render(); break;
-    }
-    case "start-bridge": {
-      void startBridge()
-        .catch((error) => toast(error instanceof Error ? error.message : String(error)));
+      store.saveTerminalId = terminalId;
+      closeModal();
+      toast("저장할 터미널을 지정했습니다. 다시 저장하십시오.");
       break;
     }
     case "save": void saveStore().catch((error) => toast(error instanceof Error ? error.message : String(error))); break;
     case "refresh-targets":
-      void sendBridge<OrcaTargets>({ type: "refresh" }).then((result) => {
-        if (result) targets = result;
-        render();
-        toast(isWideMode ? "Orca 환경·프로젝트·세션을 갱신했습니다." : "Orca 대상 갱신을 요청했습니다.");
-      }).catch((error) => toast(error instanceof Error ? error.message : String(error)));
+      void runStoreCommand("refresh")
+        .then(() => toast("Orca 대상 갱신 명령을 보냈습니다. 패널을 다시 열면 반영됩니다."))
+        .catch((error) => toast(error instanceof Error ? error.message : String(error)));
       break;
     case "toggle-run-project": {
       if (view.modal?.kind !== "run" && view.modal?.kind !== "task-run") return;
@@ -5585,12 +5343,7 @@ app.addEventListener("click", (event) => {
     case "open-task-run": {
       const task = store.tasks.find((item) => item.id === target.dataset.id);
       if (!task) return;
-      if (dataSource.config.mode === "structured") {
-        void loadTaskProjectContext(task.id).then(() => {
-          const current = store.tasks.find((item) => item.id === task.id);
-          if (current) openModal(createTaskRunModal(current));
-        });
-      } else openModal(createTaskRunModal(task));
+      openModal(createTaskRunModal(task));
       break;
     }
     case "save-task-run-settings": {
@@ -5599,28 +5352,12 @@ app.addEventListener("click", (event) => {
       if (modal.busy || modal.saving) return;
       const task = store.tasks.find((item) => item.id === modal.itemId);
       if (!task) return;
-      const expectedVersion = Number(task.version ?? 0);
       modal.saving = true;
       delete modal.error;
       delete modal.errorAction;
       applyTaskRunSettings(task, modal);
       render();
-      const persist = dataSource.config.mode === "structured"
-        ? (Number.isInteger(expectedVersion) && expectedVersion > 0
-          ? sendBridge<Partial<DataSourceState> & { store?: GraphStore }>({
-              type: "mutate-source",
-              mutation: {
-                kind: "task", expectedVersion, relatedVersions: sourceRelatedVersions("task", task), item: structuredClone(task),
-              },
-              graphId: store.activeGraphId,
-            })
-          : Promise.reject(new Error("Task의 최신 CAS version을 읽지 못했습니다. Task를 새로고침한 뒤 다시 시도하십시오.")))
-        : saveStore(false, false);
-      void persist.then((result) => {
-        if (result && "store" in result && result.store) store = normalizeGraphStore(result.store);
-        if (result && "catalog" in result) {
-          dataSource = { ...dataSource, ...result, config: dataSource.config, catalog: result.catalog ?? dataSource.catalog };
-        }
+      void saveStore(false).then(() => {
         if (view.modal === modal) closeModal();
         render();
         toast("Task 실행 설정을 저장했습니다.");
@@ -5644,54 +5381,30 @@ app.addEventListener("click", (event) => {
       render();
       const { itemKind, itemId } = modal;
       const routing = routingValue(modal.routing);
-      const task = itemKind === "task" ? store.tasks.find((item) => item.id === itemId) : undefined;
+      const item = itemKind === "task"
+        ? store.tasks.find((candidate) => candidate.id === itemId)
+        : store.todos.find((candidate) => candidate.id === itemId);
+      if (!item) { modal.busy = false; render(); return; }
       const targetProjects = itemKind === "task"
-        ? (taskProjectContextState?.taskId === itemId ? taskProjectContextState.projects : task?.projects ?? [])
+        ? ((item as LocalTask).projects ?? [])
           .filter((project) => project.role === "target" && project.locatorKind === "folder")
           .sort((left, right) => left.position - right.position)
         : [];
       const selectedProjects = selectedRunProjectCandidates(modal, targetProjects);
       const perProject = itemKind === "task" && selectedProjects.length > 1 && modal.executionMode === "per_project";
-      const bundles = selectedProjects.flatMap((project) => {
-        const projectPath = project.saved ? project.locator : project.project.path;
-        if (!projectPath) return [];
-        const projectRouting = modal.projectRoutings[project.locator];
-        return [{
-          path: projectPath,
-          label: project.label,
-          branch: projectRouting?.branch ? shortBranch(projectRouting.branch) : "",
-        }];
-      });
-      const prepare = itemKind === "task" && dataSource.config.mode === "structured" && bundles.length
-        ? sendBridge<{ context: TaskProjectContext; store?: GraphStore }>({
-            type: "link-task-project-bundles", taskId: itemId, bundles,
-          }).then((linked) => {
-            if (linked?.store) store = normalizeGraphStore(linked.store);
-            if (linked?.context) taskProjectContextState = linked.context;
-          })
-        : dataSource.config.mode === "structured" ? Promise.resolve() : saveStore(false, false);
-      void prepare
-        .then(() => sendBridge<RuntimeExecution>({
-          type: itemKind === "task" ? "start-task-execution" : "start-todo-execution",
-          ...(itemKind === "task" ? { taskId: itemId } : { todoId: itemId }),
-          ...(itemKind === "todo"
-            ? { idempotencyKey: todoTaskCreationIdempotencyKey(store.todos.find((item) => item.id === itemId)!) }
-            : {}),
-          routing,
-          ...(!isWideMode ? { openWide: true } : {}),
-          ...(itemKind === "task" ? { executionMode: perProject ? "per_project" : "single_session" } : {}),
-          ...(itemKind === "task" && selectedProjects.length ? { projectSessions: selectedProjects.map((project) => ({
-            locator: project.locator,
-            routing: routingValue(modal.projectRoutings[project.locator]),
-          })) } : {}),
-          dryRun: false,
-        }))
-        .then((result) => {
-          if (result) executions = [result, ...executions.filter((item) => item.id !== result.id)];
+      const requestTargets = perProject
+        ? selectedProjects.map((project) => resolveDispatchTarget(
+            routingValue(modal.projectRoutings[project.locator] ?? modal.routing), project.label, project.locator))
+        : [resolveDispatchTarget(routing, item.title, selectedProjects[0]?.locator)];
+      // 실행 설정은 Task에 남는다. 보내기 전에 같은 저장 경로로 먼저 기록한다.
+      if (itemKind === "task") applyTaskRunSettings(item as LocalTask, modal);
+      void saveStore(false)
+        .then(() => dispatchWork(itemKind, itemId, item.title, workItemPrompt(itemKind, item, routing), requestTargets, perProject ? "per_project" : "single_session"))
+        .then(() => {
           if (view.modal === modal) closeModal();
           view.mode = "executions";
           render();
-          toast(`${itemKind === "task" ? "Task" : "Todo"} 실행을 시작했습니다.`);
+          toast(`${itemKind === "task" ? "Task" : "Todo"}를 ${requestTargets.length}개 세션으로 보냈습니다.`);
         })
         .catch((error) => {
           const message = error instanceof Error ? error.message : String(error);
@@ -5737,41 +5450,25 @@ app.addEventListener("click", (event) => {
       delete modal.error;
       delete modal.errorAction;
       render();
-      const live = modal.live;
       const selectedProjects = selectedRunProjectCandidates(modal, graphProjectTargets(graph));
-      const structuredRun = dataSource.config.mode === "structured";
-      if (!structuredRun) applyRunDraft(graph, modal);
-      const prepare = structuredRun ? Promise.resolve() : saveStore(false, false);
-      void prepare
-        .then(() => sendBridge<RuntimeExecution>({
-          type: live ? "start-graph-execution" : "run", graphId: graph.id, dryRun: !live,
-          ...(graph.processEnabled && modal.startNewRun ? { inputPrompt: modal.inputPrompt } : {}),
-          startNewRun: modal.startNewRun,
-          ...(live ? {
-            ...(!isWideMode ? { openWide: true } : {}),
-            executionMode: modal.executionMode,
-            routing: routingValue(modal.defaults),
-            ...(modal.executionMode === "per_project" ? { projectSessions: selectedProjects.map((project) => ({
-              locator: project.locator,
-              label: project.label,
-              routing: routingValue(modal.projectRoutings[project.locator]),
-            })) } : {}),
-          } : {}),
-        }))
-        .then((result) => {
-          if (live) {
-            if (result) executions = [result, ...executions.filter((item) => item.id !== result.id)];
-            view.mode = "executions";
-            scheduleExecutionPolling();
-            // Always reconcile once from the response channel. The terminal-frame
-            // fallback intentionally has no return value, and a stale bootstrap can
-            // also lack the just-created record. Waiting for an already-active local
-            // record in either case leaves the UI frozen on the previous run.
-            void refreshExecutionStatus();
-          }
+      const perProject = modal.executionMode === "per_project" && selectedProjects.length > 1;
+      const requestTargets = perProject
+        ? selectedProjects.map((project) => resolveDispatchTarget(
+            routingValue(modal.projectRoutings[project.locator] ?? modal.defaults), project.label, project.locator))
+        : [resolveDispatchTarget(routingValue(modal.defaults), graph.name)];
+      const workInput = graph.processEnabled && modal.startNewRun ? modal.inputPrompt : "";
+      applyRunDraft(graph, modal);
+      void saveStore(false)
+        .then(() => dispatchWork(
+          "graph", graph.id, graph.name,
+          graphPrompt(graph, routingValue(modal.defaults), workInput),
+          requestTargets, perProject ? "per_project" : "single_session",
+        ))
+        .then(() => {
           if (view.modal === modal) closeModal();
+          view.mode = "executions";
           render();
-          toast(live ? "그래프 실행을 시작했습니다." : "실행 계획 생성을 요청했습니다.");
+          toast(`그래프를 ${requestTargets.length}개 세션으로 보냈습니다.`);
         })
         .catch((error) => {
           const message = error instanceof Error ? error.message : String(error);
@@ -5963,25 +5660,27 @@ app.addEventListener("change", (event) => {
     const taskId = input.dataset.taskId;
     const locator = input.dataset.locator;
     if (!taskId || !locator) return;
-    void updateTaskProjectBranch(taskId, input.dataset.projectId ?? "", locator, input.value);
+    const task = store.tasks.find((item) => item.id === taskId);
+    const project = task?.projects?.find((item) => item.locator === locator);
+    if (!task || !project) return;
+    const branch = input.value.trim();
+    if (branch) project.branch = shortBranch(branch);
+    else delete project.branch;
+    task.updatedAt = new Date().toISOString();
+    view.dirty = true;
     return;
-  } else if (scope === "task-project-picker") {
-    if (field === "environment") {
-      taskProjectPickerEnvironment = input.value;
-      selectedTaskProjectBundles.clear();
-    } else if (field === "branch") {
-      const sourcePath = input.dataset.sourcePath;
-      if (!sourcePath) return;
-      selectedTaskProjectBundles.set(sourcePath, input.value ? shortBranch(input.value) : "");
-    }
-    render();
-    return;
+
   } else if (scope === "local-task") {
     const task = store.tasks.find((item) => item.id === view.selectedTaskId);
     if (!task || !localWorkMutable()) return;
     const expectedVersion = Number(task.version ?? 0);
     if (field === "draft") {
       if (setHumanDraft(task, input.value)) syncTaskToGraphNodes(task);
+      render();
+      persistStructuredItem("task", task, expectedVersion);
+      return;
+    } else if (field === "metaDraft") {
+      if (setMetaDraft(task, input.value)) syncTaskToGraphNodes(task);
       render();
       persistStructuredItem("task", task, expectedVersion);
       return;
@@ -6007,6 +5706,11 @@ app.addEventListener("change", (event) => {
     const expectedVersion = Number(todo.version ?? 0);
     if (field === "draft") {
       setHumanDraft(todo, input.value);
+      render();
+      persistStructuredItem("todo", todo, expectedVersion);
+      return;
+    } else if (field === "metaDraft") {
+      setMetaDraft(todo, input.value);
       render();
       persistStructuredItem("todo", todo, expectedVersion);
       return;
@@ -6284,7 +5988,6 @@ app.addEventListener("change", (event) => {
 let narrowViewport = window.innerWidth <= 760;
 window.addEventListener("resize", () => {
   const nextNarrow = window.innerWidth <= 760;
-  if (isWideMode && narrowViewport && !nextNarrow) view.inspectorOpen = true;
   narrowViewport = nextNarrow;
   render();
   if (view.mode === "canvas") window.setTimeout(fitGraph, 0);
@@ -6706,8 +6409,7 @@ window.addEventListener("keydown", (event) => {
 });
 
 render();
-resumePendingTerminalBridgeSync();
-if (responseBridgeApi) void refreshExecutionStatus();
+
 const initialCanvas = app.querySelector<HTMLElement>("[data-canvas]");
 if (initialCanvas) {
   const initialFitObserver = new ResizeObserver(() => {
@@ -6717,3 +6419,11 @@ if (initialCanvas) {
   });
   initialFitObserver.observe(initialCanvas);
 }
+
+// 현재 워크트리 이름은 실행 대상 추천에만 쓰는 힌트다. 실패해도 패널은 그대로 돈다.
+void hostCall<WorkspaceContext>("workspace.readContext", {})
+  .then((context) => {
+    if (!context?.displayName || context.displayName === currentWorkspaceName) return;
+    currentWorkspaceName = context.displayName;
+  })
+  .catch(() => undefined);

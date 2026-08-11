@@ -205,8 +205,8 @@ describe("graph structure", () => {
 
 describe("shared graph validation matrix", () => {
   for (const item of validationFixtureCases) {
-    it(`${item.id} keeps normalized model severity aligned with the bridge contract`, () => {
-      const findings = analyzeGraph(graphFromValidationFixture(item), { live: item.bridgeMode === "live" }).findings;
+    it(`${item.id} keeps normalized model severity aligned with the validation contract`, () => {
+      const findings = analyzeGraph(graphFromValidationFixture(item), { live: item.runMode === "live" }).findings;
       if (!item.expected.code) {
         expect(findings.filter((finding) => finding.severity === "error").map((finding) => finding.code))
           .not.toContain("IRREVERSIBLE_GATE_DOMINATOR_REQUIRED");

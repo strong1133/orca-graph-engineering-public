@@ -8,7 +8,7 @@ const {
   validateWorkTasksBaseUrl,
   workTasksClientFromDataSource,
   workTasksEnvironment,
-} = await import("../bridge/workspace-client.mjs");
+} = await import("../lib/workspace-client.mjs");
 const apiPath = "/api/plugins/orca-graph-engineering";
 // 세션 bootstrap 은 원천이 base page 에 토큰을 심는 배포에서만 쓴다. 변수 이름을
 // 설정하지 않으면 시도조차 하지 않는 것이 새 계약이다.

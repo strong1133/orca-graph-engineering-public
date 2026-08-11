@@ -11,7 +11,7 @@ Do not include exploit details, tokens, local paths, or user graph data in a pub
 - the affected version or commit;
 - a minimal reproduction using synthetic data;
 - impact and required attacker access;
-- whether the panel, bridge, wide-view loopback server, or generated bundle is affected;
+- whether the panel, the save CLI, or the generated bundle is affected;
 - any suggested mitigation.
 
 If private reporting is unavailable, contact the maintainer through the repository owner profile and request a private channel before sharing details.
@@ -19,8 +19,8 @@ If private reporting is unavailable, contact the maintainer through the reposito
 ## Security boundaries
 
 - The plugin panel is sandboxed and uses only declared Orca capabilities.
-- The bridge runs in a visible, user-selected shell and writes local runtime JSON with owner-only permissions.
-- Folder sources write only `.orca-graph-engineering/store.json` below an explicitly selected existing absolute directory, reject filesystem-root and symbolic-link storage targets, and never run Git or persist bridge/session identity in the portable store.
+- The save CLI runs in a visible, user-selected shell, once per invocation, and writes local runtime JSON with owner-only permissions. It opens no port and holds no session.
+- Folder sources write only `.orca-graph-engineering/store.json` below an explicitly selected existing absolute directory, reject filesystem-root and symbolic-link storage targets, and never run Git or persist terminal/session identity in the portable store.
 - The optional wide view binds to `127.0.0.1`, uses an unguessable per-process route, disables caching, and does not enable CORS.
 - Live graph execution can create or write to Orca terminals. Structural, permission, budget, branch, and loop checks therefore fail closed before terminal dispatch.
 

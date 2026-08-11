@@ -26,7 +26,7 @@ Orca의 기여 지침에 따라 UI PR에는 화면 자료, 회귀 테스트, mac
 
 ## Plugin API 제안
 
-현재 plugin API v1 panel은 `connect-src 'none'`이고 panel에서 worker로 메시지를 보낼 수 없습니다. 이 때문에 플러그인이 로컬 상태를 저장하고 Orca 리소스를 조회하려면 terminal bridge가 필요합니다.
+현재 plugin API v1 panel은 `connect-src 'none'`이고 panel에서 worker로 메시지를 보낼 수 없습니다. 이 때문에 플러그인이 로컬 상태를 저장하고 Orca 리소스를 조회하려면 `terminal.sendText`로 CLI 명령을 보내는 우회로가 필요합니다.
 
 최소 API 후보:
 

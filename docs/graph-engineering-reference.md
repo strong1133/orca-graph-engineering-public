@@ -43,4 +43,4 @@
 
 ## 검수 결론
 
-책의 에이전트 그래프 핵심인 topology, 상태 병합, superstep, loop guard, 내구성, retry, human gate, context, 권한, 관측성, 비용 모델은 편집기·분석기·브리지에 연결되어 있습니다. 반면 지식 그래프 전용 query/retrieval/entity resolution, 동적 자기확장, 완전한 event sourcing/CAS, 개인정보 삭제는 구현됐다고 주장하지 않습니다. 공개 문서에서 `동작`, `계약`, `경계`를 구분해 과대평가를 피합니다.
+책의 에이전트 그래프 핵심인 topology, 상태 병합, superstep, loop guard, 내구성, retry, human gate, context, 권한, 관측성, 비용 모델은 편집기·분석기·저장 경계에 연결되어 있습니다. 반면 지식 그래프 전용 query/retrieval/entity resolution, 동적 자기확장, 완전한 event sourcing/CAS, 개인정보 삭제는 구현됐다고 주장하지 않습니다. 공개 문서에서 `동작`, `계약`, `경계`를 구분해 과대평가를 피합니다.

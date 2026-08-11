@@ -384,70 +384,66 @@ export interface OrcaTargets {
 }
 
 export type ExecutionItemKind = "task" | "todo" | "graph";
-export type ExecutionStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type ExecutionMode = "single_session" | "per_project";
 
-export interface RuntimeExecutionTarget {
-  id: string;
-  label: string;
-  status: ExecutionStatus;
-  environmentId?: string;
-  projectId?: string;
-  projectName?: string;
-  locator?: string;
-  branch?: string;
-  sessionId?: string;
-  sessionTitle?: string;
-  /** 노드마다 다른 세션으로 라우팅된 run에서 실제로 사용된 서로 다른 세션 수. */
-  sessionCount?: number;
-  model?: string;
-  startedAt?: string;
-  endedAt?: string;
-  error?: string;
-}
-
-/** Machine-local execution activity. It is never committed to the portable graph source. */
-export interface RuntimeExecution {
+/**
+ * 세션으로 작업을 내보낸 기록 한 건.
+ *
+ * 패널은 Orca 세션에 프롬프트를 꽂는 데까지만 관여한다. 그 뒤 진행은 세션의
+ * 에이전트가 소유하므로 패널이 관측할 수 있는 사실은 "무엇을, 어디로, 언제
+ * 보냈는가"뿐이다. 실행 현황 화면은 이 기록을 그대로 보여 준다 — 추측한 진행률
+ * 이나 되돌려 받지 못하는 상태를 지어내지 않는다.
+ */
+export interface DispatchRecord {
   id: string;
   itemKind: ExecutionItemKind;
   itemId: string;
   title: string;
-  status: ExecutionStatus;
+  dispatchedAt: string;
   executionMode: ExecutionMode;
-  createdAt: string;
-  updatedAt: string;
-  startedAt?: string;
-  endedAt?: string;
-  progress: { completed: number; failed: number; total: number };
-  /** 사용자가 중단을 요청한 시각. 노드 경계에서 관측된다. */
-  cancelRequestedAt?: string;
-  targets: RuntimeExecutionTarget[];
+  /** 프롬프트를 실제로 받은 대상들. 여러 프로젝트로 보내면 여러 건이다. */
+  targets: DispatchTarget[];
+  /** 세션에 닿지 못한 경우의 사유. 닿았다면 없다. */
   error?: string;
+}
+
+export interface DispatchTarget {
+  label: string;
+  environmentId?: string;
+  projectId?: string;
+  projectName?: string;
+  /** Task가 대상 프로젝트를 folder 관계로 가리킬 때의 경로. */
+  locator?: string;
+  branch?: string;
+  sessionId?: string;
+  sessionTitle?: string;
+  model?: string;
+  /** 기존 세션에 보냈는지, 새 세션을 띄우는 명령을 보냈는지. */
+  opened: "existing-session" | "new-session";
 }
 
 export interface GraphStore {
   schemaVersion: 1;
   activeGraphId: string;
-  bridgeTerminalId?: string;
-  bridgeWorkspace?: string;
-  lastBridgeMessage?: string;
-  lastBridgeAt?: string;
+  /** 저장 명령을 보낼 Orca 터미널. 패널이 파일을 쓸 수 없어 한 번 고른다. */
+  saveTerminalId?: string;
+  lastSaveMessage?: string;
+  lastSavedAt?: string;
   domains: LocalDomain[];
   milestones: LocalMilestone[];
   tasks: LocalTask[];
   todos: LocalTodo[];
   graphs: GraphDefinition[];
+  /** 최근 dispatch 기록. 오래된 것부터 잘라 최대 200건만 유지한다. */
+  dispatchLog: DispatchRecord[];
 }
 
 export interface Bootstrap {
   store: GraphStore;
   targets: OrcaTargets;
-  executions?: RuntimeExecution[];
   dataSource: DataSourceState;
   pluginRoot: string;
   builtAt: string;
-  /** Ephemeral loopback response bridge injected by the running local bridge. */
-  bridgeApiUrl?: string;
 }
 
 function normalizeRouting(value: RoutingTarget | undefined): RoutingTarget {
@@ -674,8 +670,8 @@ export function currentMetaRevision(item: Pick<LocalTask | LocalTodo, "promptRev
 }
 
 export function normalizeGraphStore(
-  input: Omit<GraphStore, "domains" | "milestones" | "tasks" | "todos">
-    & Partial<Pick<GraphStore, "domains" | "milestones" | "tasks" | "todos">>,
+  input: Omit<GraphStore, "domains" | "milestones" | "tasks" | "todos" | "dispatchLog">
+    & Partial<Pick<GraphStore, "domains" | "milestones" | "tasks" | "todos" | "dispatchLog">>,
 ): GraphStore {
   const graphs = input.graphs.map(normalizeGraph);
   const domainMap = new Map<string, LocalDomain>();
@@ -840,16 +836,49 @@ export function normalizeGraphStore(
   return {
     schemaVersion: 1,
     activeGraphId,
-    ...(input.bridgeTerminalId ? { bridgeTerminalId: input.bridgeTerminalId } : {}),
-    ...(input.bridgeWorkspace ? { bridgeWorkspace: input.bridgeWorkspace } : {}),
-    ...(input.lastBridgeMessage ? { lastBridgeMessage: input.lastBridgeMessage } : {}),
-    ...(input.lastBridgeAt ? { lastBridgeAt: input.lastBridgeAt } : {}),
+    ...(input.saveTerminalId ? { saveTerminalId: input.saveTerminalId } : {}),
+    ...(input.lastSaveMessage ? { lastSaveMessage: input.lastSaveMessage } : {}),
+    ...(input.lastSavedAt ? { lastSavedAt: input.lastSavedAt } : {}),
     domains: [...domainMap.values()],
     milestones: [...milestoneMap.values()],
     tasks: [...taskMap.values()],
     todos: [...todoMap.values()],
     graphs,
+    dispatchLog: normalizeDispatchLog(input.dispatchLog),
   };
+}
+
+export const DISPATCH_LOG_LIMIT = 200;
+
+function normalizeDispatchLog(input: DispatchRecord[] | undefined): DispatchRecord[] {
+  const records: DispatchRecord[] = [];
+  for (const record of input ?? []) {
+    if (!record?.id || !record.dispatchedAt) continue;
+    records.push({
+      id: record.id,
+      itemKind: (["task", "todo", "graph"] as const).includes(record.itemKind) ? record.itemKind : "task",
+      itemId: record.itemId ?? "",
+      title: record.title ?? record.itemId ?? "",
+      dispatchedAt: record.dispatchedAt,
+      executionMode: record.executionMode === "per_project" ? "per_project" : "single_session",
+      targets: (record.targets ?? []).map((target) => ({
+        label: target.label ?? "",
+        ...(target.environmentId ? { environmentId: target.environmentId } : {}),
+        ...(target.projectId ? { projectId: target.projectId } : {}),
+        ...(target.projectName ? { projectName: target.projectName } : {}),
+        ...(target.locator ? { locator: target.locator } : {}),
+        ...(target.branch ? { branch: target.branch } : {}),
+        ...(target.sessionId ? { sessionId: target.sessionId } : {}),
+        ...(target.sessionTitle ? { sessionTitle: target.sessionTitle } : {}),
+        ...(target.model ? { model: target.model } : {}),
+        opened: target.opened === "new-session" ? "new-session" : "existing-session",
+      })),
+      ...(record.error ? { error: record.error } : {}),
+    });
+  }
+  // 최신이 먼저. 오래된 기록부터 잘라 낸다.
+  records.sort((left, right) => right.dispatchedAt.localeCompare(left.dispatchedAt));
+  return records.slice(0, DISPATCH_LOG_LIMIT);
 }
 
 export const NODE_WIDTH = 228;

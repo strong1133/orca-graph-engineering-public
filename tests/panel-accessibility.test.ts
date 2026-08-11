@@ -5,15 +5,83 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { build } from "esbuild";
 import { JSDOM, type DOMWindow } from "jsdom";
+import { gunzipSync } from "node:zlib";
 import { describe, expect, it, vi } from "vitest";
+
+type HostRequest = { action: string; params?: Record<string, any> };
+
+/**
+ * 패널이 밖으로 나가는 유일한 통로인 `terminal.sendText`를 잡아, 실제로 어떤 명령이
+ * 터미널로 나갔는지 확인할 수 있게 한다. 긴 명령은 여러 번에 나눠 보내고 마지막에만
+ * Enter가 붙으므로, Enter를 기준으로 한 줄로 다시 합친다.
+ */
+function terminalHost(terminals: Array<{ id: string }> = [{ id: "shell" }], displayName = "current-project") {
+  const requests: HostRequest[] = [];
+  const commands: string[] = [];
+  let buffer = "";
+  const configure = (window: DOMWindow): void => {
+    window.addEventListener("message", (event) => {
+      const request = event.data as { type?: string; requestId?: string; action?: string; params?: Record<string, any> } | null;
+      if (request?.type !== "orca-panel-action" || !request.requestId || !request.action) return;
+      requests.push({ action: request.action, ...(request.params ? { params: request.params } : {}) });
+      if (request.action === "terminal.sendText") {
+        // 명령 앞의 줄 지우기 제어문자는 명령 본문이 아니다.
+        buffer += String(request.params?.text ?? "").replaceAll("\u0015", "");
+        if (request.params?.enter) {
+          commands.push(buffer);
+          buffer = "";
+        }
+      }
+      const value = request.action === "workspace.readContext"
+        ? { branch: "refs/heads/main", displayName, terminals }
+        : undefined;
+      window.postMessage({ type: "orca-panel-action-result", requestId: request.requestId, ok: true, value }, "*");
+    });
+  };
+  return { requests, commands, configure };
+}
+
+/** 저장 CLI 명령 한 줄을 하위 명령과 원래 payload로 되돌린다. */
+function decodeCommand(line: string): { command: string; payload?: any } {
+  const match = /graph-store\.mjs" (save|dispatch|source|refresh)(?: ([A-Za-z0-9_-]+))?$/u.exec(line.trim());
+  if (!match) throw new Error(`not a graph-store command: ${line}`);
+  return {
+    command: match[1]!,
+    ...(match[2] ? { payload: JSON.parse(gunzipSync(Buffer.from(match[2], "base64url")).toString("utf8")) } : {}),
+  };
+}
+
+/**
+ * 패널의 터미널 왕복은 postMessage 여러 번을 거친다. 고정된 tick 수로 기다리면
+ * 부하에 따라 마지막 명령을 놓쳐 테스트가 간헐적으로 깨진다.
+ */
+async function settle(dom: JSDOM, expectedCommands?: number): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  for (let index = 0; index < 200; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (expectedCommands === undefined) {
+      if (index >= 30) return;
+      continue;
+    }
+    if (Date.now() > deadline) return;
+  }
+  void dom;
+}
+
+async function waitForCommands(host: { commands: string[] }, count: number): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (host.commands.length < count && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
 
 const root = process.cwd();
 const execFileAsync = promisify(execFile);
 let productionPanelHtml: Promise<string> | null = null;
 
-function configureWindow(wide: boolean): (window: DOMWindow) => void {
+function configureWindow(): (window: DOMWindow) => void {
   return (window) => {
-    Object.defineProperty(window, "innerWidth", { configurable: true, value: wide ? 1200 : 640 });
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 640 });
     Object.defineProperty(window, "structuredClone", { configurable: true, value: structuredClone });
     Object.defineProperty(window, "ResizeObserver", {
       configurable: true,
@@ -22,15 +90,26 @@ function configureWindow(wide: boolean): (window: DOMWindow) => void {
         disconnect(): void {}
       },
     });
+    // 패널은 저장 payload를 gzip+base64url로 만든다. jsdom에는 이 세 가지가 없어
+    // Node 전역을 그대로 넣어 준다 — 세 개를 함께 넣어야 서로 호환된다.
+    Object.defineProperty(window, "CompressionStream", { configurable: true, value: CompressionStream });
+    Object.defineProperty(window, "Blob", { configurable: true, value: Blob });
+    Object.defineProperty(window, "Response", { configurable: true, value: Response });
+    Object.defineProperty(window, "TextEncoder", { configurable: true, value: TextEncoder });
     Object.defineProperty(window.navigator, "clipboard", {
       configurable: true,
       value: { writeText: vi.fn().mockResolvedValue(undefined) },
     });
+    // 결정적이되 호출마다 달라야 한다. 같은 값을 계속 돌려주면 동시에 뜬 host call의
+    // requestId가 겹쳐 응답이 엉뚱한 호출로 간다.
+    let uuidSequence = 0;
     Object.defineProperty(window.crypto, "randomUUID", {
       configurable: true,
-      value: () => "00000000-0000-4000-8000-000000000000",
+      value: () => {
+        uuidSequence += 1;
+        return `00000000-0000-4000-8000-${String(uuidSequence).padStart(12, "0")}`;
+      },
     });
-    if (wide) (window as typeof window & { __ORCA_GRAPH_WIDE_API__?: string }).__ORCA_GRAPH_WIDE_API__ = "/test/api";
   };
 }
 
@@ -40,7 +119,6 @@ function panelBootstrapScript(value: unknown): string {
 }
 
 async function mountPanel(
-  wide: boolean,
   configure?: (bootstrap: { store: Record<string, any>; targets: Record<string, any> }) => void,
   configureDom?: (window: DOMWindow) => void,
 ): Promise<JSDOM> {
@@ -69,7 +147,7 @@ async function mountPanel(
     runScripts: "dangerously",
     url: "http://127.0.0.1/panel",
     beforeParse: (window) => {
-      configureWindow(wide)(window);
+      configureWindow()(window);
       configureDom?.(window);
     },
   });
@@ -77,7 +155,7 @@ async function mountPanel(
   return dom;
 }
 
-async function mountProductionPanel(wide: boolean): Promise<JSDOM> {
+async function mountProductionPanel(): Promise<JSDOM> {
   productionPanelHtml ??= (async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "orca-graph-panel-dist-"));
     const output = path.join(directory, "panel.html");
@@ -100,7 +178,7 @@ async function mountProductionPanel(wide: boolean): Promise<JSDOM> {
   const dom = new JSDOM(await productionPanelHtml, {
     runScripts: "dangerously",
     url: "http://127.0.0.1/panel",
-    beforeParse: configureWindow(wide),
+    beforeParse: configureWindow(),
   });
   await Promise.resolve();
   return dom;
@@ -116,55 +194,45 @@ function focusables(dialog: Element): HTMLElement[] {
   )];
 }
 
-it("drops a saved bridge terminal that belongs to another Orca worktree", async () => {
-  const requests: Array<{ action: string; params?: Record<string, unknown> }> = [];
-  const dom = await mountPanel(false, ({ store }) => {
-    store.bridgeTerminalId = "terminal-from-previous-worktree";
-    store.bridgeWorkspace = "previous-worktree";
-  }, (window) => {
-    window.addEventListener("message", (event) => {
-      const request = event.data as { type?: string; requestId?: string; action?: string; params?: Record<string, unknown> } | null;
-      if (request?.type !== "orca-panel-action" || !request.requestId || !request.action) return;
-      requests.push({ action: request.action, ...(request.params ? { params: request.params } : {}) });
-      const value = request.action === "workspace.readContext"
-        ? { branch: "refs/heads/main", displayName: "current-worktree", terminals: [{ id: "current-shell" }] }
-        : undefined;
-      window.postMessage({ type: "orca-panel-action-result", requestId: request.requestId, ok: true, value }, "*");
-    });
-  });
+
+it("asks which terminal to save through only when the remembered one is gone", async () => {
+  // 패널은 파일을 쓸 수 없어 저장 명령을 터미널로 보낸다. Orca는 터미널 id만
+  // 알려 주므로 어느 것이 셸인지 사용자가 한 번 고르고, 그 뒤로는 묻지 않는다.
+  const host = terminalHost([{ id: "current-shell" }, { id: "agent-pane" }]);
+  const dom = await mountPanel(({ store }) => {
+    store.saveTerminalId = "terminal-from-previous-worktree";
+  }, host.configure);
   try {
     const { document } = dom.window;
-    document.querySelector<HTMLButtonElement>('[data-action="connect-bridge"]')?.click();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    document.querySelector<HTMLButtonElement>('[data-action="add-task"]')?.click();
+    document.querySelector<HTMLButtonElement>('[data-action="save"]')?.click();
+    await settle(dom);
+      await waitForCommands(host, 1);
 
-    let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-    expect(dialog?.textContent).toContain("저장된 브리지 터미널이 현재 Orca worktree에 없어 선택을 해제했습니다");
-    expect(dialog?.querySelector<HTMLButtonElement>('[data-action="start-bridge"]')?.disabled).toBe(true);
-    expect(dialog?.querySelector('[data-id="terminal-from-previous-worktree"]')).toBeNull();
+    // 기억해 둔 터미널이 이 워크트리에 없으므로 선택을 다시 묻는다.
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog?.textContent).toContain("저장할 터미널");
+    expect([...dialog!.querySelectorAll('[data-action="choose-save-terminal"]')].map((button) => button.getAttribute("data-id")))
+      .toEqual(["current-shell", "agent-pane"]);
+    expect(host.commands).toEqual([]);
 
-    dialog?.querySelector<HTMLButtonElement>('[data-action="choose-terminal"][data-id="current-shell"]')?.click();
-    dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-    expect(dialog?.querySelector<HTMLButtonElement>('[data-action="start-bridge"]')?.disabled).toBe(false);
-    dialog?.querySelector<HTMLButtonElement>('[data-action="start-bridge"]')?.click();
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    dialog?.querySelector<HTMLButtonElement>('[data-action="choose-save-terminal"][data-id="current-shell"]')?.click();
+    document.querySelector<HTMLButtonElement>('[data-action="save"]')?.click();
+    await settle(dom);
 
-    expect(requests.map((request) => request.action)).toContain("terminal.sendText");
-    expect(requests.find((request) => request.action === "terminal.sendText")?.params).toMatchObject({
-      terminalId: "current-shell",
-      enter: true,
-    });
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(host.commands).toHaveLength(1);
+    expect(decodeCommand(host.commands[0]!).command).toBe("save");
+    expect(host.requests.filter((request) => request.action === "terminal.sendText")
+      .every((request) => request.params?.terminalId === "current-shell")).toBe(true);
   } finally {
     dom.window.close();
   }
 });
 
-describe.each([
-  ["side panel", false],
-  ["wide view", true],
-] as const)("panel accessibility in %s", (_label, wide) => {
+describe("panel accessibility", () => {
   it("manages local Tasks and Todos without a connected data source", async () => {
-    const dom = await mountPanel(wide);
+    const dom = await mountPanel();
     try {
       const { document, Event } = dom.window;
       expect(document.querySelector<HTMLButtonElement>('.topbar [data-action="refresh-source"]')?.disabled).toBe(true);
@@ -208,7 +276,7 @@ describe.each([
       id, title, prompt: `Prompt ${title}`, draft: `Prompt ${title}`, promptRevisions: [],
       domainId: "domain-a", milestoneId, status, priority: "medium", tags: [], createdAt: now, updatedAt: now,
     });
-    const dom = await mountPanel(wide, ({ store }) => {
+    const dom = await mountPanel(({ store }) => {
       store.domains = [{
         id: "domain-a", name: "Delivery", summary: "", objectives: "", commonNotes: "", constraintNotes: "",
         status: "active", owners: [], version: 1, createdAt: now, updatedAt: now,
@@ -258,14 +326,13 @@ describe.each([
   });
 
   it("opens a standalone Task run dialog with one-off Orca routing", async () => {
-    const dom = await mountPanel(wide, ({ store, targets }) => {
-      store.bridgeWorkspace = "current-project";
+    const dom = await mountPanel(({ store, targets }) => {
       targets.environments = [
         { id: "local", name: "device-a", local: true, connected: true },
         { id: "environment-device-b", name: "device-b", local: false, connected: true },
       ];
       targets.projects = [
-        { id: "repo:current-project", name: "current-project", environmentId: "local", worktreeId: "worktree-current-project" },
+        { id: "repo:current-project", name: "current-project", environmentId: "local", worktreeId: "worktree-current-project", current: true },
         { id: "repo:remote-project", name: "remote-project", environmentId: "environment-device-b", worktreeId: "worktree-remote-project" },
       ];
       targets.sessions = [{
@@ -328,7 +395,7 @@ describe.each([
   });
 
   it("offers every agent session in the selected local Orca for Task and Graph execution", async () => {
-    const dom = await mountPanel(wide, ({ store, targets }) => {
+    const dom = await mountPanel(({ store, targets }) => {
       store.graphs[0].defaults = { environmentId: "local", projectId: "project-a", model: "gpt-5.6-sol" };
       targets.environments = [{ id: "local", name: "device-a", local: true, connected: true }];
       targets.projects = [
@@ -374,7 +441,7 @@ describe.each([
   });
 
   it("allows zero or multiple project and worktree selections at run time", async () => {
-    const dom = await mountPanel(wide, ({ targets }) => {
+    const dom = await mountPanel(({ targets }) => {
       targets.projects = [
         { id: "project-api", name: "API", environmentId: "local", worktreeId: "wt-api", path: "/workspace/api", branch: "main" },
         { id: "project-web", name: "Web", environmentId: "local", worktreeId: "wt-web", path: "/workspace/web", branch: "release" },
@@ -413,7 +480,7 @@ describe.each([
   });
 
   it("selects the one machine that can satisfy every saved Task project and branch", async () => {
-    const dom = await mountPanel(wide, ({ store, targets }) => {
+    const dom = await mountPanel(({ store, targets }) => {
       const now = "2026-08-10T00:00:00.000Z";
       store.tasks = [{
         id: "task-remote", title: "원격 다중 프로젝트", prompt: "work", draft: "work", promptRevisions: [],
@@ -458,17 +525,17 @@ describe.each([
     }
   });
 
-  it("restores the last Task route and keeps the run dialog open when launch fails", async () => {
-    const now = "2026-08-10T00:00:00.000Z";
-    const dom = await mountPanel(wide, (bootstrap) => {
-      (bootstrap as typeof bootstrap & { bridgeApiUrl: string }).bridgeApiUrl = "/test/api";
-      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [{
-        id: "exec-previous", itemKind: "task", itemId: "task-design", title: "요구사항 설계", status: "completed",
-        executionMode: "single_session", createdAt: now, updatedAt: now, progress: { completed: 1, failed: 0, total: 1 },
+
+  it("restores the last Task route and keeps the run dialog open when the send fails", async () => {
+    const host = terminalHost([]);
+    const dom = await mountPanel((bootstrap) => {
+      bootstrap.store.dispatchLog = [{
+        id: "dispatch-previous", itemKind: "task", itemId: "task-design", title: "요구사항 설계",
+        dispatchedAt: "2026-08-10T00:00:00.000Z", executionMode: "single_session",
         targets: [{
-          id: "target-previous", label: "Current", status: "completed", environmentId: "local",
-          projectId: "repo:current-project", branch: "feature/review", sessionId: "session-previous",
-          sessionTitle: "Review Agent", model: "claude-opus-5",
+          label: "Current", environmentId: "local", projectId: "repo:current-project",
+          branch: "feature/review", sessionId: "session-previous", sessionTitle: "Review Agent",
+          model: "claude-opus-5", opened: "existing-session",
         }],
       }];
       bootstrap.targets.projects = [{
@@ -480,48 +547,38 @@ describe.each([
         projectId: "repo:current-project", branch: "feature/review", paneKey: "tab:leaf", agentType: "claude",
         agentState: "done", connected: true, writable: true,
       }];
-    }, (window) => {
-      Object.defineProperty(window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          const request = JSON.parse(String(init.body));
-          if (request.type === "save") return Response.json({ ok: true, value: { mode: "local", store: request.store } });
-          if (request.type === "start-task-execution") return Response.json({ ok: false, error: "agent session launch failed" });
-          return Response.json({ ok: true, value: undefined });
-        }),
-      });
-    });
+    }, host.configure);
     try {
       const { document } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
       document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-design"]')?.click();
       document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
 
+      // 지난번에 어디로 보냈는지가 기본값이 된다.
       let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
       expect(dialog?.querySelector<HTMLSelectElement>('[data-field="sessionId"]')?.value).toBe("session-previous");
       expect(dialog?.querySelector<HTMLSelectElement>('[data-field="model"]')?.value).toBe("claude-opus-5");
+
       dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.click();
       dialog = document.querySelector<HTMLElement>('[role="dialog"]');
       expect(dialog?.getAttribute("aria-busy")).toBe("true");
-      expect(dialog?.textContent).toContain("실행 요청 중");
+      await settle(dom);
 
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      // 워크트리에 터미널이 하나도 없어 명령을 보낼 수 없다. 창을 닫아 버리면
+      // 사용자가 방금 고른 설정을 다시 입력해야 한다.
       dialog = document.querySelector<HTMLElement>('[role="dialog"]');
       expect(dialog).not.toBeNull();
       expect(dialog?.getAttribute("aria-busy")).toBe("false");
-      expect(dialog?.textContent).toContain("실행을 시작하지 못했습니다");
-      expect(dialog?.textContent).toContain("agent session launch failed");
+      expect(dialog?.textContent).toContain("열린 터미널이 없습니다");
       expect(dialog?.querySelector<HTMLSelectElement>('[data-field="sessionId"]')?.value).toBe("session-previous");
       expect(dialog?.querySelector<HTMLSelectElement>('[data-field="model"]')?.value).toBe("claude-opus-5");
-      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
     } finally {
       dom.window.close();
     }
   });
 
   it("creates or opens a Todo Task and selects its predefined worktree Graph", async () => {
-    const dom = await mountPanel(wide, ({ store }) => {
+    const dom = await mountPanel(({ store }) => {
       const now = "2026-08-10T00:00:00.000Z";
       store.todos = [
         {
@@ -562,7 +619,7 @@ describe.each([
   });
 
   it("keeps an archived Todo comment visible and read-only without placeholders", async () => {
-    const dom = await mountPanel(wide, ({ store }) => {
+    const dom = await mountPanel(({ store }) => {
       const now = "2026-08-10T00:00:00.000Z";
       store.todos = [{
         id: "todo-archived", title: "보관 ToDo", notes: "정지희 1차 후 정석진 작업 예정", draft: "보관 항목",
@@ -586,34 +643,46 @@ describe.each([
     }
   });
 
-  it("shows one tracked execution consistently in navigation, Task list, detail, and execution status", async () => {
-    const dom = await mountPanel(wide, (bootstrap) => {
-      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [{
-        id: "exec-task-running", itemKind: "task", itemId: "task-design", title: "요구사항 설계", status: "running",
-        executionMode: "single_session", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:01:00.000Z",
-        progress: { completed: 0, failed: 0, total: 1 },
-        targets: [{ id: "target-1", label: "current-project", status: "running", environmentId: "local", projectId: "current-project", branch: "main", model: "gpt-5.6-sol" }],
+
+  it("shows what was sent, where, and when — and nothing it cannot observe", async () => {
+    // 패널에는 세션에서 돌아오는 채널이 없다. 진행률이나 완료를 지어내면 사용자는
+    // 확인되지 않은 상태를 사실로 읽는다.
+    const dom = await mountPanel(({ store }) => {
+      store.dispatchLog = [{
+        id: "dispatch-1", itemKind: "task", itemId: "task-design", title: "요구사항 설계",
+        dispatchedAt: "2026-08-10T01:00:00.000Z", executionMode: "single_session",
+        targets: [{
+          label: "current-project", projectName: "current-project", branch: "main",
+          sessionId: "session-a", sessionTitle: "Codex", model: "gpt-5.6-sol", opened: "existing-session",
+        }],
       }];
     });
     try {
       const { document } = dom.window;
       expect(document.querySelector('[data-action="set-view"][data-id="executions"]')?.textContent).toContain("1");
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
+      const manager = document.querySelector<HTMLElement>(".execution-manager");
+      expect(manager?.textContent).toContain("요구사항 설계");
+      expect(manager?.textContent).toContain("current-project");
+      expect(manager?.textContent).toContain("기존 세션");
+      expect(manager?.textContent).toContain("전달 뒤의 진행은 각 세션에서 확인하십시오");
+      // 관측할 수 없는 것은 그리지 않는다.
+      expect(manager?.querySelector(".execution-progress")).toBeNull();
+      expect(manager?.textContent).not.toContain("실행 중");
+
+      // Task 실행 버튼은 보낸 뒤에도 계속 눌릴 수 있어야 한다 — 끝났는지 알 수 없으므로
+      // 잠그면 사용자가 다시 보낼 방법이 사라진다.
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
       const row = document.querySelector<HTMLElement>('[data-action="select-local-task"][data-id="task-design"]')?.closest(".work-card-row");
-      expect(row?.textContent).toContain("실행 중");
-      expect(row?.querySelector<HTMLButtonElement>('[data-action="open-task-run"]')?.disabled).toBe(true);
-      row?.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
-      expect(document.querySelector(".work-detail-page .execution-banner")?.textContent).toContain("0/1 완료");
-      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
-      expect(document.querySelector(".execution-manager")?.textContent).toContain("요구사항 설계");
-      expect(document.querySelector(".execution-card .execution-progress")?.getAttribute("aria-valuenow")).toBe("0");
+      expect(row?.querySelector<HTMLButtonElement>('[data-action="open-task-run"]')?.disabled).toBe(false);
+      expect(row?.querySelector(".dispatch-inline")).not.toBeNull();
     } finally {
       dom.window.close();
     }
   });
 
   it("shows the run work input, per-node outcome, and failure reason in the execution status view", async () => {
-    const dom = await mountPanel(wide, (bootstrap) => {
+    const dom = await mountPanel((bootstrap) => {
       bootstrap.store.graphs[0].runs = [{
         id: "run-1", runNo: 7, status: "failed", startedAt: "2026-08-11T03:00:00.000Z",
         endedAt: "2026-08-11T03:04:00.000Z", trigger: "manual", terminationReason: "node_failed",
@@ -623,18 +692,16 @@ describe.each([
           { nodeId: "node-implement", status: "failed", attempt: 2, durationMs: 7_000, sessionId: "term-b", message: "필수 템플릿 계약값 누락으로 blocked" },
         ],
       }];
-      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [{
-        id: "exec-graph-run", itemKind: "graph", itemId: "graph-orca-demo", title: "Orca 그래프 엔지니어링",
-        status: "failed", executionMode: "single_session",
-        createdAt: "2026-08-11T03:00:00.000Z", updatedAt: "2026-08-11T03:04:00.000Z",
-        progress: { completed: 1, failed: 1, total: 4 },
-        targets: [{ id: "target-1", label: "current-project", status: "failed", environmentId: "local", projectId: "current-project" }],
+      bootstrap.store.dispatchLog = [{
+        id: "dispatch-graph", itemKind: "graph", itemId: "graph-orca-demo", title: "Orca 그래프 엔지니어링",
+        dispatchedAt: "2026-08-11T03:00:00.000Z", executionMode: "single_session",
+        targets: [{ label: "current-project", projectName: "current-project", opened: "new-session" }],
       }];
     });
     try {
       const { document } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
-      const history = document.querySelector<HTMLElement>(".execution-run-history");
+      const history = document.querySelector<HTMLElement>(".execution-group");
       expect(history?.textContent).toContain("Run #7");
       expect(history?.textContent).toContain("상속바로 백오피스 고객재등록 버튼 복구");
       expect(history?.textContent).toContain("요구사항 설계");
@@ -649,7 +716,7 @@ describe.each([
   });
 
   it("exposes each node's last run outcome as a canvas tooltip and offers a run-history reset", async () => {
-    const dom = await mountPanel(wide, (bootstrap) => {
+    const dom = await mountPanel((bootstrap) => {
       bootstrap.store.graphs[0].runs = [{
         id: "run-1", runNo: 3, status: "failed", startedAt: "2026-08-11T03:00:00.000Z", trigger: "manual",
         nodeResults: [{ nodeId: "node-implement", status: "failed", attempt: 1, durationMs: 5_000, sessionTitle: "구현 세션", message: "필수 템플릿 계약값 누락으로 blocked" }],
@@ -671,81 +738,38 @@ describe.each([
     }
   });
 
-  it("groups repeated execution history under its Graph instead of rendering separate Graph rows", async () => {
-    const dom = await mountPanel(wide, (bootstrap) => {
-      const base = {
-        itemKind: "graph", itemId: "graph-orca-demo", title: "Orca 그래프 엔지니어링", executionMode: "single_session",
-        progress: { completed: 0, failed: 1, total: 4 },
-        targets: [{ id: "target-1", label: "current-project", status: "failed", environmentId: "local", projectId: "current-project" }],
-      };
-      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [
-        { ...base, id: "exec-graph-3", status: "failed", createdAt: "2026-08-10T03:00:00.000Z", updatedAt: "2026-08-10T03:01:00.000Z", error: "세 번째 실패" },
-        { ...base, id: "exec-graph-2", status: "failed", createdAt: "2026-08-10T02:00:00.000Z", updatedAt: "2026-08-10T02:01:00.000Z", error: "두 번째 실패" },
-        { ...base, id: "exec-graph-1", status: "failed", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:01:00.000Z", error: "첫 번째 실패" },
+
+  it("keeps the newest dispatch first and shows the graph run history beside it", async () => {
+    const dom = await mountPanel(({ store }) => {
+      store.dispatchLog = [
+        {
+          id: "dispatch-old", itemKind: "graph", itemId: "graph-orca-demo", title: "Orca 데모",
+          dispatchedAt: "2026-08-10T01:00:00.000Z", executionMode: "single_session",
+          targets: [{ label: "current-project", opened: "new-session" }],
+        },
+        {
+          id: "dispatch-new", itemKind: "graph", itemId: "graph-orca-demo", title: "Orca 데모",
+          dispatchedAt: "2026-08-10T02:00:00.000Z", executionMode: "single_session",
+          targets: [{ label: "current-project", opened: "new-session" }],
+        },
       ];
     });
     try {
       const { document } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
-      const groups = document.querySelectorAll<HTMLElement>('.execution-group[data-execution-kind="graph"][data-execution-item-id="graph-orca-demo"]');
-      expect(groups).toHaveLength(1);
-      expect(groups[0]?.querySelector(".execution-group-header")?.textContent).toContain("실행 3회");
-      expect(groups[0]?.querySelectorAll(".execution-card")).toHaveLength(3);
-      expect(groups[0]?.querySelectorAll('[data-action="open-execution-item"]')).toHaveLength(1);
-      expect(groups[0]?.textContent).toContain("최근 실행");
-      expect(groups[0]?.textContent).toContain("이전 실행 2");
-    } finally {
-      dom.window.close();
-    }
-  });
-
-  it("morphs execution status in place without replacing the manager, Graph group, or run card", async () => {
-    let resolveStatus: ((response: Response) => void) | undefined;
-    const running = {
-      id: "exec-morph", itemKind: "graph", itemId: "graph-orca-demo", title: "동적 Graph", status: "running",
-      executionMode: "single_session", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:01:00.000Z",
-      progress: { completed: 1, failed: 0, total: 4 },
-      targets: [{ id: "target-1", label: "current-project", status: "running", environmentId: "local", projectId: "current-project" }],
-    };
-    const failed = {
-      ...running, status: "failed", updatedAt: "2026-08-10T01:02:00.000Z",
-      progress: { completed: 1, failed: 1, total: 4 }, error: "두 번째 노드 실패",
-      targets: [{ ...running.targets[0], status: "failed", error: "두 번째 노드 실패" }],
-    };
-    const dom = await mountPanel(wide, (bootstrap) => {
-      const live = bootstrap as typeof bootstrap & { bridgeApiUrl: string; executions: unknown[] };
-      live.bridgeApiUrl = "/test/api";
-      live.executions = [running];
-    }, (window) => {
-      Object.defineProperty(window, "fetch", {
-        configurable: true,
-        value: vi.fn(() => new Promise<Response>((resolve) => { resolveStatus = resolve; })),
-      });
-    });
-    try {
-      const { document } = dom.window;
-      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
-      const manager = document.querySelector(".execution-manager");
-      const body = document.querySelector(".execution-manager-body");
-      const group = document.querySelector(".execution-group");
-      const card = document.querySelector(".execution-card");
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      resolveStatus?.(Response.json({ ok: true, value: { executions: [failed] } }));
-      await Promise.resolve();
-      await Promise.resolve();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(document.querySelector(".execution-manager")).toBe(manager);
-      expect(document.querySelector(".execution-manager-body")).toBe(body);
-      expect(document.querySelector(".execution-group")).toBe(group);
-      expect(document.querySelector(".execution-card")).toBe(card);
-      expect(card?.textContent).toContain("두 번째 노드 실패");
+      const cards = [...document.querySelectorAll<HTMLElement>(".dispatch-card")];
+      expect(cards).toHaveLength(2);
+      // 최신이 먼저. 같은 Graph를 여러 번 보내도 run 이력 섹션은 하나만 만든다.
+      expect(cards[0]?.textContent).toContain("2026");
+      expect(document.querySelectorAll(".execution-group")).toHaveLength(1);
+      expect(document.querySelector(".execution-group")?.textContent).toContain("graph-orca-demo");
     } finally {
       dom.window.close();
     }
   });
 
   it("prepares a failed active process run as a new run with its previous work input", async () => {
-    const dom = await mountPanel(wide, (bootstrap) => {
+    const dom = await mountPanel((bootstrap) => {
       const { store } = bootstrap;
       (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
         config: { schemaVersion: 1, mode: "structured", url: "https://workspace.example.test" },
@@ -774,158 +798,26 @@ describe.each([
     }
   });
 
-  it("refreshes cross-surface execution state immediately when the status view opens", async () => {
-    const requests: any[] = [];
-    const execution = {
-      id: "exec-cross-surface", itemKind: "graph", itemId: "graph-orca-demo", title: "다른 Orca 표면 실행", status: "running",
-      executionMode: "single_session", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:01:00.000Z",
-      progress: { completed: 1, failed: 0, total: 3 },
-      targets: [{
-        id: "target-1", label: "API", status: "running", environmentId: "local", projectId: "project-api",
-        branch: "feature/review", model: "gpt-5.6-sol", sessionId: "session-sensitive-id", sessionTitle: "Review Agent",
-      }],
-    };
-    const dom = await mountPanel(wide, (bootstrap) => {
-      const liveBootstrap = bootstrap as typeof bootstrap & { bridgeApiUrl: string; executions: unknown[] };
-      liveBootstrap.bridgeApiUrl = "/test/api";
-      liveBootstrap.executions = [];
-    }, (window) => {
-      Object.defineProperty(window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          requests.push(JSON.parse(String(init.body)));
-          return Response.json({ ok: true, value: { executions: [execution] } });
-        }),
-      });
-    });
-    try {
-      const { document } = dom.window;
-      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
-      await Promise.resolve();
-      await Promise.resolve();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(requests).toContainEqual({ type: "execution-status" });
-      expect(document.querySelector(".execution-manager")?.textContent).toContain("다른 Orca 표면 실행");
-      expect(document.querySelector(".execution-target")?.textContent).toContain("Orca 세션 · Review Agent");
-      expect(document.querySelector(".execution-target")?.textContent).not.toContain("session-sensitive-id");
-    } finally {
-      dom.window.close();
-    }
-  });
-
-  it("patches graph execution polling in place without replacing the plugin or status button", async () => {
-    let resolveStatus: ((response: Response) => void) | undefined;
-    const runningExecution = {
-      id: "exec-graph-live", itemKind: "graph", itemId: "graph-orca-demo", title: "그래프 실시간 실행", status: "running",
-      executionMode: "single_session", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:01:00.000Z",
-      progress: { completed: 0, failed: 0, total: 4 },
-      targets: [{ id: "target-1", label: "current-project", status: "running", environmentId: "local", projectId: "current-project", branch: "main", model: "gpt-5.6-sol" }],
-    };
-    const failedExecution = {
-      ...runningExecution,
-      status: "failed",
-      updatedAt: "2026-08-10T01:01:01.000Z",
-      progress: { completed: 0, failed: 1, total: 4 },
-      error: "실행 세션을 시작하지 못했습니다.",
-      targets: [{ ...runningExecution.targets[0], status: "failed", error: "실행 세션을 시작하지 못했습니다." }],
-    };
-    const dom = await mountPanel(wide, (bootstrap) => {
-      const liveBootstrap = bootstrap as typeof bootstrap & { bridgeApiUrl: string; executions: unknown[] };
-      liveBootstrap.bridgeApiUrl = "/test/api";
-      liveBootstrap.executions = [runningExecution];
-    }, (window) => {
-      const nativeSetTimeout = window.setTimeout.bind(window);
-      Object.defineProperty(window, "setTimeout", {
-        configurable: true,
-        value: (handler: TimerHandler, delay?: number, ...args: unknown[]) => nativeSetTimeout(handler, delay === 1_500 ? 0 : delay, ...args),
-      });
-      Object.defineProperty(window, "fetch", {
-        configurable: true,
-        value: vi.fn(() => new Promise<Response>((resolve) => { resolveStatus = resolve; })),
-      });
-    });
-    try {
-      const { document } = dom.window;
-      const shell = document.querySelector(".app-shell");
-      const statusButton = document.querySelector<HTMLButtonElement>('.execution-banner [data-action="set-view"][data-id="executions"]');
-      const firstNode = document.querySelector<HTMLElement>('.node[data-node-id="node-design"]');
-      expect(firstNode?.classList.contains("execution-queued")).toBe(true);
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(resolveStatus).toBeTypeOf("function");
-      resolveStatus?.(Response.json({ ok: true, value: { executions: [failedExecution] } }));
-      await Promise.resolve();
-      await Promise.resolve();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      expect(document.querySelector(".app-shell")).toBe(shell);
-      expect(document.querySelector('.execution-banner [data-action="set-view"][data-id="executions"]')).toBe(statusButton);
-      expect(document.querySelector(".execution-banner")?.textContent).toContain("실패");
-      expect(firstNode?.classList.contains("execution-blocked")).toBe(true);
-      expect(firstNode?.querySelector(".node-execution-chip")?.textContent).toContain("시작 실패");
-    } finally {
-      dom.window.close();
-    }
-  });
-
-  it("keeps the execution status button actionable after an immediate graph failure", async () => {
-    const dom = await mountPanel(wide, (bootstrap) => {
-      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [{
-        id: "exec-graph-failed", itemKind: "graph", itemId: "graph-orca-demo", title: "실패한 그래프", status: "failed",
-        executionMode: "single_session", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:00:01.000Z",
-        progress: { completed: 0, failed: 1, total: 4 }, error: "실행 시작 실패",
-        targets: [{ id: "target-1", label: "current-project", status: "failed", environmentId: "local", projectId: "current-project", branch: "main", model: "gpt-5.6-sol", error: "실행 시작 실패" }],
-      }];
-    });
-    try {
-      const { document } = dom.window;
-      const statusButton = document.querySelector<HTMLButtonElement>('.execution-banner [data-action="set-view"][data-id="executions"]');
-      expect(statusButton).not.toBeNull();
-      statusButton?.click();
-      expect(document.querySelector(".execution-manager")?.textContent).toContain("실패한 그래프");
-      expect(document.querySelector(".execution-card.status-failed")?.textContent).toContain("실행 시작 실패");
-    } finally {
-      dom.window.close();
-    }
-  });
 
   it("does not let canvas pointer handling swallow a real execution status button click", async () => {
-    const dom = await mountPanel(wide, (bootstrap) => {
-      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [{
-        id: "exec-pointer-failed", itemKind: "graph", itemId: "graph-orca-demo", title: "포인터 실패 그래프", status: "failed",
-        executionMode: "single_session", createdAt: "2026-08-11T01:00:00.000Z", updatedAt: "2026-08-11T01:00:01.000Z",
-        progress: { completed: 0, failed: 1, total: 4 }, error: "포인터 실행 실패",
-        targets: [{ id: "target-1", label: "current-project", status: "failed", environmentId: "local", projectId: "current-project" }],
-      }];
-    });
+    const dom = await mountPanel();
     try {
       const { document, MouseEvent } = dom.window;
-      const statusButton = document.querySelector<HTMLButtonElement>('.execution-banner [data-action="set-view"][data-id="executions"]');
-      expect(statusButton).not.toBeNull();
-      statusButton?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientX: 10, clientY: 10 }));
-      statusButton?.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, clientX: 10, clientY: 10 }));
-      expect(document.contains(statusButton)).toBe(true);
-      statusButton?.click();
-      expect(document.querySelector(".execution-manager")?.textContent).toContain("포인터 실패 그래프");
+      const canvas = document.querySelector<HTMLElement>("[data-canvas]");
+      canvas?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, button: 0, clientX: 10, clientY: 10 }));
+      dom.window.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, button: 0, clientX: 10, clientY: 10 }));
+      const statusButton = document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]');
+      statusButton?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      expect(document.querySelector(".execution-manager")).not.toBeNull();
     } finally {
       dom.window.close();
     }
   });
 
-  it("saves graph launch settings without starting an execution", async () => {
-    const requests: any[] = [];
-    const dom = await mountPanel(wide, (bootstrap) => {
-      (bootstrap as typeof bootstrap & { bridgeApiUrl: string }).bridgeApiUrl = "/test/api";
-    }, (window) => {
-      Object.defineProperty(window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          const request = JSON.parse(String(init.body));
-          requests.push(request);
-          if (request.type === "save") return Response.json({ ok: true, value: { mode: "local", store: request.store } });
-          return Response.json({ ok: true, value: undefined });
-        }),
-      });
-    });
+
+  it("saves graph launch settings without sending the graph to a session", async () => {
+    const host = terminalHost();
+    const dom = await mountPanel(undefined, host.configure);
     try {
       const { document } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
@@ -935,13 +827,13 @@ describe.each([
       expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.textContent).toContain("실행 시작");
       saveButton?.click();
       expect(document.querySelector('[role="dialog"]')?.getAttribute("aria-busy")).toBe("true");
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await settle(dom);
+      await waitForCommands(host, 1);
 
-      const saveRequest = requests.find((request) => request.type === "save");
-      expect(saveRequest?.rebuildPanel).toBe(false);
-      expect(saveRequest?.store.graphs.find((graph: any) => graph.id === "graph-orca-demo")?.engineering?.executionMode).toBe("single_session");
-      expect(requests.some((request) => request.type === "start-graph-execution")).toBe(false);
+      const decoded = host.commands.map(decodeCommand);
+      expect(decoded.map((entry) => entry.command)).toEqual(["save"]);
+      expect(decoded[0]?.payload.graphs.find((graph: any) => graph.id === "graph-orca-demo")?.engineering?.executionMode)
+        .toBe("single_session");
       expect(document.querySelector('[role="dialog"]')).toBeNull();
       expect(document.querySelector(".execution-manager")).toBeNull();
     } finally {
@@ -949,133 +841,98 @@ describe.each([
     }
   });
 
-  it("saves and restores Task launch settings without starting the Task", async () => {
-    const requests: any[] = [];
-    const dom = await mountPanel(wide, (bootstrap) => {
-      (bootstrap as typeof bootstrap & { bridgeApiUrl: string }).bridgeApiUrl = "/test/api";
-    }, (window) => {
-      Object.defineProperty(window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          const request = JSON.parse(String(init.body));
-          requests.push(request);
-          if (request.type === "save") return Response.json({ ok: true, value: { mode: "local", store: request.store } });
-          return Response.json({ ok: true, value: undefined });
-        }),
-      });
-    });
+
+  it("saves and restores Task launch settings without sending the Task", async () => {
+    const host = terminalHost();
+    const dom = await mountPanel((bootstrap) => {
+      bootstrap.targets.projects = [{
+        id: "repo:current-project", name: "current-project", environmentId: "local",
+        worktreeId: "worktree-current", path: "/workspace/current", branch: "main", current: true,
+      }];
+    }, host.configure);
     try {
       const { document, Event } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
       document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-design"]')?.click();
       document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
-      let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      const model = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="model"]');
+      const model = document.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="model"]');
       if (model) {
         model.value = "claude-opus-5";
         model.dispatchEvent(new Event("change", { bubbles: true }));
       }
-      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      const saveButton = dialog?.querySelector<HTMLButtonElement>('[data-action="save-task-run-settings"]');
-      expect(saveButton?.textContent).toBe("저장");
-      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.textContent).toContain("실행 시작");
-      saveButton?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      document.querySelector<HTMLButtonElement>('[data-action="save-task-run-settings"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 1);
 
-      const saveRequest = requests.find((request) => request.type === "save");
-      expect(saveRequest?.rebuildPanel).toBe(false);
-      const savedTask = saveRequest?.store.tasks.find((task: any) => task.id === "task-design");
-      expect(savedTask?.metadata?.orcaGraphRunSettings).toMatchObject({
-        schemaVersion: 1,
-        routing: { model: "claude-opus-5" },
-        executionMode: "single_session",
-      });
-      expect(requests.some((request) => request.type === "start-task-execution")).toBe(false);
+      const decoded = host.commands.map(decodeCommand);
+      // 저장만 한다. 설정을 남기려고 세션을 깨우지 않는다.
+      expect(decoded.map((entry) => entry.command)).toEqual(["save"]);
       expect(document.querySelector('[role="dialog"]')).toBeNull();
+      expect(document.querySelector(".execution-manager")).toBeNull();
 
+      // 다시 열면 저장된 설정이 그대로 복원된다.
       document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
-      expect(document.querySelector<HTMLSelectElement>('[role="dialog"] [data-scope="task-run-routing"][data-field="model"]')?.value).toBe("claude-opus-5");
+      expect(document.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="model"]')?.value)
+        .toBe("claude-opus-5");
     } finally {
       dom.window.close();
     }
   });
 
-  it("starts a structured Graph without committing and rebuilding the panel first", async () => {
-    const requests: any[] = [];
-    const now = "2026-08-11T00:00:00.000Z";
-    const dom = await mountPanel(wide, (bootstrap) => {
-      const liveBootstrap = bootstrap as typeof bootstrap & { bridgeApiUrl: string; dataSource: Record<string, unknown> };
-      liveBootstrap.bridgeApiUrl = "/test/api";
-      liveBootstrap.dataSource = {
-        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
-        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
-        capabilities: { execution: { mode: "remote-claim", nodeKinds: ["task", "condition", "graph_call"] } },
-      };
-      const graph = bootstrap.store.graphs[0];
-      graph.nodes = [graph.nodes.find((node: any) => node.id === "node-design")];
-      graph.edges = [];
-      graph.defaults = { environmentId: "local", model: "gpt-5.6-sol" };
-    }, (window) => {
-      Object.defineProperty(window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          const request = JSON.parse(String(init.body));
-          requests.push(request);
-          if (request.type === "start-graph-execution") return Response.json({ ok: true, value: {
-            id: "exec-structured", itemKind: "graph", itemId: request.graphId, title: "Structured Graph", status: "queued",
-            executionMode: "single_session", createdAt: now, updatedAt: now,
-            progress: { completed: 0, failed: 0, total: 4 }, targets: [],
-          } });
-          return Response.json({ ok: true, value: undefined });
-        }),
-      });
-    });
+
+  it("saves the graph, then sends it to the selected session as one command each", async () => {
+    const host = terminalHost();
+    const dom = await mountPanel(({ targets }) => {
+      targets.projects = [{ id: "repo:current-project", name: "current-project", environmentId: "local", worktreeId: "worktree-current", current: true }];
+    }, host.configure);
     try {
       const { document } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
-      const confirm = document.querySelector<HTMLButtonElement>('[data-action="confirm-run"]');
-      expect(confirm?.disabled, document.querySelector('[role="dialog"]')?.textContent ?? "run dialog missing").toBe(false);
-      confirm?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(requests.some((request) => request.type === "save")).toBe(false);
-      const startRequest = requests.find((request) => request.type === "start-graph-execution");
-      expect(startRequest?.graphId).toBe("graph-orca-demo");
-      expect(startRequest?.openWide).toBe(wide ? undefined : true);
-      expect(document.querySelector(".execution-manager")).not.toBeNull();
+      document.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 2);
+
+      const decoded = host.commands.map(decodeCommand);
+      // 저장이 먼저다. 보낸 프롬프트가 저장되지 않은 그래프를 가리키면 세션이 읽는
+      // 정본과 패널이 보여 주는 것이 갈린다.
+      expect(decoded.map((entry) => entry.command)).toEqual(["save", "dispatch"]);
+      const dispatch = decoded[1]!.payload;
+      expect(dispatch.itemKind).toBe("graph");
+      expect(dispatch.itemId).toBe("graph-orca-demo");
+      expect(dispatch.prompt).toContain("이 그래프를 실행하십시오");
+      expect(dispatch.prompt).toContain("RESULT: done");
+      expect(dispatch.targets).toHaveLength(1);
+      expect(dispatch.targets[0]).toMatchObject({ projectId: "repo:current-project", worktreeId: "worktree-current" });
+
+      // 보낸 사실은 즉시 실행 현황에 남는다.
+      expect(document.querySelector(".execution-manager")?.textContent).toContain("graph-orca-demo");
     } finally {
       dom.window.close();
     }
   });
 
-  it("shows commercial-grade execution states on graph nodes during a run", async () => {
-    const dom = await mountPanel(wide, (bootstrap) => {
-      bootstrap.store.graphs[0].nodes[0].status = "running";
-      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [{
-        id: "exec-graph-running", itemKind: "graph", itemId: "graph-orca-demo", title: "실행 중 그래프", status: "running",
-        executionMode: "single_session", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:00:01.000Z",
-        progress: { completed: 0, failed: 0, total: 4 },
-        targets: [{ id: "target-1", label: "current-project", status: "running", environmentId: "local", projectId: "current-project", branch: "main", model: "gpt-5.6-sol" }],
-      }];
+
+  it("draws node status from the graph and its run history, never from a guess", async () => {
+    const dom = await mountPanel(({ store }) => {
+      const graph = store.graphs.find((item: any) => item.id === "graph-orca-demo");
+      graph.nodes[0].status = "done";
+      if (graph.nodes[1]) graph.nodes[1].status = "failed";
     });
     try {
       const { document } = dom.window;
-      const runningNode = document.querySelector<HTMLElement>('.node[data-node-id="node-design"]');
-      const queuedNode = document.querySelector<HTMLElement>('.node[data-node-id="node-quality"]');
-      expect(runningNode?.classList.contains("execution-running")).toBe(true);
-      expect(runningNode?.querySelector(".node-execution-chip.running")?.textContent).toContain("실행 중");
-      expect(runningNode?.querySelector(".node-run-meta.status-running")?.textContent).toContain("실행 중");
-      expect(queuedNode?.classList.contains("execution-queued")).toBe(true);
-      expect(queuedNode?.querySelector(".node-execution-chip.queued")?.textContent).toContain("실행 대기");
-      expect(queuedNode?.getAttribute("aria-label")).toContain("실행 상태 실행 대기");
+      const nodes = [...document.querySelectorAll<HTMLElement>(".node[data-node-id]")];
+      expect(nodes[0]?.className).toContain("execution-done");
+      expect(nodes[1]?.className).toContain("execution-failed");
+      // pending 노드를 "실행 대기"로 바꿔 부르지 않는다 — 큐가 없기 때문이다.
+      expect(document.querySelector(".execution-queued")).toBeNull();
+      expect(document.body.textContent).not.toContain("실행 대기");
     } finally {
       dom.window.close();
     }
   });
 
   it("offers a confirmed Task delete action that preserves recoverable history", async () => {
-    const dom = await mountPanel(wide);
+    const dom = await mountPanel();
     try {
       const { document } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
@@ -1107,7 +964,7 @@ describe.each([
   });
 
   it("keeps each management menu active after its own mutations", async () => {
-    const dom = await mountPanel(wide);
+    const dom = await mountPanel();
     try {
       const { document } = dom.window;
       const expectManager = (mode: "domains" | "milestones" | "tasks" | "todos", label: string): void => {
@@ -1143,7 +1000,7 @@ describe.each([
   });
 
   it("shows active Todos by default while preserving completed and cancelled history", async () => {
-    const dom = await mountPanel(wide, (bootstrap) => {
+    const dom = await mountPanel((bootstrap) => {
       const now = "2026-08-09T00:00:00.000Z";
       const statuses = [
         ...Array<"open">(21).fill("open"),
@@ -1198,7 +1055,7 @@ describe.each([
   });
 
   it("manages Domain and Milestone scopes and filters grouped Task lists", async () => {
-    const dom = await mountPanel(wide);
+    const dom = await mountPanel();
     try {
       const { document, Event } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="domains"]')?.click();
@@ -1283,41 +1140,36 @@ describe.each([
     }
   });
 
-  it("keeps human Draft and Meta Draft separate and exposes explicit skill generation", async () => {
-    const dom = await mountPanel(wide, ({ store }) => {
-      const now = "2026-08-09T00:00:00.000Z";
-      store.tasks = [{
-        id: "task-prompt", title: "Prompt task", prompt: "old meta", draft: "human request", metaDraft: "old meta",
-        promptRevisions: [
-          { id: "draft-1", kind: "draft", revision: 1, content: "human request", status: "current", generator: "human", createdAt: now },
-          { id: "meta-2", kind: "meta", revision: 2, content: "old meta", status: "current", basedOnId: "draft-1", generator: "meta-prompt-agent", createdAt: now },
-        ],
-        status: "ready", priority: "medium", tags: [], createdAt: now, updatedAt: now,
-      }];
-    });
+
+  it("keeps human Draft and Meta Draft separate and both hand-editable", async () => {
+    const dom = await mountPanel();
     try {
       const { document, Event } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
-      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-prompt"]')?.click();
-      const draft = document.querySelector<HTMLTextAreaElement>('[data-scope="local-task"][data-field="draft"]');
-      const meta = document.querySelector<HTMLTextAreaElement>(".prompt-editor.meta");
-      expect(draft?.value).toBe("human request");
-      expect(meta?.value).toBe("old meta");
-      expect(meta?.readOnly).toBe(true);
-      expect(document.querySelector('[data-action="request-meta-prompt"]')?.textContent).toContain("다시 만들기");
-      if (draft) {
-        draft.value = "changed human request";
-        draft.dispatchEvent(new Event("change", { bubbles: true }));
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
+      const pair = document.querySelector<HTMLElement>('[aria-label="Draft와 Meta Draft"]');
+      expect(pair).not.toBeNull();
+      const draft = pair?.querySelector<HTMLTextAreaElement>('[data-field="draft"]');
+      const meta = pair?.querySelector<HTMLTextAreaElement>('[data-field="metaDraft"]');
+      expect(draft).not.toBeNull();
+      // Meta Draft는 이제 사람이 직접 쓴다. 읽기 전용으로 두면 편집할 방법이 없다.
+      expect(meta?.readOnly).toBe(false);
+      expect(pair?.textContent).toContain("Meta Draft를 비워 두면");
+      // 별도 세션을 띄우는 생성 버튼은 없다.
+      expect(document.querySelector('[data-action="request-meta-prompt"]')).toBeNull();
+
+      if (meta) {
+        meta.value = "정제된 실행 프롬프트";
+        meta.dispatchEvent(new Event("change", { bubbles: true }));
       }
-      expect(document.querySelector(".prompt-pair")?.textContent).toContain("원문 변경됨");
-      expect(document.querySelector(".prompt-history")?.textContent).toContain("Prompt 이력 3");
+      expect(document.querySelector('.topbar .status-pill.warn')?.textContent).toContain("저장 안 됨");
     } finally {
       dom.window.close();
     }
   });
 
   it("renders condition nodes as real diamonds with size-aware edges", async () => {
-    const dom = await mountProductionPanel(wide);
+    const dom = await mountProductionPanel();
     try {
       const { document } = dom.window;
       const condition = document.querySelector<HTMLElement>(".node.condition");
@@ -1345,7 +1197,7 @@ describe.each([
   });
 
   it("drags nodes from the body as well as the edge", async () => {
-    const dom = await mountPanel(wide);
+    const dom = await mountPanel();
     try {
       const { document, MouseEvent } = dom.window;
       const node = document.querySelector<HTMLElement>(".node");
@@ -1370,7 +1222,7 @@ describe.each([
   });
 
   it("exposes both data source modes and blocks split-brain structured execution", async () => {
-    const dom = await mountPanel(wide, (bootstrap) => {
+    const dom = await mountPanel((bootstrap) => {
       (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
         config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
         status: "ready",
@@ -1410,17 +1262,18 @@ describe.each([
         folderMode.dispatchEvent(new Event("change", { bubbles: true }));
       }
       document.querySelector<HTMLElement>('[role="dialog"]')?.querySelector<HTMLButtonElement>('[data-action="close-modal"]')?.click();
+      // 실행은 대상 세션의 에이전트가 수행하므로 원천의 실행 지원 여부는 더 이상
+      // 실행을 막는 조건이 아니다. 막는 것은 그래프 구조가 실제로 잘못됐을 때뿐이다.
       document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
       const runDialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      expect(runDialog?.textContent).toContain("데이터 원천이 Orca 원격 실행을 지원하지 않습니다");
-      expect(runDialog?.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.disabled).toBe(true);
+      expect(runDialog?.textContent).not.toContain("원격 실행을 지원하지 않습니다");
     } finally {
       dom.window.close();
     }
   });
 
-  it("blocks model/bridge policy errors in the run modal", async () => {
-    const dom = await mountPanel(wide, ({ store }) => {
+  it("blocks model policy errors in the run modal", async () => {
+    const dom = await mountPanel(({ store }) => {
       const graph = store.graphs[0];
       graph.edges = [{ id: "policy-edge", from: "retrying", to: "networked", kind: "sequence" }];
       graph.nodes = [
@@ -1449,9 +1302,8 @@ describe.each([
   });
 
   it("keeps Run visible and configures per-node routing with automatic conditions", async () => {
-    const dom = await mountPanel(wide, ({ store, targets }) => {
-      store.bridgeWorkspace = "current-project";
-      targets.projects = [{ id: "repo:current-project", name: "current-project", worktreeId: "worktree-current-project" }];
+    const dom = await mountPanel(({ store, targets }) => {
+      targets.projects = [{ id: "repo:current-project", name: "current-project", worktreeId: "worktree-current-project", current: true }];
       const graph = store.graphs[0];
       graph.defaults = {};
       delete graph.engineering;
@@ -1506,7 +1358,7 @@ describe.each([
   });
 
   it("does not offer Claude-unsupported reasoning for a new session", async () => {
-    const dom = await mountPanel(wide, ({ store }) => {
+    const dom = await mountPanel(({ store }) => {
       store.graphs[0].defaults = { projectId: "project", model: "claude-opus-5" };
     });
     try {
@@ -1520,7 +1372,7 @@ describe.each([
   });
 
   it("sanitizes hidden existing-session reasoning overrides before execution", async () => {
-    const dom = await mountPanel(wide, ({ store, targets }) => {
+    const dom = await mountPanel(({ store, targets }) => {
       targets.sessions = [{
         id: "claude-session",
         title: "Claude session",
@@ -1556,7 +1408,7 @@ describe.each([
   });
 
   it("supports keyboard graph selection, dialog focus lifecycle, and live announcements", async () => {
-    const dom = await mountProductionPanel(wide);
+    const dom = await mountProductionPanel();
     const { document } = dom.window;
     try {
       const node = document.querySelector<HTMLElement>('[data-node-id][role="button"]');
@@ -1626,7 +1478,7 @@ describe.each([
       expect(document.activeElement).toBe(document.querySelectorAll('[data-action="toggle-layout"]')[0]);
 
       const runOpeners = [...document.querySelectorAll<HTMLButtonElement>('[data-action="open-run"]')];
-      const runOpener = runOpeners[wide ? 0 : 1] ?? runOpeners[0];
+      const runOpener = runOpeners[0];
       expect(runOpener).toBeDefined();
       runOpener?.focus();
       runOpener?.click();
@@ -1644,14 +1496,14 @@ describe.each([
       if (first) key(dom, first, "Tab", true);
       expect(document.activeElement).toBe(last);
       const currentRunOpeners = [...document.querySelectorAll<HTMLButtonElement>('[data-action="open-run"]')];
-      const currentRunOpener = currentRunOpeners[wide ? 0 : 1] ?? currentRunOpeners[0];
+      const currentRunOpener = currentRunOpeners[0];
       currentRunOpener?.focus();
       if (currentRunOpener) key(dom, currentRunOpener, "Tab");
       expect(document.activeElement).toBe(first);
       if (last) key(dom, last, "Escape");
       expect(document.querySelector('[role="dialog"]')).toBeNull();
       const restoredRunOpeners = [...document.querySelectorAll<HTMLButtonElement>('[data-action="open-run"]')];
-      expect(document.activeElement).toBe(restoredRunOpeners[wide ? 0 : 1] ?? restoredRunOpeners[0]);
+      expect(document.activeElement).toBe(restoredRunOpeners[0]);
 
       expect(document.querySelector('[data-action="open-plan"]')).toBeNull();
 
@@ -1668,7 +1520,7 @@ describe.each([
   });
 
   it("supports multi-selection, full history, edge reconnection, and a read-only run view", async () => {
-    const dom = await mountPanel(wide);
+    const dom = await mountPanel();
     try {
       const { document, Event, MouseEvent } = dom.window;
       document.querySelector<HTMLElement>('.node[data-node-id="node-design"]')?.click();
@@ -1723,7 +1575,7 @@ describe.each([
   });
 
   it("opens the node editor from a real pointer selection and links to full Task editing", async () => {
-    const dom = await mountPanel(wide);
+    const dom = await mountPanel();
     try {
       const { document, Event, MouseEvent } = dom.window;
       const node = document.querySelector<HTMLElement>('.node[data-node-id="node-design"]');
@@ -1744,7 +1596,7 @@ describe.each([
       expect(document.querySelectorAll('[data-scope="node-routing"][data-field="projectId"]')).toHaveLength(1);
       expect(document.querySelectorAll('[data-scope="node-routing"][data-field="sessionId"]')).toHaveLength(1);
       expect(document.querySelectorAll('[data-scope="node-routing"][data-field="model"]')).toHaveLength(1);
-      expect(document.querySelector('[data-action="request-meta-prompt"]')).not.toBeNull();
+      expect(document.querySelector('[data-inspector-panel="task"] [data-scope="local-task"][data-field="metaDraft"]')).not.toBeNull();
       const nodeDraft = document.querySelector<HTMLTextAreaElement>('[data-inspector-panel="task"] [data-scope="local-task"][data-field="draft"]');
       expect(nodeDraft?.value).toContain("요구사항을 분석");
       if (nodeDraft) {
@@ -1784,7 +1636,7 @@ describe.each([
   });
 
   it("separates graph lifecycle from run health and can close a stale running record", async () => {
-    const dom = await mountPanel(wide, ({ store }) => {
+    const dom = await mountPanel(({ store }) => {
       const graph = store.graphs[0];
       graph.status = "running";
       graph.nodes.forEach((node: Record<string, unknown>) => { node.status = "pending"; });
@@ -1812,7 +1664,7 @@ describe.each([
   });
 
   it("navigates graph calls and exposes groups, problems, search, and semantic zoom", async () => {
-    const dom = await mountPanel(wide);
+    const dom = await mountPanel();
     try {
       const { document, Event } = dom.window;
       document.querySelector<HTMLElement>('.node[data-node-id="node-quality-graph-call"]')?.click();
@@ -1849,10 +1701,11 @@ describe.each([
 });
 
 describe("work process and branch execution surface", () => {
+
   it("assigns one graph by project without exposing node-by-node routing", async () => {
     const now = "2026-08-10T00:00:00.000Z";
-    const requests: any[] = [];
-    const dom = await mountPanel(true, (bootstrap) => {
+    const host = terminalHost();
+    const dom = await mountPanel((bootstrap) => {
       const graph = bootstrap.store.graphs[0];
       graph.defaults = { environmentId: "local", projectId: "project-api", branch: "main", model: "gpt-5.6-sol" };
       graph.nodes = [
@@ -1874,22 +1727,7 @@ describe("work process and branch execution surface", () => {
         { id: "api-main", branch: "main", environmentId: "local", projectId: "project-api", worktreeId: "wt-api", path: "/workspace/api" },
         { id: "web-release", branch: "release", environmentId: "local", projectId: "project-web", worktreeId: "wt-web", path: "/workspace/web" },
       ];
-    }, (window) => {
-      Object.defineProperty(window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          const request = JSON.parse(String(init.body));
-          requests.push(request);
-          if (request.type === "save") return Response.json({ ok: true, value: { mode: "local", store: request.store } });
-          if (request.type === "start-graph-execution") return Response.json({ ok: true, value: undefined });
-          if (request.type === "execution-status") return Response.json({ ok: true, value: { executions: [{
-            id: "exec-graph", itemKind: "graph", itemId: request.graphId ?? "graph-orca-demo", title: "Graph", status: "running", executionMode: "per_project",
-            createdAt: now, updatedAt: now, progress: { completed: 0, failed: 0, total: 2 }, targets: [],
-          }] } });
-          return Response.json({ ok: true, value: undefined });
-        }),
-      });
-    });
+    }, host.configure);
     try {
       const { document, Event } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
@@ -1899,25 +1737,25 @@ describe("work process and branch execution surface", () => {
       expect(document.querySelectorAll(".task-project-run-card")).toHaveLength(2);
       expect(document.querySelector("[role=dialog]")?.textContent).not.toContain("노드별 실행 대상");
       document.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(requests.find((request) => request.type === "start-graph-execution")).toMatchObject({
-        executionMode: "per_project",
-        projectSessions: [
-          { locator: "/workspace/api", routing: { environmentId: "local", projectId: "project-api", branch: "main", model: "gpt-5.6-sol" } },
-          { locator: "/workspace/web", routing: { environmentId: "local", projectId: "project-web", branch: "release", model: "gpt-5.6-sol" } },
-        ],
-      });
-      expect(requests).toContainEqual({ type: "execution-status" });
+      await settle(dom);
+      await waitForCommands(host, 2);
+
+      const dispatch = host.commands.map(decodeCommand).find((entry) => entry.command === "dispatch")?.payload;
+      // 프로젝트마다 자기 워크트리로 간다. 하나의 라우팅으로 접으면 다른 프로젝트의
+      // 작업이 엉뚱한 체크아웃에서 돈다.
+      expect(dispatch?.executionMode).toBe("per_project");
+      expect(dispatch?.targets).toMatchObject([
+        { locator: "/workspace/api", projectId: "project-api", branch: "main", worktreeId: "wt-api" },
+        { locator: "/workspace/web", projectId: "project-web", branch: "release", worktreeId: "wt-web" },
+      ]);
       expect(document.querySelector(".execution-manager")).not.toBeNull();
-      expect(document.querySelector(".execution-manager")?.textContent).toContain("Graph");
     } finally {
       dom.window.close();
     }
   });
 
   it("shows the process badge, saved run input, and Orca worktree branches", async () => {
-    const dom = await mountPanel(true, (bootstrap) => {
+    const dom = await mountPanel((bootstrap) => {
       (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
         config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
         status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
@@ -1964,7 +1802,7 @@ describe("work process and branch execution surface", () => {
   });
 
   it("does not offer an unsupported resume path for a local process graph", async () => {
-    const dom = await mountPanel(true, ({ store }) => {
+    const dom = await mountPanel(({ store }) => {
       const graph = store.graphs[0];
       graph.processEnabled = true;
       graph.defaults = { projectId: "project", model: "gpt-5.6-sol" };
@@ -1987,444 +1825,134 @@ describe("work process and branch execution surface", () => {
 });
 
 describe("structured source work editing", () => {
-  it("refreshes the same-origin wide panel through the bridge response API", async () => {
-    const now = "2026-08-10T00:00:00.000Z";
-    const requests: any[] = [];
-    let refreshedStore: Record<string, any> | null = null;
-    const dom = await mountPanel(true, (bootstrap) => {
-      bootstrap.store.tasks = [{
-        id: "TASK-refresh", version: 3, title: "새로고침 전", prompt: "work", draft: "work",
-        promptRevisions: [], status: "backlog", priority: "medium", tags: [], createdAt: now, updatedAt: now,
-      }];
-      (bootstrap as typeof bootstrap & { bridgeApiUrl: string; dataSource: Record<string, unknown> }).bridgeApiUrl =
-        "http://127.0.0.1:61234/test/api";
-      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
-        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
-        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
-        capabilities: { taskMutation: true },
-      };
-      refreshedStore = structuredClone(bootstrap.store);
-      refreshedStore.tasks[0].title = "새로고침 후";
-      refreshedStore.tasks[0].version = 4;
-    }, (window) => {
-      Object.defineProperty(window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          const request = JSON.parse(String(init.body));
-          requests.push(request);
-          return Response.json({ ok: true, value: {
-            mode: "structured", status: "ready", catalog: [], store: refreshedStore,
-          } });
-        }),
-      });
-    });
-    try {
-      const { document } = dom.window;
-      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
-      expect(document.querySelector('[aria-label="Task 관리"]')?.textContent).toContain("새로고침 전");
-      document.querySelector<HTMLButtonElement>('.topbar [data-action="refresh-source"]')?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(requests).toContainEqual({ type: "refresh-source", graphId: expect.any(String) });
-      expect(document.querySelector('[aria-label="Task 관리"]')?.textContent).toContain("새로고침 후");
-      expect(document.querySelector('.toast[role="status"]')?.textContent).toContain("데이터 원천을 새로고침했습니다");
-    } finally {
-      dom.window.close();
-    }
-  });
 
-  it("creates a quick graph with the last-read Task CAS version and ordered IDs", async () => {
-    const now = "2026-08-10T00:00:00.000Z";
-    const requests: any[] = [];
-    let createdStore: Record<string, any> | null = null;
-    const dom = await mountPanel(true, (bootstrap) => {
-      bootstrap.store.tasks = [
-        { id: "TASK-source", version: 4, title: "Source", prompt: "source prompt", draft: "source prompt", promptRevisions: [], domainId: "DOMAIN-a", milestoneId: "MILESTONE-a", status: "ready", priority: "medium", tags: [], createdAt: now, updatedAt: now },
-        { id: "TASK-next", version: 2, title: "Next", prompt: "next prompt", draft: "next prompt", promptRevisions: [], domainId: "DOMAIN-a", milestoneId: "MILESTONE-a", status: "backlog", priority: "medium", tags: [], createdAt: now, updatedAt: now },
+  it("builds a quick graph locally so it is saved through the one save path", async () => {
+    const host = terminalHost();
+    const dom = await mountPanel(({ store }) => {
+      const now = "2026-08-11T00:00:00.000Z";
+      store.tasks = [
+        { id: "task-a", title: "1차", prompt: "A", draft: "A", promptRevisions: [], status: "ready", priority: "medium", tags: [], version: 4, createdAt: now, updatedAt: now },
+        { id: "task-b", title: "2차", prompt: "B", draft: "B", promptRevisions: [], status: "ready", priority: "medium", tags: [], version: 2, createdAt: now, updatedAt: now },
       ];
-      (bootstrap as typeof bootstrap & { bridgeApiUrl: string; dataSource: Record<string, unknown> }).bridgeApiUrl = "/test/api";
-      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
-        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
-        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
-        capabilities: { graphCommit: true, taskMutation: true },
-      };
-      createdStore = structuredClone(bootstrap.store);
-      const quick = { ...structuredClone(createdStore.graphs[0]), id: "GRAPH-quick", name: "검수 흐름", version: 1, nodes: [], edges: [] };
-      createdStore.graphs.push(quick);
-      createdStore.activeGraphId = quick.id;
-    }, (window) => {
-      Object.defineProperty(window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          const request = JSON.parse(String(init.body));
-          requests.push(request);
-          if (request.type === "task-project-context") {
-            return Response.json({ ok: true, value: {
-              taskId: "TASK-source", taskVersion: 9, projects: [], registry: [], recommended: [],
-              environment: "device-a", current: null,
-            } });
-          }
-          if (request.type === "create-quick-graph") {
-            return Response.json({ ok: true, value: { graphId: "GRAPH-quick", store: createdStore } });
-          }
-          return Response.json({ ok: true, value: undefined });
-        }),
-      });
-    });
+    }, host.configure);
     try {
       const { document, Event } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
-      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="TASK-source"]')?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      document.querySelector<HTMLButtonElement>('[data-action="open-quick-graph"]')?.click();
-      document.querySelector<HTMLButtonElement>('[data-action="toggle-quick-graph-task"][data-id="TASK-next"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-a"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-quick-graph"][data-id="task-a"]')?.click();
       const name = document.querySelector<HTMLInputElement>('[data-action="quick-graph-name"]');
-      if (name) {
-        name.value = "검수 흐름";
-        name.dispatchEvent(new Event("input", { bubbles: true }));
-      }
+      if (name) { name.value = "검수 흐름"; name.dispatchEvent(new Event("input", { bubbles: true })); }
+      document.querySelector<HTMLElement>('[role="dialog"]')
+        ?.querySelector<HTMLInputElement>('[data-action="toggle-quick-graph-task"][data-id="task-b"]')?.click();
       document.querySelector<HTMLButtonElement>('[data-action="confirm-quick-graph"]')?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await settle(dom);
 
-      expect(requests.find((request) => request.type === "create-quick-graph")).toEqual({
-        type: "create-quick-graph",
-        sourceTaskId: "TASK-source",
-        expectedTaskVersion: 9,
-        name: "검수 흐름",
-        taskIds: ["TASK-source", "TASK-next"],
-      });
-      expect(document.querySelector<HTMLElement>('[role="dialog"]')).toBeNull();
-      expect(document.querySelector<HTMLSelectElement>(".graph-switcher")?.value).toBe("GRAPH-quick");
-    } finally {
-      dom.window.close();
-    }
-  });
-
-  it("creates or reuses a Task and opens its detail without opening a run dialog", async () => {
-    let preparedStore: Record<string, any> | null = null;
-    const dom = await mountPanel(true, (bootstrap) => {
-      const now = "2026-08-10T00:00:00.000Z";
-      bootstrap.store.tasks = [];
-      bootstrap.store.todos = [{
-        id: "TODO-quick", version: 8, title: "  원문 Todo  ", notes: "메모", draft: "  원문 Todo  ",
-        promptRevisions: [], status: "open", priority: "medium", tags: [],
-        createdAt: now, updatedAt: now,
-      }];
-      bootstrap.targets.projects = [{
-        id: "repo:work", name: "work", path: "/workspace/work", environmentId: "local",
-        worktreeId: "wt-main", branch: "refs/heads/main",
-      }];
-      bootstrap.targets.branches = [{
-        id: "branch:main", branch: "refs/heads/main", environmentId: "local",
-        projectId: "repo:work", repoId: "repo-work", worktreeId: "wt-main",
-      }];
-      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
-        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
-        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
-        capabilities: { taskMutation: true, todoMutation: true },
-      };
-      preparedStore = structuredClone(bootstrap.store);
-      preparedStore.tasks = [{
-        id: "TASK-from-todo", version: 1, title: "원문 Todo", prompt: "  원문 Todo  ", draft: "  원문 Todo  ",
-        promptRevisions: [], status: "backlog", priority: "medium", tags: [], createdAt: now, updatedAt: now,
-      }];
-      preparedStore.todos[0].taskId = "TASK-from-todo";
-    });
-    try {
-      const requests: any[] = [];
-      Object.defineProperty(dom.window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          const request = JSON.parse(String(init.body));
-          requests.push(request);
-          const value = request.type === "create-todo-task"
-            ? { taskId: "TASK-from-todo", store: preparedStore }
-            : request.type === "task-project-context" ? {
-                taskId: "TASK-from-todo", taskVersion: 1, projects: [], registry: [], recommended: [],
-                environment: "device-a", current: null,
-              } : undefined;
-          return Response.json({ ok: true, value });
-        }),
-      });
-      const { document } = dom.window;
-      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
-      document.querySelector<HTMLButtonElement>('[data-action="create-task-for-todo"][data-id="TODO-quick"]')?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      const prepare = requests.find((request) => request.type === "create-todo-task");
-      expect(prepare).toMatchObject({ type: "create-todo-task", todoId: "TODO-quick" });
-      expect(prepare.idempotencyKey).toBe("todo-task-00000000-0000-4000-8000-000000000000");
-      expect(document.querySelector<HTMLElement>('[role="dialog"]')).toBeNull();
-      expect(document.querySelector<HTMLElement>('[aria-label="Task 상세"]')?.textContent).toContain("TASK-from-todo");
-    } finally {
-      dom.window.close();
-    }
-  });
-
-  it("queries the linked Task memberships before showing the worktree Graph picker", async () => {
-    let refreshedStore: Record<string, any> | null = null;
-    const dom = await mountPanel(true, (bootstrap) => {
-      const now = "2026-08-10T00:00:00.000Z";
-      bootstrap.store.todos = [{
-        id: "TODO-graph", version: 3, title: "Graph 선택", notes: "1차 진행중", draft: "Graph 선택",
-        promptRevisions: [], status: "open", priority: "medium", tags: [], taskId: "task-design", createdAt: now, updatedAt: now,
-      }];
-      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
-        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
-        status: "ready", source: { id: "workspace", name: `${["under", "joy"].join("")}-workspace` }, catalog: [],
-        capabilities: { taskMutation: true, todoMutation: true },
-      };
-      refreshedStore = structuredClone(bootstrap.store);
-    });
-    try {
-      const requests: any[] = [];
-      Object.defineProperty(dom.window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          const request = JSON.parse(String(init.body));
-          requests.push(request);
-          const value = request.type === "todo-graph-choices" ? {
-            taskId: "task-design", taskTitle: "요구사항 설계",
-            graphs: [{ id: "graph-main", name: "MR 코드리뷰", status: "active" }],
-            store: refreshedStore,
-          } : undefined;
-          return Response.json({ ok: true, value });
-        }),
-      });
-      const { document } = dom.window;
-      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
-      document.querySelector<HTMLButtonElement>('[data-action="choose-todo-graph"][data-id="TODO-graph"]')?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(requests).toContainEqual({ type: "todo-graph-choices", todoId: "TODO-graph" });
-      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      expect(dialog?.textContent).toContain("워크트리 Graph 선택");
-      expect(dialog?.textContent).toContain("MR 코드리뷰");
-    } finally {
-      dom.window.close();
-    }
-  });
-
-  it("explains that a linked Task must be added to a Graph before worktree selection", async () => {
-    const dom = await mountPanel(true, (bootstrap) => {
-      const now = "2026-08-10T00:00:00.000Z";
-      bootstrap.store.todos = [{
-        id: "TODO-no-graph", version: 2, title: "Graph 없는 Task", notes: "", draft: "Graph 연결 필요",
-        promptRevisions: [], status: "open", priority: "medium", tags: [], taskId: "task-design", createdAt: now, updatedAt: now,
-      }];
-      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
-        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
-        status: "ready", source: { id: "workspace", name: `${["under", "joy"].join("")}-workspace` }, catalog: [],
-        capabilities: { taskMutation: true, todoMutation: true },
-      };
-    }, (window) => {
-      Object.defineProperty(window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          const request = JSON.parse(String(init.body));
-          const value = request.type === "todo-graph-choices"
-            ? { taskId: "task-design", taskTitle: "요구사항 설계", graphs: [] }
-            : undefined;
-          return Response.json({ ok: true, value });
-        }),
-      });
-    });
-    try {
-      const { document } = dom.window;
-      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
-      document.querySelector<HTMLButtonElement>('[data-action="choose-todo-graph"][data-id="TODO-no-graph"]')?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(document.querySelector<HTMLElement>('[role="dialog"]')).toBeNull();
-      expect(document.querySelector<HTMLElement>(".toast")?.textContent).toContain("Task를 Graph에 먼저 추가하십시오");
-    } finally {
-      dom.window.close();
-    }
-  });
-
-  it("selects multiple registered Orca project and actual worktree branch bundles", async () => {
-    const dom = await mountPanel(true, (bootstrap) => {
-      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
-        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
-        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
-        capabilities: { taskMutation: true },
-      };
-    });
-    try {
-      const requests: any[] = [];
-      Object.defineProperty(dom.window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          const request = JSON.parse(String(init.body));
-          requests.push(request);
-          if (request.type === "task-project-context") {
-            return Response.json({ ok: true, value: {
-              taskId: request.taskId, taskVersion: 4, projects: [], environment: "device-a",
-              current: { repoId: "repo-a", path: "/workspace/a", branch: "refs/heads/main" },
-              recommended: [{
-                name: "Project A", path: "/workspace/a", environment: "device-a", repo_id: "repo-a",
-                worktrees: [
-                  { id: "wt-feature", path: "/workspace/a-feature", branch: "feature/review", display_name: "review" },
-                  { id: "wt-main", path: "/workspace/a", branch: "main", display_name: "main", is_main: true },
-                ],
-              }],
-              registry: [{
-                name: "Project A", path: "/workspace/a", environment: "device-a", repo_id: "repo-a",
-                worktrees: [
-                  { id: "wt-feature", path: "/workspace/a-feature", branch: "feature/review", display_name: "review" },
-                  { id: "wt-main", path: "/workspace/a", branch: "main", display_name: "main", is_main: true },
-                ],
-              }, {
-                name: "Project B", path: "/workspace/b", environment: "device-a", repo_id: "repo-b",
-                worktrees: [{ id: "wt-b", path: "/workspace/b", branch: "release", is_main: true }],
-              }],
-            } });
-          }
-          if (request.type === "connect-task-project-bundles") {
-            return Response.json({ ok: true, value: {
-              context: {
-                taskId: request.taskId, taskVersion: 5, registry: [], recommended: [], environment: "device-a", current: null,
-                projects: request.selections.map((selection: any, position: number) => ({
-                  role: "target", locatorKind: "folder", locator: selection.targetPath ?? selection.sourcePath,
-                  branch: selection.branch || undefined, position,
-                })),
-              },
-            } });
-          }
-          return Response.json({ ok: true, value: undefined });
-        }),
-      });
-      const { document, Event } = dom.window;
-      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
-      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      const projects = [...document.querySelectorAll<HTMLInputElement>('[data-action="toggle-task-project"]')];
-      expect(projects).toHaveLength(2);
-      expect(projects[0]?.checked).toBe(true);
-      expect(projects[0]?.closest("article")?.textContent).toContain("워크트리 2");
-      let branch = document.querySelector<HTMLSelectElement>('[data-scope="task-project-picker"][data-field="branch"][data-source-path="/workspace/a"]');
-      expect(branch?.value).toBe("main");
-      expect([...(branch?.options ?? [])].map((item) => item.textContent)).toEqual([
-        "브랜치 지정 안 함", "main · 기본", "feature/review",
+      // 원천에 별도 quick-create를 요청하지 않는다. 다른 편집과 같은 저장 경로다.
+      expect(host.commands).toEqual([]);
+      const switcher = document.querySelector<HTMLSelectElement>('[data-action="switch-graph"]');
+      expect([...(switcher?.options ?? [])].map((option) => option.textContent)).toContain("검수 흐름");
+      const nodes = [...document.querySelectorAll<HTMLElement>(".node[data-node-id]")];
+      expect(nodes).toHaveLength(2);
+      expect(nodes.map((node) => node.textContent)).toEqual([
+        expect.stringContaining("1차"), expect.stringContaining("2차"),
       ]);
+      expect(document.querySelector(".topbar .status-pill.warn")?.textContent).toContain("저장 안 됨");
 
-      projects[1]?.click();
-      branch = document.querySelector<HTMLSelectElement>('[data-scope="task-project-picker"][data-field="branch"][data-source-path="/workspace/b"]');
-      expect(branch?.value).toBe("release");
-      if (branch) {
-        branch.value = "";
-        branch.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-      document.querySelector<HTMLButtonElement>('[data-action="connect-task-projects"]')?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(requests.find((request) => request.type === "connect-task-project-bundles")).toMatchObject({
-        taskId: "task-design", environment: "device-a",
-        selections: [
-          { sourcePath: "/workspace/a", targetPath: "/workspace/a", branch: "main" },
-          { sourcePath: "/workspace/b", targetPath: "/workspace/b", branch: "" },
-        ],
-      });
+      document.querySelector<HTMLButtonElement>('[data-action="save"]')?.click();
+      await settle(dom);
+      const saved = host.commands.map(decodeCommand).find((entry) => entry.command === "save")?.payload;
+      expect(saved.graphs.map((graph: any) => graph.name)).toContain("검수 흐름");
     } finally {
       dom.window.close();
     }
   });
 
-  it("runs every Task target in its own project branch and model session", async () => {
-    const now = "2026-08-10T00:00:00.000Z";
-    const projectRows = [
-      { id: "TP-A", role: "target" as const, locatorKind: "folder" as const, locator: "/workspace/api", label: "API", branch: "main", position: 0 },
-      { id: "TP-B", role: "target" as const, locatorKind: "folder" as const, locator: "/workspace/web", label: "Web", branch: "release", position: 1 },
-    ];
-    const dom = await mountPanel(true, (bootstrap) => {
-      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
-        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
-        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
-        capabilities: { taskMutation: true },
-      };
+
+  it("creates or reuses a Todo Task locally and opens its detail", async () => {
+    const host = terminalHost();
+    const dom = await mountPanel(({ store }) => {
+      const now = "2026-08-11T00:00:00.000Z";
+      store.tasks = [];
+      store.todos = [{
+        id: "todo-source", title: "리뷰 반영", notes: "", draft: "리뷰 반영 작업",
+        promptRevisions: [], status: "open", priority: "medium", tags: [], version: 3, createdAt: now, updatedAt: now,
+      }];
+    }, host.configure);
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="create-task-for-todo"][data-id="todo-source"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 1);
+
+      // Task 생성은 다른 편집과 같은 저장 경로를 탄다. 별도 원천 왕복이 없다.
+      expect(host.commands.map(decodeCommand).map((entry) => entry.command)).toEqual(["save"]);
+      const detail = document.querySelector<HTMLElement>('[aria-label="Task 상세"]');
+      expect(detail?.textContent).toContain("리뷰 반영");
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+
+      // 같은 Todo에서 다시 눌러도 새 Task를 만들지 않고 연결된 Task를 연다.
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-linked-task"]')?.click();
+      await settle(dom);
+      expect(document.querySelector<HTMLElement>('[aria-label="Task 상세"]')?.textContent).toContain("리뷰 반영");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+
+  it("sends each Task target to its own project branch and model session", async () => {
+    const now = "2026-08-11T00:00:00.000Z";
+    const host = terminalHost();
+    const dom = await mountPanel((bootstrap) => {
       bootstrap.store.tasks = [{
-        id: "task-design", version: 7, title: "다중 프로젝트 실행", prompt: "API와 Web을 함께 수정",
-        draft: "API와 Web을 함께 수정", promptRevisions: [], status: "ready", priority: "medium", tags: [],
-        projects: projectRows, createdAt: "2026-08-10T00:00:00.000Z", updatedAt: "2026-08-10T00:00:00.000Z",
+        id: "task-multi", title: "다중 대상", prompt: "작업", draft: "작업", promptRevisions: [],
+        status: "ready", priority: "medium", tags: [], version: 5, createdAt: now, updatedAt: now,
+        projects: [
+          { id: "api-target", role: "target", locatorKind: "folder", locator: "/workspace/api", label: "API", branch: "main", position: 0 },
+          { id: "web-target", role: "target", locatorKind: "folder", locator: "/workspace/web", label: "Web", branch: "release", position: 1 },
+        ],
       }];
       bootstrap.targets.environments = [{ id: "local", name: "device-a", local: true, connected: true }];
       bootstrap.targets.projects = [
-        { id: "project-api", name: "API", environmentId: "local", repoId: "repo-api", worktreeId: "wt-api", path: "/workspace/api", branch: "main" },
-        { id: "project-web", name: "Web", environmentId: "local", repoId: "repo-web", worktreeId: "wt-web", path: "/workspace/web", branch: "release" },
+        { id: "project-api", name: "API", environmentId: "local", worktreeId: "wt-api", path: "/workspace/api", branch: "main" },
+        { id: "project-web", name: "Web", environmentId: "local", worktreeId: "wt-web", path: "/workspace/web", branch: "release" },
       ];
       bootstrap.targets.branches = [
-        { id: "branch-api", branch: "main", environmentId: "local", projectId: "project-api", repoId: "repo-api", worktreeId: "wt-api", path: "/workspace/api" },
-        { id: "branch-web", branch: "release", environmentId: "local", projectId: "project-web", repoId: "repo-web", worktreeId: "wt-web", path: "/workspace/web" },
+        { id: "api-main", branch: "main", environmentId: "local", projectId: "project-api", worktreeId: "wt-api", path: "/workspace/api" },
+        { id: "web-release", branch: "release", environmentId: "local", projectId: "project-web", worktreeId: "wt-web", path: "/workspace/web" },
       ];
-    });
+    }, host.configure);
     try {
-      const requests: any[] = [];
-      Object.defineProperty(dom.window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          const request = JSON.parse(String(init.body));
-          requests.push(request);
-          if (request.type === "task-project-context") {
-            return Response.json({ ok: true, value: {
-              taskId: "task-design", taskVersion: 7, projects: projectRows, registry: [], recommended: [],
-              environment: "device-a", current: null,
-            } });
-          }
-          if (request.type === "link-task-project-bundles") {
-            return Response.json({ ok: true, value: {
-              context: { taskId: "task-design", taskVersion: 8, projects: projectRows, registry: [], recommended: [], environment: "device-a", current: null },
-            } });
-          }
-          if (request.type === "start-task-execution") {
-            return Response.json({ ok: true, value: {
-              id: "exec-multi", itemKind: "task", itemId: "task-design", title: "다중 프로젝트 실행", status: "completed",
-              executionMode: "per_project", createdAt: now, updatedAt: now, progress: { completed: 2, failed: 0, total: 2 }, targets: [],
-            } });
-          }
-          return Response.json({ ok: true, value: undefined });
-        }),
-      });
       const { document, Event } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
-      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-design"]')?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      let mode = document.querySelector<HTMLSelectElement>('[data-scope="task-run-mode"]');
-      expect(mode).not.toBeNull();
-      if (mode) {
-        mode.value = "per_project";
-        mode.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-      expect(document.querySelectorAll(".task-project-run-card")).toHaveLength(2);
-      expect([...document.querySelectorAll<HTMLSelectElement>('[data-scope="task-run-project-routing"][data-field="branch"]')].map((select) => select.value)).toEqual(["main", "release"]);
-      let webModel = document.querySelector<HTMLSelectElement>('[data-scope="task-run-project-routing"][data-field="model"][data-locator="/workspace/web"]');
-      if (webModel) {
-        webModel.value = "gpt-5.6-luna";
-        webModel.dispatchEvent(new Event("change", { bubbles: true }));
-      }
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-multi"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-multi"]')?.click();
+      const mode = document.querySelector<HTMLSelectElement>('[data-scope="task-run-mode"]');
+      if (mode) { mode.value = "per_project"; mode.dispatchEvent(new Event("change", { bubbles: true })); }
       document.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await settle(dom);
+      await waitForCommands(host, 2);
 
-      expect(requests.find((request) => request.type === "link-task-project-bundles")?.bundles).toEqual([
-        { path: "/workspace/api", label: "API", branch: "main" },
-        { path: "/workspace/web", label: "Web", branch: "release" },
+      const decoded = host.commands.map(decodeCommand);
+      expect(decoded.map((entry) => entry.command)).toEqual(["save", "dispatch"]);
+      const dispatch = decoded[1]!.payload;
+      expect(dispatch.executionMode).toBe("per_project");
+      expect(dispatch.targets).toMatchObject([
+        { locator: "/workspace/api", projectId: "project-api", branch: "main", worktreeId: "wt-api" },
+        { locator: "/workspace/web", projectId: "project-web", branch: "release", worktreeId: "wt-web" },
       ]);
-      expect(requests.find((request) => request.type === "start-task-execution")).toMatchObject({
-        executionMode: "per_project",
-        projectSessions: [
-          { locator: "/workspace/api", routing: { environmentId: "local", projectId: "project-api", branch: "main", model: "gpt-5.6-sol" } },
-          { locator: "/workspace/web", routing: { environmentId: "local", projectId: "project-web", branch: "release", model: "gpt-5.6-luna" } },
-        ],
-      });
+      // 프롬프트에는 대상 프로젝트가 그대로 실려야 세션이 어디서 무엇을 할지 안다.
+      expect(dispatch.prompt).toContain("/workspace/api");
+      expect(dispatch.prompt).toContain("/workspace/web");
     } finally {
       dom.window.close();
     }
   });
 
   it("does not auto-select a recommendation when the Task already has a target project", async () => {
-    const dom = await mountPanel(true, (bootstrap) => {
+    const dom = await mountPanel((bootstrap) => {
       (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
         config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
         status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
@@ -2461,79 +1989,42 @@ describe("structured source work editing", () => {
     }
   });
 
-  it("sends the last-read CAS version and full supported Task DTO", async () => {
-    const dom = await mountPanel(true, (bootstrap) => {
-      const now = "2026-08-09T00:00:00.000Z";
-      bootstrap.store.tasks = [{
-        id: "task-source", version: 4, title: "Source task", prompt: "Human draft", draft: "Human draft",
-        promptRevisions: [{
-          id: "task-source:draft:1", kind: "draft", revision: 1, content: "Human draft",
-          status: "current", generator: "human", createdAt: now,
-        }],
-        status: "backlog", priority: "medium", tags: [], createdAt: now, updatedAt: now,
-      }];
-      bootstrap.store.todos = [{
-        id: "todo-source", version: 6, title: "Bound Todo", notes: "", draft: "Bound Todo",
-        groupName: "Delivery", subgroupName: "Review",
-        promptRevisions: [], status: "open", priority: "medium", tags: [], taskId: "task-source",
-        createdAt: now, updatedAt: now,
-      }];
+
+  it("sends only the changed items, each carrying its last-read CAS version", async () => {
+    const now = "2026-08-11T00:00:00.000Z";
+    const host = terminalHost();
+    const dom = await mountPanel((bootstrap) => {
       (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
         config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
-        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
-        capabilities: {
-          graphCommit: true, domainMutation: true, milestoneMutation: true,
-          taskMutation: true, todoMutation: true, promptMutation: true,
-        },
+        status: "ready",
+        source: { id: "workspace", name: "Workspace" },
+        capabilities: { graphCommit: true, domainMutation: true, milestoneMutation: true, taskMutation: true, todoMutation: true, promptMutation: true },
+        catalog: [],
       };
-    });
+      bootstrap.store.tasks = [
+        { id: "task-edited", title: "수정 대상", prompt: "A", draft: "A", promptRevisions: [], status: "ready", priority: "medium", tags: [], version: 7, createdAt: now, updatedAt: now },
+        { id: "task-untouched", title: "그대로", prompt: "B", draft: "B", promptRevisions: [], status: "ready", priority: "medium", tags: [], version: 2, createdAt: now, updatedAt: now },
+      ];
+    }, host.configure);
     try {
-      const requests: any[] = [];
-      Object.defineProperty(dom.window, "fetch", {
-        configurable: true,
-        value: vi.fn(async (_url: string, init: RequestInit) => {
-          requests.push(JSON.parse(String(init.body)));
-          return new Response(JSON.stringify({ ok: true, value: undefined }), {
-            status: 200, headers: { "content-type": "application/json" },
-          });
-        }),
-      });
       const { document, Event } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
-      expect(document.querySelector('[aria-label="Task 관리"]')?.textContent).toContain("구조화 원천 · 양방향");
-      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-source"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-edited"]')?.click();
       const title = document.querySelector<HTMLInputElement>('[data-scope="local-task"][data-field="title"]');
-      expect(title?.value).toBe("Source task");
       if (title) {
-        title.value = "Changed in Orca";
+        title.value = "수정한 제목";
         title.dispatchEvent(new Event("change", { bubbles: true }));
       }
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(requests.find((request) => request.type === "mutate-source" && request.mutation?.kind === "task")).toMatchObject({
-        type: "mutate-source",
-        mutation: {
-          kind: "task", expectedVersion: 4, relatedVersions: { "todo-source": 6 },
-          item: { id: "task-source", title: "Changed in Orca", draft: "Human draft" },
-        },
-      });
+      document.querySelector<HTMLButtonElement>('[data-action="save"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 1);
 
-      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="todos"]')?.click();
-      const subgroup = document.querySelector<HTMLInputElement>('[data-scope="local-todo"][data-field="subgroupName"]');
-      expect(subgroup?.value).toBe("Review");
-      const comment = document.querySelector<HTMLTextAreaElement>('[data-scope="local-todo"][data-field="notes"]');
-      if (comment) {
-        comment.value = "정지희 1차 후 정석진 작업 예정";
-        comment.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(requests.find((request) => request.type === "mutate-source" && request.mutation?.kind === "todo")).toMatchObject({
-        type: "mutate-source",
-        mutation: {
-          kind: "todo", expectedVersion: 6, relatedVersions: { "task-source": 4 },
-          item: { id: "todo-source", groupName: "Delivery", subgroupName: "Review", notes: "정지희 1차 후 정석진 작업 예정" },
-        },
-      });
-      expect(document.querySelector('[aria-label="Todo 관리"]')?.textContent).toContain("정지희 1차 후 정석진 작업 예정");
+      const saved = host.commands.map(decodeCommand).find((entry) => entry.command === "save")?.payload;
+      // 손대지 않은 항목을 함께 보내면 그 사이 원천에서 바뀐 값을 덮어쓰게 된다.
+      expect(saved.tasks.map((task: any) => task.id)).toEqual(["task-edited"]);
+      expect(saved.tasks[0]).toMatchObject({ title: "수정한 제목", version: 7 });
+      expect(saved.todos).toBeUndefined();
+      expect(saved.domains).toBeUndefined();
     } finally {
       dom.window.close();
     }

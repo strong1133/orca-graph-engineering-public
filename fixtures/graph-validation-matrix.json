@@ -3,7 +3,7 @@
   "cases": [
     {
       "id": "duplicate-edge-id",
-      "bridgeMode": "dry",
+      "runMode": "dry",
       "expected": { "code": "DUPLICATE_EDGE_ID", "severity": "error" },
       "nodes": [{ "id": "start" }, { "id": "finish" }],
       "edges": [
@@ -13,7 +13,7 @@
     },
     {
       "id": "duplicate-condition-label",
-      "bridgeMode": "dry",
+      "runMode": "dry",
       "expected": { "code": "CONDITION_BRANCH_LABEL_DUPLICATE", "severity": "error" },
       "nodes": [
         { "id": "decision", "kind": "condition", "branchTaken": "yes" },
@@ -27,7 +27,7 @@
     },
     {
       "id": "whitespace-live-selection",
-      "bridgeMode": "live",
+      "runMode": "live",
       "expected": { "code": null, "severity": null },
       "nodes": [
         { "id": "decision", "kind": "condition", "branchTaken": "   " },
@@ -41,7 +41,7 @@
     },
     {
       "id": "loop-source-is-not-condition",
-      "bridgeMode": "dry",
+      "runMode": "dry",
       "expected": { "code": "LOOP_SOURCE_CONDITION_REQUIRED", "severity": "error" },
       "loopGuards": true,
       "nodes": [{ "id": "start" }, { "id": "work" }],
@@ -52,7 +52,7 @@
     },
     {
       "id": "loop-label-is-whitespace",
-      "bridgeMode": "dry",
+      "runMode": "dry",
       "expected": { "code": "LOOP_BRANCH_LABEL_REQUIRED", "severity": "error" },
       "loopGuards": true,
       "nodes": [{ "id": "start" }, { "id": "decision", "kind": "condition", "branchTaken": "done" }, { "id": "done" }],
@@ -64,7 +64,7 @@
     },
     {
       "id": "loop-points-downstream",
-      "bridgeMode": "dry",
+      "runMode": "dry",
       "expected": { "code": "LOOP_BACK_EDGE_REQUIRED", "severity": "error" },
       "loopGuards": true,
       "nodes": [{ "id": "decision", "kind": "condition", "branchTaken": "done" }, { "id": "work" }],
@@ -75,7 +75,7 @@
     },
     {
       "id": "retry-without-idempotency-key",
-      "bridgeMode": "dry",
+      "runMode": "dry",
       "expected": { "code": "IDEMPOTENCY_KEY_REQUIRED", "severity": "error" },
       "nodes": [
         { "id": "retrying", "engineering": { "maxAttempts": 2, "permissions": ["read"] } }
@@ -84,7 +84,7 @@
     },
     {
       "id": "retry-with-whitespace-idempotency-key",
-      "bridgeMode": "dry",
+      "runMode": "dry",
       "expected": { "code": "IDEMPOTENCY_KEY_REQUIRED", "severity": "error" },
       "nodes": [
         { "id": "retrying-space", "engineering": { "maxAttempts": 2, "idempotencyKey": "   ", "permissions": ["read"] } }
@@ -93,7 +93,7 @@
     },
     {
       "id": "sensitive-network-without-policy-exception",
-      "bridgeMode": "dry",
+      "runMode": "dry",
       "expected": { "code": "SENSITIVE_NETWORK_POLICY_REQUIRED", "severity": "error" },
       "nodes": [
         { "id": "networked", "engineering": { "dataClass": "sensitive", "permissions": ["read", "network"] } }
@@ -102,7 +102,7 @@
     },
     {
       "id": "approved-gate-is-unrelated",
-      "bridgeMode": "live",
+      "runMode": "live",
       "expected": { "code": "IRREVERSIBLE_GATE_DOMINATOR_REQUIRED", "severity": "error" },
       "nodes": [
         { "id": "start" },
@@ -113,7 +113,7 @@
     },
     {
       "id": "approved-gate-is-downstream",
-      "bridgeMode": "live",
+      "runMode": "live",
       "expected": { "code": "IRREVERSIBLE_GATE_DOMINATOR_REQUIRED", "severity": "error" },
       "nodes": [
         { "id": "start" },
@@ -127,7 +127,7 @@
     },
     {
       "id": "dominating-gate-is-pending",
-      "bridgeMode": "live",
+      "runMode": "live",
       "expected": { "code": "IRREVERSIBLE_GATE_DOMINATOR_REQUIRED", "severity": "error" },
       "nodes": [
         { "id": "start" },
@@ -141,7 +141,7 @@
     },
     {
       "id": "approved-gate-covers-only-one-path",
-      "bridgeMode": "live",
+      "runMode": "live",
       "expected": { "code": "IRREVERSIBLE_GATE_DOMINATOR_REQUIRED", "severity": "error" },
       "nodes": [
         { "id": "start" },
@@ -158,7 +158,7 @@
     },
     {
       "id": "approved-gate-dominates-action",
-      "bridgeMode": "live",
+      "runMode": "live",
       "expected": { "code": null, "severity": null },
       "nodes": [
         { "id": "start" },
@@ -172,7 +172,7 @@
     },
     {
       "id": "selected-gated-branch-dominates-action",
-      "bridgeMode": "live",
+      "runMode": "live",
       "expected": { "code": null, "severity": null },
       "nodes": [
         { "id": "decision", "kind": "condition", "branchTaken": " y " },
@@ -189,7 +189,7 @@
     },
     {
       "id": "selected-ungated-branch-rejects-action",
-      "bridgeMode": "live",
+      "runMode": "live",
       "expected": { "code": "IRREVERSIBLE_GATE_DOMINATOR_REQUIRED", "severity": "error" },
       "nodes": [
         { "id": "decision", "kind": "condition", "branchTaken": "n" },

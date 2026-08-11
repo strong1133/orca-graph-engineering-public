@@ -127,7 +127,7 @@ const stagingPackage = path.join(stagingRoot, "package");
 const releaseEntries = [
   ".gitignore",
   ".github/workflows/ci.yml",
-  "bridge",
+  "lib",
   "docs/architecture.md",
   "docs/graph-engineering-reference.md",
   "docs/upstream-proposal.md",
@@ -189,7 +189,8 @@ try {
     ".gitignore",
     "orca-plugin.json",
     panelEntry,
-    "bridge/index.mjs",
+    "lib/store.mjs",
+    "scripts/graph-store.mjs",
     "npm-shrinkwrap.json",
     "tests/release-package.test.ts",
   ]) {

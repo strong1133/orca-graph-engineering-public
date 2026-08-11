@@ -51,13 +51,19 @@ const useSourceStore = ["structured", "folder"].includes(dataSourceConfig.mode)
 const sourceStore = useSourceStore
   ? sourceCache.store
   : { schemaVersion: 1, activeGraphId: "", graphs: [] };
+// 예전 브리지 시절의 런타임 키는 bootstrap에 싣지 않는다.
+const {
+  bridgeTerminalId: _legacyTerminal, bridgeWorkspace: _legacyWorkspace,
+  lastBridgeMessage: _legacyMessage, lastBridgeAt: _legacyAt,
+  ...currentLocalStore
+} = localStore;
 const store = ["structured", "folder"].includes(dataSourceConfig.mode) ? {
   ...sourceStore,
-  ...(localStore.bridgeTerminalId ? { bridgeTerminalId: localStore.bridgeTerminalId } : {}),
-  ...(localStore.bridgeWorkspace ? { bridgeWorkspace: localStore.bridgeWorkspace } : {}),
-  ...(localStore.lastBridgeMessage ? { lastBridgeMessage: localStore.lastBridgeMessage } : {}),
-  ...(localStore.lastBridgeAt ? { lastBridgeAt: localStore.lastBridgeAt } : {}),
-} : localStore;
+  ...(currentLocalStore.saveTerminalId ? { saveTerminalId: currentLocalStore.saveTerminalId } : {}),
+  ...(currentLocalStore.lastSaveMessage ? { lastSaveMessage: currentLocalStore.lastSaveMessage } : {}),
+  ...(currentLocalStore.lastSavedAt ? { lastSavedAt: currentLocalStore.lastSavedAt } : {}),
+  dispatchLog: currentLocalStore.dispatchLog ?? [],
+} : currentLocalStore;
 const dataSource = {
   config: dataSourceConfig,
   status: sourceCache.mode === dataSourceConfig.mode ? sourceCache.status : "idle",

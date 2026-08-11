@@ -71,7 +71,8 @@ describe("source and Orca plugin package contracts", () => {
     const files = await archiveFiles(artifact, extracted);
     expect(files).toEqual(expect.arrayContaining([
       "package/.github/workflows/ci.yml",
-      "package/bridge/index.mjs",
+      "package/lib/store.mjs",
+      "package/scripts/graph-store.mjs",
       "package/dist/panel.html",
       "package/npm-shrinkwrap.json",
       "package/orca-plugin.json",
@@ -101,8 +102,7 @@ describe("source and Orca plugin package contracts", () => {
     ], { cwd: root, encoding: "utf8" }));
     expect(verification).toMatchObject({
       ok: true,
-      bridgePing: "pong",
-      bridgeSave: "saved",
+      saveCli: "saved",
       panelBootstrapUpdated: true,
       canonicalHeaders: true,
       manifestEntry: "dist/panel.html",

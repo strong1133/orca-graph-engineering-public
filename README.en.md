@@ -31,21 +31,21 @@ corepack npm run build
 
 For a distributable archive run `corepack npm run package:plugin` and verify it with `corepack npm run verify:plugin`. The extracted `package/` directory works directly as a Development plugin path.
 
-### Prerequisite — the bridge
+### The save terminal
 
-The panel runs inside the Orca plugin API v1 sandbox. Saving files and creating agent terminals require a **local bridge**.
+The panel runs inside the Orca plugin API v1 sandbox. That sandbox has no network, no filesystem, and no browser storage. The only way out is `terminal.sendText`, so **saving and running send one command line to a terminal**.
 
-1. Open one Orca terminal in this repository directory.
-2. Start the bridge in it.
+All you need is one open Orca terminal tab. The first time you save, you pick which terminal to use; after that it never asks again.
+
+There is no resident process. Nothing to keep running, no connection state. Pressing save runs one command once.
 
 ```bash
-node ./bridge/index.mjs
+# the shape of what the panel sends — you never type this yourself
+node ./scripts/graph-store.mjs save <payload>
 ```
 
-3. Select that terminal as the bridge at the top of the panel.
-4. You are ready when `Graph Engineering bridge ready` appears. Keep the terminal open while you use the plugin.
+Do not pick a terminal that is running Codex or Claude. Those terminals are the ones that receive work.
 
-You can draw and inspect graphs without the bridge, but saving, executing, and Meta Prompt generation will not work.
 
 ### Choose where your data lives
 
@@ -99,7 +99,7 @@ The management screens work without connecting any data source.
 - `빠른 그래프 구성` (Quick graph) chains Tasks from the same scope in the order you pick them.
 - Archiving replaces hard delete: Domain/Milestone archive, restorable Task archive, Todo cancel.
 
-`Meta Prompt 만들기` creates a new agent session in the selected bridge worktree and generates an execution prompt using the plugin's built-in public prompt contract. It is stored only when the result passes the fixed nine-section structure and the human draft did not change meanwhile.
+Both the human draft and the Meta draft are edited by hand. The Meta draft is the prompt actually used for execution; leave it empty and the human draft is sent as-is. Every edit appends a new revision.
 
 ## 6. Routing
 
@@ -115,27 +115,26 @@ Reasoning for a new session is limited to values the model catalog declares. The
 
 ## 7. Execution
 
-`▶ 실행` (Run) checks routing and safety contracts first and only dispatches what passes. A dry-run plan touches neither Orca nor the source.
+`▶ Run` **hands the work to an Orca session in the target project**. Pick an existing session and the prompt goes there; pick only a project and branch and a fresh claude/codex session is started in that worktree and given the prompt.
 
-**Blocked before running** — structural errors, unlabelled condition branches, unsafe permission combinations, network policy violations for sensitive data, missing idempotency keys, missing approval gates, exceeded token budgets, unavailable worktrees or sessions.
+From there the agent in that session owns the work — walking the graph node by node, deciding conditions, recording results. **There is no separate executor inside the plugin.**
 
-**Agent result contract** — the assigned agent makes the first line of its final response exactly `RESULT: done` or `RESULT: failed — <reason>`. Bold text or list markers read the same. An answer with no result line counts as success by default; set `ORCA_GRAPH_REQUIRE_RESULT_CONTRACT=1` to close those as failures too.
+The reason for this boundary is simple: the panel has no channel back from a session. Estimating progress or inferring completion would mean presenting unverified state as fact.
 
-**Transient failure recovery** — interactive agent terminals can only be created while the Orca main window renderer is ready. The bridge checks `orca status` first and retries only transient failures with exponential backoff (90 seconds by default). Non-transient failures are reported immediately.
+**Pre-flight blocking** — only real graph structure and link errors block a run. A missing target or model is surfaced separately as a run-configuration problem.
 
-**Retries** — a node is redispatched up to its attempt budget. A session that already carries a failed turn is not reused; only that route's session is recreated, leaving other routes and their context continuity intact.
+**Result contract** — the prompt asks the agent to make the first line of its final response exactly `RESULT: done` or `RESULT: failed — <reason>`.
 
-**Guards** — the run wall-time limit is checked at node boundaries. An approval gate never passes without human approval.
+**Reset** — `↺ Reset run state` rolls back node status while leaving nodes and edges alone. Past run history is preserved. Saving propagates it to the data source.
 
-**Cancellation** — a running execution offers `■ 실행 중단` (Stop). It is observed at node boundaries, so it stops after the current node finishes and never rescinds work already sent to an agent; interrupting a turn mid-flight would leave a remote node claimed. A stopped execution is recorded as cancelled rather than failed, and a child graph entered through `graph_call` stops at the same boundary.
+## 8. Execution status
 
-**Reset** — `↺ 실행 초기화` returns execution state while leaving nodes, edges, and past runs untouched. It is refused while an execution is running; stop it first.
+`Execution status` is a log of **what the panel sent, where, and when**. Each entry records the graph or Task name, the target project and branch, whether it reused a session or opened a new one, and the time it was sent.
 
-## 8. Execution status and history
+The same screen also shows the run history recorded on the graph. When the source keeps per-node results, you get the run number, status, verbatim work input, and each node's status, attempt count, duration, and failure reason.
 
-`실행 현황` (Execution status) shows execution records together with **per-node progress**. Each run carries its number, status, counters, and verbatim work input; each node row shows status, attempt count, duration, the Orca session that ran it, and its result or verbatim failure reason. Hovering a canvas node shows the same in a tooltip.
+This screen requires no connection, does not poll, and does not open a separate tab. Dispatch records live only in a local file on this machine, capped at 200, and never mix into graph data or an external source.
 
-Execution records live only in `executions.json` in app data and never mix into graph data or an external source. Restarting the bridge closes unfinished records as failed so no ghost state remains.
 
 ## 9. Calling a graph from a graph
 
@@ -147,7 +146,7 @@ Three routing-combination policies are available: child settings only, parent fi
 
 `구조화 Workspace` connects to any HTTP implementation that follows public Data Source contract v1, documented in [docs/data-source-contract.md](docs/data-source-contract.md).
 
-Token values are never stored. Put the token in the environment of the terminal that runs the bridge and enter only the **environment variable name** in the UI. The connection snapshot lives in a replaceable `source-cache.json`, excluded from Git and from the distributed package.
+Token values are never stored. Put the token in the environment of the terminal that runs the save command and enter only the **environment variable name** in the UI. The connection snapshot lives in a replaceable `source-cache.json`, excluded from Git and from the distributed package.
 
 Node-level execution contracts (`role`, `maxAttempts`, `permissions`, `dataClass`, `idempotencyKey`, `timeoutSeconds`, and so on) travel inside the Graph aggregate, but the contract allows a provider to ignore them. When a save comes back without them, the panel reports exactly which keys were not preserved — the approval gate, retry, and permission checks for that node will not apply at run time.
 
@@ -155,7 +154,7 @@ Node-level execution contracts (`role`, `maxAttempts`, `permissions`, `dataClass
 
 | Name | Default | Meaning |
 | --- | --- | --- |
-| `ORCA_GRAPH_RUNTIME_DIR` | Orca app data | Where bridge state is stored |
+| `ORCA_GRAPH_RUNTIME_DIR` | Orca app data | Where saved state is stored |
 | `ORCA_GRAPH_TERMINAL_CREATE_TIMEOUT_MS` | `90000` | Terminal creation retry budget |
 | `ORCA_GRAPH_AGENT_READY_TIMEOUT_MS` | `60000` | Wait for a new agent session to report ready |
 | `ORCA_GRAPH_WORK_ITEM_TIMEOUT_SECONDS` | `900` | Standalone Task/Todo execution limit |
@@ -174,10 +173,13 @@ Everything a source connection needs comes from the variables above. The plugin 
 
 ## 12. Known boundaries
 
-- **Loop edge execution** — editing, checking, and planning only; live execution is blocked. The routine scheduler is still metadata.
-- **Remote `graph_call`** — blocked during structured-source execution because there is no child-run contract yet. Run the child graph directly, or use a local or folder source.
-- **Cancellation points** — observed only at node boundaries. A standalone Task or Todo run has a single dispatch and therefore no cancellation point.
-- **Wide view tab** — not an official editor contribution but a compatibility layer where the local bridge you started opens a loopback address in an Orca browser tab.
+These boundaries follow directly from what Orca plugin API v1 grants a panel.
+
+- **Nothing is observable after handoff** — the panel has no channel back from a session. Check progress and completion in the Orca session itself; execution status records only what was sent.
+- **Saving needs a terminal** — the panel iframe runs under `connect-src 'none'` and the `storage` host API is not panel-callable. `terminal.sendText` is the only way out.
+- **Fresh data appears when you reopen the panel** — save and refresh rewrite the bootstrap in `dist/panel.html`, and Orca re-reads that file each time the panel opens.
+- **There is no cancel** — a prompt already delivered to a session cannot be recalled. Stop it in that Orca session.
+- **Routine scheduler** — still metadata.
 
 ## Development
 
