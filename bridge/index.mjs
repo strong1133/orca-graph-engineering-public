@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { updatePanelBootstrap } from "../scripts/panel-bootstrap.mjs";
 import { prepareRuntimeDirectory, resolveRuntimeDirectory } from "../scripts/runtime-path.mjs";
 import {
-  dispatchedResultFailure,
+  dispatchedResultFailure as readResultContract,
   droppedNodeEngineering,
   nodeAttemptBudget,
   remoteNodeDecision,
@@ -51,6 +51,16 @@ const defaultDataSourcePath = path.join(root, "fixtures/default-data-source.json
 const defaultSourceCachePath = path.join(root, "fixtures/default-source-cache.json");
 
 await prepareRuntimeDirectory(root, runtimeDir, { migrate: !process.env.ORCA_GRAPH_RUNTIME_DIR });
+
+// 계약을 지키지 않은 응답을 실패로 볼지는 운영 정책이다. 기본값은 기존 그래프를
+// 깨지 않도록 관대하고, 엄격 모드를 켜면 결과 줄이 없는 응답도 실패로 닫는다.
+function requireResultContract() {
+  return process.env.ORCA_GRAPH_REQUIRE_RESULT_CONTRACT === "1";
+}
+
+function dispatchedResultFailure(summary) {
+  return readResultContract(summary, { required: requireResultContract() });
+}
 
 const orcaCommand = process.env.ORCA_CLI_COMMAND ||
   (process.env.ORCA_DEV_REPO_ROOT ? "orca-dev" : process.platform === "linux" ? "orca-ide" : "orca");
@@ -566,6 +576,14 @@ async function enrichWorkProcessSource(cache) {
 // 모든 노드를 pending으로 돌리며 지난 run 이력은 파괴하지 않는다.
 async function resetGraphRunState(graphId) {
   if (!graphId) throw new Error("graph id is required to reset a run");
+  // 초기화는 현재 run을 봉인하고 노드를 pending으로 되돌린다. 실행기가 그 run의
+  // 노드를 claim/complete 하는 중이면 두 쪽이 같은 상태를 서로 다른 방향으로
+  // 밀게 된다. 큐가 이 조합을 물리적으로 막던 자리를 명시적 가드로 대신한다.
+  const active = (await readExecutions()).find((item) => item.itemId === graphId
+    && ["queued", "running"].includes(item.status));
+  if (active) {
+    throw new Error(`이 그래프는 지금 실행 중입니다 (${active.id}). 실행을 먼저 중단한 뒤 초기화하십시오.`);
+  }
   const config = await readDataSourceConfig();
   const store = await readWorkingStore(config);
   const graph = store.graphs.find((item) => item.id === graphId);
@@ -2005,7 +2023,9 @@ async function dispatchTask(graph, node, targets, runId, options = {}) {
       route.model.id,
       route.routing.reasoning || "",
     ]);
-    const pooled = options.sessionPool?.get(sessionKey);
+    // 실패한 턴을 남긴 세션만 버린다. 풀 전체를 비우면 다른 경로의 건강한 세션과
+    // contextMode: "inherit"가 약속한 문맥 연속성까지 잃는다.
+    const pooled = options.forceFresh ? undefined : options.sessionPool?.get(sessionKey);
     if (pooled) {
       handle = pooled.handle;
       sessionTitle = pooled.title;
@@ -2413,13 +2433,17 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
   const unresolved = new Set();
   const nodeOutputs = new Map();
   const planLines = [];
+  // 진행 기록은 부모 실행 레코드에만 남긴다(자식 run을 중복 기록하지 않으려고).
+  // 하지만 중단 신호는 자식 그래프도 봐야 한다 — 두 목적에 한 값을 쓰면 부모를
+  // 중단해도 자식이 끝까지 완주한다.
   const runtimeExecutionId = context.parentRunId ? undefined : context.executionId;
+  const cancelScopeId = context.executionId;
   const sessionPool = context.sessionPool ?? new Map();
   await persistRunProgress(store, `${graph.name} · ${dryRun ? "실행 계획" : "Run"} #${run.runNo} 시작`, runtimeExecutionId, graph.id);
 
   try {
     for (const nodeId of order) {
-      assertNotCancelled(runtimeExecutionId);
+      assertNotCancelled(cancelScopeId);
       const elapsed = Date.now() - now.getTime();
       const maxWallMs = Number(graph.runGuards?.maxWallSeconds || 0) * 1000;
       if (!dryRun && maxWallMs && elapsed > maxWallMs) {
@@ -2533,6 +2557,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
               parentGraphId: graph.id,
               parentNodeId: node.id,
               sessionPool,
+              ...(context.executionId ? { executionId: context.executionId } : {}),
               ...(context.workInput !== undefined ? { workInput: context.workInput } : {}),
             },
           });
@@ -2587,6 +2612,7 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
         try {
           const dispatched = await dispatchTask(executionGraph, executionNode, targets, run.id, {
             sessionPool,
+            ...(attempt > 1 ? { forceFresh: true } : {}),
             title: `${graph.name} · Run #${run.runNo}`,
             ...(context.workInput !== undefined ? { workInput: context.workInput } : {}),
           });
@@ -2890,6 +2916,7 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
         try {
           dispatched = await dispatchTask(graph, design, targets, frontier.run?.id ?? graph.id, {
             sessionPool,
+            ...(attempt > 1 ? { forceFresh: true } : {}),
             title: `${graph.name} · 원격 Run`,
             ...(workInput !== undefined ? { workInput } : {}),
           });
@@ -3576,7 +3603,16 @@ async function runStandaloneWorkItem(itemKind, itemId, requestedRouting, dryRun,
     const messages = failed.map((result) => result.status === "rejected"
       ? result.reason instanceof Error ? result.reason.message : String(result.reason)
       : "");
-    throw new Error(`${failed.length}/${settled.length} project executions failed: ${messages.join("; ")}`);
+    // 성공한 프로젝트의 변경은 그대로 남는다. 무엇이 이미 적용됐는지 알려주지 않으면
+    // 사용자는 어디를 되돌려야 하는지 알 수 없다. 자동 보상은 하지 않는다 —
+    // 에이전트가 만든 변경을 임의로 되돌리는 것이 더 위험하다.
+    const applied = settled
+      .map((result, index) => (result.status === "fulfilled" ? executions[index]?.project?.locator : null))
+      .filter(Boolean);
+    const appliedNote = applied.length
+      ? ` 이미 적용된 프로젝트: ${applied.join(", ")} (자동으로 되돌리지 않습니다).`
+      : "";
+    throw new Error(`${failed.length}/${settled.length} project executions failed: ${messages.join("; ")}.${appliedNote}`);
   }
   const dispatched = settled.map((result) => result.status === "fulfilled" ? result.value : null);
   return {

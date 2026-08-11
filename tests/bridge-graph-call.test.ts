@@ -102,7 +102,9 @@ if (args[0] === "environment" && args[1] === "list") {
       state: mode === "busy" ? "working" : "done",
       agentType: "codex",
       lastAssistantMessage: promptSendCount
-        ? process.env.ORCA_GRAPH_FAKE_ASSISTANT
+        ? process.env.ORCA_GRAPH_FAKE_FAIL_FIRST_TURN === "1"
+          ? (promptSendCount === 1 ? "RESULT: failed — 1회차 실패" : "RESULT: done") + "\\nturn " + promptSendCount
+        : process.env.ORCA_GRAPH_FAKE_ASSISTANT
           ? process.env.ORCA_GRAPH_FAKE_ASSISTANT + "\\nturn " + promptSendCount
           : JSON.stringify({ branch: "y", reason: "fake result selects y " + promptSendCount })
         : "fake agent ready",
@@ -520,8 +522,8 @@ describe("bridge graph calls", () => {
     await writeGraphStore(runtimeDirectory, [graph]);
     const fake = await installFakeOrca(runtimeDirectory);
 
-    // 실행이 도는 동안 초기화 요청을 함께 보낸다. 두 작업이 같은 큐에 있으면
-    // 초기화는 실행이 끝난 뒤에야 처리된다 — 정작 필요한 순간에 막히는 것이다.
+    // 실행이 도는 동안 다른 요청을 함께 보낸다. 두 작업이 같은 큐에 있으면
+    // 그 요청은 실행이 끝난 뒤에야 처리된다.
     const output = await sendToBridge(
       runtimeDirectory,
       {
@@ -536,12 +538,12 @@ describe("bridge graph calls", () => {
         ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
         ORCA_GRAPH_FAKE_WAIT_DELAY_MS: "1200",
       },
-      [{ type: "reset-graph-run", graphId: graph.id }],
+      [{ type: "refresh" }],
       { marker: "execution queued", delayMs: 300 },
     );
 
-    expect(output).toContain("graph run state reset");
-    expect(output.indexOf("graph run state reset")).toBeLessThan(output.indexOf("execution completed"));
+    expect(output).toContain("Orca targets refreshed");
+    expect(output.indexOf("Orca targets refreshed")).toBeLessThan(output.indexOf("execution completed"));
   });
 
   it("stops a running Graph at the next node boundary when the user cancels", async () => {
@@ -635,6 +637,162 @@ describe("bridge graph calls", () => {
     // 실행 쪽 기록도 함께 남아야 한다.
     const executed = after.graphs.find((item: { id: string }) => item.id === graph.id);
     expect(executed.runs.at(-1).nodeResults?.length ?? executed.nodes[0].status).toBeTruthy();
+  });
+
+  it("observes a cancel inside a called child graph too", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const child = executionGraph(
+      "GRAPH-cancel-child",
+      // 노드마다 reasoning 을 달리해 세션을 새로 만들게 한다 — 각 노드가 tui-idle
+      // 대기를 치르므로 자식이 충분히 오래 돌고, 그 사이 중단이 도착한다.
+      [taskNode("child-a", { reasoning: "low" }), taskNode("child-b", { reasoning: "medium" }), taskNode("child-c", { reasoning: "high" })],
+      [
+        { id: "a-b", from: "child-a", to: "child-b", kind: "sequence" },
+        { id: "b-c", from: "child-b", to: "child-c", kind: "sequence" },
+      ],
+      { projectId: "fake-project", model: "gpt-5.6-sol" },
+    );
+    const parent = executionGraph(
+      "GRAPH-cancel-parent",
+      [{
+        id: "call", kind: "graph_call", label: "call", x: 0, y: 0, status: "pending", joinMode: "all",
+        childGraphId: child.id, graphCallRoutingMode: "child", routing: {}, engineering: {},
+      }],
+      [],
+      { projectId: "fake-project", model: "gpt-5.6-sol" },
+    );
+    await writeGraphStore(runtimeDirectory, [parent, child]);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    // 부모를 중단하면 자식도 노드 경계에서 멈춰야 한다. 진행 기록용 식별자를
+    // 취소 신호로 겸용하면 자식은 신호를 못 보고 끝까지 완주한다.
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: parent.id,
+        executionMode: "single_session",
+        routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" },
+      },
+      "execution cancelled",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_WAIT_DELAY_MS: "900",
+      },
+      [{ type: "cancel-execution", graphId: parent.id }],
+      { marker: "execution queued", delayMs: 1400 },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "send").length).toBeLessThan(3);
+  });
+
+  it("refuses to reset a Graph run while that Graph is still executing", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-reset-guard",
+      [taskNode("only")],
+      [],
+      { projectId: "fake-project", model: "gpt-5.6-sol" },
+    );
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    // 초기화는 현재 run을 봉인하고 노드를 pending으로 되돌린다. 실행기가 같은 run의
+    // 노드를 진행하는 중이면 두 쪽이 같은 상태를 반대로 민다.
+    const output = await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: graph.id,
+        executionMode: "single_session",
+        routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" },
+      },
+      "execution completed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_WAIT_DELAY_MS: "1200",
+      },
+      [{ type: "reset-graph-run", graphId: graph.id }],
+      { marker: "execution queued", delayMs: 300 },
+    );
+
+    expect(output).toContain("실행을 먼저 중단한 뒤 초기화하십시오");
+    expect(output).not.toContain("graph run state reset");
+  });
+
+  it("replaces only the failed session and lets later nodes keep reusing the pool", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-retry-pool",
+      [taskNode("first", {}, { maxAttempts: 2, idempotencyKey: "retry-key" }), taskNode("second")],
+      [{ id: "first-second", from: "first", to: "second", kind: "sequence" }],
+      { projectId: "fake-project", model: "gpt-5.6-sol" },
+    );
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: graph.id,
+        executionMode: "single_session",
+        routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" },
+      },
+      "execution completed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_FAIL_FIRST_TURN: "1",
+      },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    // 1회차 세션 + 재시도용 새 세션 = 2개. 두 번째 노드는 새 세션을 그대로 물려받아야
+    // 하므로 3개가 되면 풀을 통째로 비운 것이다.
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "create")).toHaveLength(2);
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "send")).toHaveLength(3);
+  });
+
+  it("gives a retried node a fresh agent session instead of the failed one", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-retry-session",
+      [taskNode("only", {}, { maxAttempts: 2, idempotencyKey: "retry-key" })],
+      [],
+      { projectId: "fake-project", model: "gpt-5.6-sol" },
+    );
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: graph.id,
+        executionMode: "single_session",
+        routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" },
+      },
+      "execution failed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_ASSISTANT: "RESULT: failed — 계속 실패",
+      },
+    );
+
+    // 실패한 턴을 남긴 세션을 재사용하면 부분 결과 위에 덧쓰게 된다. 재시도는
+    // 세션을 새로 만들어야 하므로 terminal create가 시도 수만큼 나와야 한다.
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "create")).toHaveLength(2);
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "send")).toHaveLength(2);
   });
 
   it("resets a Graph run state without touching its structure or run history", async () => {

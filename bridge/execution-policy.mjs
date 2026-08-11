@@ -63,7 +63,7 @@ export function runWallDeadline(runGuards, runStartedAt, now) {
  */
 const DISPATCH_RESULT_SCAN_LINES = 5;
 
-export function dispatchedResultFailure(summary) {
+export function dispatchedResultFailure(summary, { required = false } = {}) {
   const lines = String(summary || "").split(/\r?\n/u)
     .map((line) => line.replace(/^[\s>*\-#]+/u, "").replace(/[*`_]/gu, "").trim())
     .filter(Boolean)
@@ -74,7 +74,9 @@ export function dispatchedResultFailure(summary) {
     if (match[1].toLowerCase() === "done") return "";
     return match[2]?.trim() || "agent reported failed or blocked work";
   }
-  return "";
+  // 계약을 지키지 않은 응답을 성공으로 읽으면 실패가 완료로 굳는다. 기본값은
+  // 기존 그래프를 깨지 않도록 관대하게 두고, 엄격 모드에서만 fail-closed한다.
+  return required ? "agent did not report the required RESULT line" : "";
 }
 
 /** 원천이 저장하지 않은 노드 실행 계약. 계약 v1은 provider가 무시하는 것을 허용한다. */

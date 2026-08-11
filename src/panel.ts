@@ -3652,7 +3652,7 @@ function render(): void {
             <span class="toolbar-group"><button data-action="add-task">＋ Task</button><button data-action="open-batch-tasks">＋ Task 묶음</button><button data-action="add-condition">＋ ◇ 조건</button><button data-action="add-graph-call">＋ ▦ 호출</button></span>
             <span class="toolbar-group"><button data-action="undo" ${view.historyUndo.length ? "" : "disabled"}>↶</button><button data-action="redo" ${view.historyRedo.length ? "" : "disabled"}>↷</button><button data-action="open-templates">Topology</button><button data-action="auto-layout">자동 정렬 미리보기 ${view.layoutDirection}</button><button data-action="toggle-layout">${view.layoutDirection === "LR" ? "가로 → 세로" : "세로 → 가로"}</button></span>
             <span class="toolbar-group"><label class="node-search"><span>⌕</span><input data-action="node-search" value="${esc(view.nodeQuery)}" placeholder="노드 검색 ⌘K" aria-label="노드 검색"></label><select data-action="group-mode" aria-label="캔버스 그룹">${option("none", "그룹 없음", graphGroupMode(graph))}${option("domain", "Domain", graphGroupMode(graph))}${option("milestone", "Milestone", graphGroupMode(graph))}${option("superstep", "Superstep", graphGroupMode(graph))}${option("loop", "Loop", graphGroupMode(graph))}</select></span>
-            <span class="toolbar-group"><button data-action="refresh-targets">Orca 대상 갱신</button><button data-action="reset-graph-history" title="노드와 연결은 그대로 두고 실행 상태만 되돌립니다">↺ 실행 초기화</button></span>
+            <span class="toolbar-group"><button data-action="refresh-targets">Orca 대상 갱신</button><button data-action="reset-graph-history" title="노드와 연결은 그대로 두고 실행 상태만 되돌립니다" ${graphExecution && executionActive(graphExecution) ? "disabled" : ""}>↺ 실행 초기화</button></span>
             <span class="toolbar-group"><button data-action="show-analysis">그래프 설정</button><button data-action="toggle-problems">Problems</button><button data-action="open-history">실행 이력</button><button data-action="export-json">JSON</button><button data-action="import-json">가져오기</button><button data-action="open-shortcuts">?</button><span class="badge">run ${runCount}</span></span>
           </span>
           <span class="toolbar-compact">
@@ -3669,7 +3669,7 @@ function render(): void {
                 <button data-action="toggle-layout">레이아웃 방향 전환</button>
                 <button data-action="editor-mode" data-id="${view.editorMode === "design" ? "run" : "design"}">${view.editorMode === "design" ? "실행 보기" : "설계 모드"}</button>
                 <button data-action="redo" ${view.historyRedo.length ? "" : "disabled"}>다시 실행</button>
-                <button data-action="reset-graph-history">↺ 실행 초기화</button>
+                <button data-action="reset-graph-history" ${graphExecution && executionActive(graphExecution) ? "disabled" : ""}>↺ 실행 초기화</button>
                 <button data-action="show-analysis">그래프 설정</button>
                 <button data-action="toggle-problems">Problems</button>
                 <button data-action="open-data-source">데이터 원천</button>

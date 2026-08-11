@@ -85,6 +85,15 @@ describe("agent result contract", () => {
     expect(dispatchedResultFailure("make the first line exactly `RESULT: done` or `RESULT: failed — <reason>`")).toBe("");
   });
 
+  it("closes a contract-less answer only in strict mode", () => {
+    // 기본값은 기존 그래프를 깨지 않도록 관대하다. 엄격 모드에서만 fail-closed.
+    expect(dispatchedResultFailure("작업을 마쳤습니다")).toBe("");
+    expect(dispatchedResultFailure("작업을 마쳤습니다", { required: true })).toContain("did not report");
+    // 계약을 지킨 응답은 엄격 모드에서도 성공이다.
+    expect(dispatchedResultFailure("RESULT: done", { required: true })).toBe("");
+    expect(dispatchedResultFailure("RESULT: failed — 이유", { required: true })).toBe("이유");
+  });
+
   it("does not scan past the opening lines", () => {
     const late = ["a", "b", "c", "d", "e", "f", "RESULT: failed — 늦은 줄"].join("\n");
     expect(dispatchedResultFailure(late)).toBe("");

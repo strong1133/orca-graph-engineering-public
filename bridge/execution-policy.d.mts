@@ -16,7 +16,7 @@ export function runWallDeadline(
   now: number,
 ): number | null;
 
-export function dispatchedResultFailure(summary: unknown): string;
+export function dispatchedResultFailure(summary: unknown, options?: { required?: boolean }): string;
 
 export function droppedNodeEngineering(
   submitted: { nodes?: Array<{ id?: string; label?: string; engineering?: Record<string, unknown> }> } | null | undefined,
