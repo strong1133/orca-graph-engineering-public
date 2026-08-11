@@ -261,15 +261,15 @@ describe.each([
     const dom = await mountPanel(wide, ({ store, targets }) => {
       store.bridgeWorkspace = "current-project";
       targets.environments = [
-        { id: "local", name: "jsj1", local: true, connected: true },
-        { id: "environment-jsj2", name: "jsj2", local: false, connected: true },
+        { id: "local", name: "device-a", local: true, connected: true },
+        { id: "environment-device-b", name: "device-b", local: false, connected: true },
       ];
       targets.projects = [
         { id: "repo:current-project", name: "current-project", environmentId: "local", worktreeId: "worktree-current-project" },
-        { id: "repo:remote-project", name: "remote-project", environmentId: "environment-jsj2", worktreeId: "worktree-remote-project" },
+        { id: "repo:remote-project", name: "remote-project", environmentId: "environment-device-b", worktreeId: "worktree-remote-project" },
       ];
       targets.sessions = [{
-        id: "remote-session", title: "Remote Codex", environmentId: "environment-jsj2",
+        id: "remote-session", title: "Remote Codex", environmentId: "environment-device-b",
         worktreeId: "worktree-remote-project", projectId: "repo:remote-project", paneKey: "tab:leaf",
         agentType: "codex", agentState: "done", connected: true, writable: true,
       }];
@@ -290,7 +290,7 @@ describe.each([
       expect(dialog?.textContent).toContain("현재 프로젝트 추천");
       const environment = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="environmentId"]');
       expect(environment?.value).toBe("local");
-      expect([...(environment?.options ?? [])].map((option) => option.textContent)).toEqual(["jsj1 · 이 Orca", "jsj2"]);
+      expect([...(environment?.options ?? [])].map((option) => option.textContent)).toEqual(["device-a · 이 Orca", "device-b"]);
       expect(dialog?.querySelector<HTMLInputElement>('[data-action="toggle-run-project"][data-project-id="repo:current-project"]')?.checked).toBe(true);
       expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="model"]')?.value).toBe("gpt-5.6-sol");
       expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
@@ -307,7 +307,7 @@ describe.each([
 
       const rerenderedEnvironment = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="environmentId"]');
       if (rerenderedEnvironment) {
-        rerenderedEnvironment.value = "environment-jsj2";
+        rerenderedEnvironment.value = "environment-device-b";
         rerenderedEnvironment.dispatchEvent(new Event("change", { bubbles: true }));
       }
       dialog = document.querySelector<HTMLElement>('[role="dialog"]');
@@ -327,10 +327,10 @@ describe.each([
     }
   });
 
-  it("offers every agent session in the selected jsj1 Orca for Task and Graph execution", async () => {
+  it("offers every agent session in the selected local Orca for Task and Graph execution", async () => {
     const dom = await mountPanel(wide, ({ store, targets }) => {
       store.graphs[0].defaults = { environmentId: "local", projectId: "project-a", model: "gpt-5.6-sol" };
-      targets.environments = [{ id: "local", name: "jsj1", local: true, connected: true }];
+      targets.environments = [{ id: "local", name: "device-a", local: true, connected: true }];
       targets.projects = [
         { id: "project-a", name: "Project A", environmentId: "local", worktreeId: "worktree-a", path: "/workspace/a", branch: "main", current: true },
         { id: "project-b", name: "Project B", environmentId: "local", worktreeId: "worktree-b", path: "/workspace/b", branch: "dev" },
@@ -424,20 +424,20 @@ describe.each([
         ],
       }];
       targets.environments = [
-        { id: "local", name: "jsj1", local: true, connected: true },
-        { id: "environment-jsj2", name: "jsj2", local: false, connected: true },
+        { id: "local", name: "device-a", local: true, connected: true },
+        { id: "environment-device-b", name: "device-b", local: false, connected: true },
       ];
       targets.projects = [
         { id: "repo-front", name: "front", environmentId: "local", path: "/local/front", worktreeId: "wt-front-local", branch: "dev" },
         { id: "repo-api", name: "api", environmentId: "local", path: "/local/api", worktreeId: "wt-api-local", branch: "dev" },
-        { id: "repo-front", name: "front", environmentId: "environment-jsj2", path: "/remote/front", worktreeId: "wt-front-remote", branch: "dev" },
-        { id: "repo-api", name: "api", environmentId: "environment-jsj2", path: "/remote/api", worktreeId: "wt-api-remote", branch: "dev" },
+        { id: "repo-front", name: "front", environmentId: "environment-device-b", path: "/remote/front", worktreeId: "wt-front-remote", branch: "dev" },
+        { id: "repo-api", name: "api", environmentId: "environment-device-b", path: "/remote/api", worktreeId: "wt-api-remote", branch: "dev" },
       ];
       targets.branches = [
         { id: "front-hotfix", branch: "feature/task", environmentId: "local", projectId: "repo-front", worktreeId: "wt-front-hotfix", path: "/local/worktrees/front" },
         { id: "api-hotfix", branch: "feature/task", environmentId: "local", projectId: "repo-api", worktreeId: "wt-api-hotfix", path: "/local/worktrees/api" },
-        { id: "front-dev", branch: "dev", environmentId: "environment-jsj2", projectId: "repo-front", worktreeId: "wt-front-remote", path: "/remote/front" },
-        { id: "api-dev", branch: "dev", environmentId: "environment-jsj2", projectId: "repo-api", worktreeId: "wt-api-remote", path: "/remote/api" },
+        { id: "front-dev", branch: "dev", environmentId: "environment-device-b", projectId: "repo-front", worktreeId: "wt-front-remote", path: "/remote/front" },
+        { id: "api-dev", branch: "dev", environmentId: "environment-device-b", projectId: "repo-api", worktreeId: "wt-api-remote", path: "/remote/api" },
       ];
     });
     try {
@@ -1865,7 +1865,7 @@ describe("work process and branch execution surface", () => {
         { id: "task-api", title: "API", prompt: "API 수정", draft: "API 수정", promptRevisions: [], status: "ready", priority: "medium", tags: [], projects: [{ id: "api-target", role: "target", locatorKind: "folder", locator: "/workspace/api", label: "API", branch: "main", position: 0 }], createdAt: now, updatedAt: now },
         { id: "task-web", title: "Web", prompt: "Web 수정", draft: "Web 수정", promptRevisions: [], status: "ready", priority: "medium", tags: [], projects: [{ id: "web-target", role: "target", locatorKind: "folder", locator: "/workspace/web", label: "Web", branch: "release", position: 0 }], createdAt: now, updatedAt: now },
       ];
-      bootstrap.targets.environments = [{ id: "local", name: "jsj1", local: true, connected: true }];
+      bootstrap.targets.environments = [{ id: "local", name: "device-a", local: true, connected: true }];
       bootstrap.targets.projects = [
         { id: "project-api", name: "API", environmentId: "local", worktreeId: "wt-api", path: "/workspace/api", branch: "main" },
         { id: "project-web", name: "Web", environmentId: "local", worktreeId: "wt-web", path: "/workspace/web", branch: "release" },
@@ -1930,7 +1930,7 @@ describe("work process and branch execution surface", () => {
         id: "run-process", runNo: 7, status: "running", startedAt: "2026-08-10T00:00:00Z",
         inputPrompt: "  고객 A\n계약서 검토  ",
       }];
-      bootstrap.targets.environments = [{ id: "local", name: "jsj1", local: true, connected: true }];
+      bootstrap.targets.environments = [{ id: "local", name: "device-a", local: true, connected: true }];
       bootstrap.targets.projects = [{
         id: "project-1", name: "Work", environmentId: "local", repoId: "repo-1",
         worktreeId: "repo-1::/work", path: "/work", branch: "refs/heads/main",
@@ -2060,7 +2060,7 @@ describe("structured source work editing", () => {
           if (request.type === "task-project-context") {
             return Response.json({ ok: true, value: {
               taskId: "TASK-source", taskVersion: 9, projects: [], registry: [], recommended: [],
-              environment: "정석맥1", current: null,
+              environment: "device-a", current: null,
             } });
           }
           if (request.type === "create-quick-graph") {
@@ -2140,7 +2140,7 @@ describe("structured source work editing", () => {
             ? { taskId: "TASK-from-todo", store: preparedStore }
             : request.type === "task-project-context" ? {
                 taskId: "TASK-from-todo", taskVersion: 1, projects: [], registry: [], recommended: [],
-                environment: "정석맥1", current: null,
+                environment: "device-a", current: null,
               } : undefined;
           return Response.json({ ok: true, value });
         }),
@@ -2257,23 +2257,23 @@ describe("structured source work editing", () => {
           requests.push(request);
           if (request.type === "task-project-context") {
             return Response.json({ ok: true, value: {
-              taskId: request.taskId, taskVersion: 4, projects: [], environment: "정석맥1",
+              taskId: request.taskId, taskVersion: 4, projects: [], environment: "device-a",
               current: { repoId: "repo-a", path: "/workspace/a", branch: "refs/heads/main" },
               recommended: [{
-                name: "Project A", path: "/workspace/a", environment: "정석맥1", repo_id: "repo-a",
+                name: "Project A", path: "/workspace/a", environment: "device-a", repo_id: "repo-a",
                 worktrees: [
                   { id: "wt-feature", path: "/workspace/a-feature", branch: "feature/review", display_name: "review" },
                   { id: "wt-main", path: "/workspace/a", branch: "main", display_name: "main", is_main: true },
                 ],
               }],
               registry: [{
-                name: "Project A", path: "/workspace/a", environment: "정석맥1", repo_id: "repo-a",
+                name: "Project A", path: "/workspace/a", environment: "device-a", repo_id: "repo-a",
                 worktrees: [
                   { id: "wt-feature", path: "/workspace/a-feature", branch: "feature/review", display_name: "review" },
                   { id: "wt-main", path: "/workspace/a", branch: "main", display_name: "main", is_main: true },
                 ],
               }, {
-                name: "Project B", path: "/workspace/b", environment: "정석맥1", repo_id: "repo-b",
+                name: "Project B", path: "/workspace/b", environment: "device-a", repo_id: "repo-b",
                 worktrees: [{ id: "wt-b", path: "/workspace/b", branch: "release", is_main: true }],
               }],
             } });
@@ -2281,7 +2281,7 @@ describe("structured source work editing", () => {
           if (request.type === "connect-task-project-bundles") {
             return Response.json({ ok: true, value: {
               context: {
-                taskId: request.taskId, taskVersion: 5, registry: [], recommended: [], environment: "정석맥1", current: null,
+                taskId: request.taskId, taskVersion: 5, registry: [], recommended: [], environment: "device-a", current: null,
                 projects: request.selections.map((selection: any, position: number) => ({
                   role: "target", locatorKind: "folder", locator: selection.targetPath ?? selection.sourcePath,
                   branch: selection.branch || undefined, position,
@@ -2317,7 +2317,7 @@ describe("structured source work editing", () => {
       document.querySelector<HTMLButtonElement>('[data-action="connect-task-projects"]')?.click();
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(requests.find((request) => request.type === "connect-task-project-bundles")).toMatchObject({
-        taskId: "task-design", environment: "정석맥1",
+        taskId: "task-design", environment: "device-a",
         selections: [
           { sourcePath: "/workspace/a", targetPath: "/workspace/a", branch: "main" },
           { sourcePath: "/workspace/b", targetPath: "/workspace/b", branch: "" },
@@ -2345,7 +2345,7 @@ describe("structured source work editing", () => {
         draft: "API와 Web을 함께 수정", promptRevisions: [], status: "ready", priority: "medium", tags: [],
         projects: projectRows, createdAt: "2026-08-10T00:00:00.000Z", updatedAt: "2026-08-10T00:00:00.000Z",
       }];
-      bootstrap.targets.environments = [{ id: "local", name: "jsj1", local: true, connected: true }];
+      bootstrap.targets.environments = [{ id: "local", name: "device-a", local: true, connected: true }];
       bootstrap.targets.projects = [
         { id: "project-api", name: "API", environmentId: "local", repoId: "repo-api", worktreeId: "wt-api", path: "/workspace/api", branch: "main" },
         { id: "project-web", name: "Web", environmentId: "local", repoId: "repo-web", worktreeId: "wt-web", path: "/workspace/web", branch: "release" },
@@ -2365,12 +2365,12 @@ describe("structured source work editing", () => {
           if (request.type === "task-project-context") {
             return Response.json({ ok: true, value: {
               taskId: "task-design", taskVersion: 7, projects: projectRows, registry: [], recommended: [],
-              environment: "정석맥1", current: null,
+              environment: "device-a", current: null,
             } });
           }
           if (request.type === "link-task-project-bundles") {
             return Response.json({ ok: true, value: {
-              context: { taskId: "task-design", taskVersion: 8, projects: projectRows, registry: [], recommended: [], environment: "정석맥1", current: null },
+              context: { taskId: "task-design", taskVersion: 8, projects: projectRows, registry: [], recommended: [], environment: "device-a", current: null },
             } });
           }
           if (request.type === "start-task-execution") {
@@ -2437,15 +2437,15 @@ describe("structured source work editing", () => {
         value: vi.fn(async (_url: string, init: RequestInit) => {
           const request = JSON.parse(String(init.body));
           return Response.json({ ok: true, value: {
-            taskId: request.taskId, taskVersion: 4, environment: "정석맥1",
+            taskId: request.taskId, taskVersion: 4, environment: "device-a",
             current: { repoId: "repo-current", path: "/workspace/current", branch: "main" },
             projects: [{ role: "target", locatorKind: "folder", locator: "/workspace/already", position: 0 }],
             recommended: [{
-              name: "Current", path: "/workspace/current", environment: "정석맥1", repo_id: "repo-current",
+              name: "Current", path: "/workspace/current", environment: "device-a", repo_id: "repo-current",
               worktrees: [{ id: "wt-current", path: "/workspace/current", branch: "main", is_main: true }],
             }],
             registry: [{
-              name: "Current", path: "/workspace/current", environment: "정석맥1", repo_id: "repo-current",
+              name: "Current", path: "/workspace/current", environment: "device-a", repo_id: "repo-current",
               worktrees: [{ id: "wt-current", path: "/workspace/current", branch: "main", is_main: true }],
             }],
           } });

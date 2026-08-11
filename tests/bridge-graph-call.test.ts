@@ -85,7 +85,7 @@ const fakeCallLog = readFileSync(process.env.ORCA_GRAPH_FAKE_CALL_LOG, "utf8");
 const promptSendCount = fakeCallLog.split("\\n").filter((line) => line.includes('["terminal","send"')).length;
 let result = {};
 if (args[0] === "environment" && args[1] === "list") {
-  result = { environments: process.env.ORCA_GRAPH_FAKE_REMOTE === "1" ? [{ id: "env-jsj2", name: "jsj2" }] : [] };
+  result = { environments: process.env.ORCA_GRAPH_FAKE_REMOTE === "1" ? [{ id: "env-device-b", name: "device-b" }] : [] };
 } else if (args[0] === "worktree" && args[1] === "ps") {
   const paneKey = mode === "stale" ? "new-tab:new-leaf" : "fake-tab:fake-leaf";
   const worktree = {
@@ -182,7 +182,7 @@ process.stdout.write(JSON.stringify({ ok: true, result }));
 `, { mode: 0o755 });
   await writeFile(path.join(runtimeDirectory, "targets.json"), `${JSON.stringify({
     refreshedAt: "2026-08-09T00:00:00.000Z",
-    environments: [{ id: "local", name: "jsj1", local: true, connected: true }],
+    environments: [{ id: "local", name: "device-a", local: true, connected: true }],
     projects: [{ id: "fake-project", name: "Fake project", environmentId: "local", worktreeId: "fake-worktree", path: "/portable/fake-project", branch: "refs/heads/main" }],
     branches: [{ id: "main", branch: "refs/heads/main", environmentId: "local", projectId: "fake-project", repoId: "fake-repo", worktreeId: "fake-worktree", path: "/portable/fake-project" }],
     sessions: [{
@@ -1362,20 +1362,20 @@ describe("bridge graph calls", () => {
     const fake = await installFakeOrca(runtimeDirectory);
     const targetsPath = path.join(runtimeDirectory, "targets.json");
     const targets = JSON.parse(await readFile(targetsPath, "utf8"));
-    targets.environments.push({ id: "env-jsj2", name: "jsj2", local: false, connected: true });
-    targets.projects.push({ id: "remote-project", name: "Remote project", environmentId: "env-jsj2", worktreeId: "remote-worktree" });
+    targets.environments.push({ id: "env-device-b", name: "device-b", local: false, connected: true });
+    targets.projects.push({ id: "remote-project", name: "Remote project", environmentId: "env-device-b", worktreeId: "remote-worktree" });
     await writeFile(targetsPath, `${JSON.stringify(targets)}\n`, "utf8");
 
     await sendToBridge(
       runtimeDirectory,
-      { type: "run-task", taskId: "TASK-remote", routing: { environmentId: "env-jsj2", projectId: "remote-project", model: "gpt-5.6-sol" }, dryRun: false },
+      { type: "run-task", taskId: "TASK-remote", routing: { environmentId: "env-device-b", projectId: "remote-project", model: "gpt-5.6-sol" }, dryRun: false },
       "task TASK-remote executed",
       { ORCA_CLI_COMMAND: fake.command, ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog },
     );
 
     const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
     for (const args of calls.filter((item) => item[0] === "terminal" || item[0] === "worktree")) {
-      expect(args).toEqual(expect.arrayContaining(["--environment", "env-jsj2"]));
+      expect(args).toEqual(expect.arrayContaining(["--environment", "env-device-b"]));
     }
     expect(calls.some((args) => args[0] === "terminal" && args[1] === "create" && args.includes("id:remote-worktree"))).toBe(true);
   });
@@ -2105,25 +2105,25 @@ describe("bridge graph calls", () => {
         ORCA_CLI_COMMAND: fake.command,
         ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
         ORCA_GRAPH_FAKE_REMOTE: "1",
-        ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME: "jsj1",
+        ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME: "device-a",
       },
     );
 
     const targets = JSON.parse(await readFile(path.join(runtimeDirectory, "targets.json"), "utf8"));
     expect(targets.environments).toEqual([
-      { id: "local", name: "jsj1", local: true, connected: true },
-      { id: "env-jsj2", name: "jsj2", local: false, connected: true },
+      { id: "local", name: "device-a", local: true, connected: true },
+      { id: "env-device-b", name: "device-b", local: false, connected: true },
     ]);
     expect(targets.projects).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: "fake-project", environmentId: "local" }),
-      expect.objectContaining({ id: "remote-project", environmentId: "env-jsj2" }),
+      expect.objectContaining({ id: "remote-project", environmentId: "env-device-b" }),
     ]));
     expect(targets.sessions).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: "fake-session", environmentId: "local" }),
-      expect.objectContaining({ id: "remote-session", environmentId: "env-jsj2" }),
+      expect.objectContaining({ id: "remote-session", environmentId: "env-device-b" }),
     ]));
     const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
-    expect(calls.some((args) => args[0] === "project" && args[1] === "list" && args.includes("env-jsj2"))).toBe(true);
+    expect(calls.some((args) => args[0] === "project" && args[1] === "list" && args.includes("env-device-b"))).toBe(true);
   });
 
   describe("shared graph validation matrix", () => {

@@ -116,12 +116,15 @@ describe("structured workspace contract", () => {
     const authEnv = "ORCA_GRAPH_SOURCE_TOKEN";
     envKeys.push(authEnv);
     delete process.env[authEnv];
+    // bootstrap 은 토큰을 담은 전역 변수 이름을 설정한 배포에서만 시도한다.
+    envKeys.push("ORCA_GRAPH_WORKSPACE_SESSION_TOKEN_VAR");
+    process.env.ORCA_GRAPH_WORKSPACE_SESSION_TOKEN_VAR = "window.__WORKSPACE_SESSION_TOKEN__";
     const requests: Array<{ url: string; authorization: string | null }> = [];
     const token = "session-token-from-origin-12345";
     const fetchImpl = async (url: URL, init: RequestInit) => {
       requests.push({ url: url.toString(), authorization: new Headers(init.headers).get("authorization") });
       if (url.pathname === "/") {
-        return new Response(`<script>window.__HERMES_SESSION_TOKEN__="${token}"</script>`, {
+        return new Response(`<script>window.__WORKSPACE_SESSION_TOKEN__="${token}"</script>`, {
           status: 200,
           headers: { "content-type": "text/html" },
         });
@@ -133,14 +136,14 @@ describe("structured workspace contract", () => {
     };
 
     await expect(requestDataSource(
-      { schemaVersion: 1, mode: "structured", url: "https://hermes.example/api/plugins/workspace", authEnv },
+      { schemaVersion: 1, mode: "structured", url: "https://workspace.example/api/plugins/workspace", authEnv },
       "snapshot",
       {},
       { fetchImpl },
     )).resolves.toEqual({ ok: true });
     expect(requests).toEqual([
-      { url: "https://hermes.example/", authorization: null },
-      { url: "https://hermes.example/api/plugins/workspace/snapshot", authorization: `Bearer ${token}` },
+      { url: "https://workspace.example/", authorization: null },
+      { url: "https://workspace.example/api/plugins/workspace/snapshot", authorization: `Bearer ${token}` },
     ]);
     expect(process.env[authEnv]).toBe(token);
   });

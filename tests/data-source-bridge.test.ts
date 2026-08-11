@@ -163,7 +163,7 @@ describe("bridge structured source boundary", () => {
       requests.push({ method: request.method ?? "", url: request.url ?? "", ...(body ? { body } : {}) });
       if (request.method === "GET" && request.url === "/") {
         response.writeHead(200, { "content-type": "text/html" });
-        response.end('<script>window.__HERMES_SESSION_TOKEN__="abcdefghijklmnopqrstuvwxyz012345"</script>');
+        response.end('<script>window.__WORKSPACE_SESSION_TOKEN__="abcdefghijklmnopqrstuvwxyz012345"</script>');
         return;
       }
       if (request.method === "POST" && request.url?.endsWith("/graphs/quick")) {
@@ -208,7 +208,7 @@ describe("bridge structured source boundary", () => {
         ORCA_GRAPH_SKIP_REBUILD: "1",
         ORCA_GRAPH_WORKSPACE_BASE_URL: baseUrl,
         ORCA_GRAPH_WORKSPACE_ALLOW_INSECURE_LOOPBACK: "1",
-        [["ORCA", "GRAPH", "WORK", "TASKS", "ENVIRONMENT"].join("_")]: "Hermes",
+        [["ORCA", "GRAPH", "WORK", "TASKS", "ENVIRONMENT"].join("_")]: "Workspace",
         ORCA_CLI_COMMAND: "/usr/bin/false",
       },
       stdio: ["pipe", "pipe", "pipe"],
@@ -265,7 +265,7 @@ describe("bridge structured source boundary", () => {
       let payload: unknown;
       if (request.method === "GET" && request.url === "/") {
         response.writeHead(200, { "content-type": "text/html" });
-        response.end('<script>window.__HERMES_SESSION_TOKEN__="abcdefghijklmnopqrstuvwxyz012345"</script>');
+        response.end('<script>window.__WORKSPACE_SESSION_TOKEN__="abcdefghijklmnopqrstuvwxyz012345"</script>');
         return;
       }
       if (request.method === "GET" && request.url?.endsWith("/todos/TODO-roundtrip")) {
@@ -327,7 +327,7 @@ describe("bridge structured source boundary", () => {
         ORCA_GRAPH_SKIP_REBUILD: "1",
         ORCA_GRAPH_WORKSPACE_BASE_URL: baseUrl,
         ORCA_GRAPH_WORKSPACE_ALLOW_INSECURE_LOOPBACK: "1",
-        [["ORCA", "GRAPH", "WORK", "TASKS", "ENVIRONMENT"].join("_")]: "Hermes",
+        [["ORCA", "GRAPH", "WORK", "TASKS", "ENVIRONMENT"].join("_")]: "Workspace",
         ORCA_CLI_COMMAND: "/usr/bin/false",
       },
       stdio: ["pipe", "pipe", "pipe"],

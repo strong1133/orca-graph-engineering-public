@@ -83,7 +83,8 @@ describe("public plugin surface", () => {
   });
 
   it("does not regress to private-service names, secrets, or absolute contributor paths", async () => {
-    const roots = ["bridge", "docs", "fixtures", "scripts", "src"];
+    // 테스트 픽스처도 공개된다. 여기 개인 장치 이름이 남으면 그것도 결합이다.
+    const roots = ["bridge", "docs", "fixtures", "scripts", "src", "tests"];
     const files = ["README.md", "CONTRIBUTING.md", "SECURITY.md", "orca-plugin.json", "package.json"];
     for (const directory of roots) files.push(...await publicFiles(directory));
     const forbidden = [
@@ -92,6 +93,10 @@ describe("public plugin surface", () => {
       ["work", "tasks"].join("-"),
       ["work", "tasks"].join("_"),
       ["ff", "genius"].join("-"),
+      ["her", "mes"].join(""),
+      ["jsj", "1"].join(""),
+      ["jsj", "2"].join(""),
+      ["정석", "맥"].join(""),
     ];
     const findings: string[] = [];
     for (const file of files) {

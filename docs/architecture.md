@@ -30,7 +30,7 @@ visible Orca shell terminal
        └─ rebuild dist/panel.html → Orca dev reload
 ```
 
-패널은 Orca가 제공하는 `workspace.readContext`, `terminal.sendText`, `notifications.show`만 사용합니다. Orca plugin API v1은 panel document를 `default-src 'none'; connect-src 'none'`인 opaque sandbox로 감싸므로 sidebar에서 loopback HTTP를 읽을 수 없습니다. 따라서 sidebar는 public `terminal.sendText`로 명령만 전달하고, 응답과 실행 polling이 필요한 동작은 브리지가 여는 same-origin Orca browser tab으로 승격합니다. 브리지는 숨은 background worker가 아니라 사용자가 선택하고 종료할 수 있는 Orca terminal에서 동작합니다. 넓게 보기 탭을 재사용할 때도 현재 HTML을 명시적으로 reload한다. Orca/Hermes 전용 `ORCA_GRAPH_SOURCE_TOKEN`은 누락 시 설정된 원천과 같은 origin의 공개 bootstrap에서만 재취득하며 프로세스 밖으로 직렬화하거나 로그에 남기지 않는다. 그 밖의 인증 환경변수는 자동 탐색하지 않고 fail-closed로 처리한다.
+패널은 Orca가 제공하는 `workspace.readContext`, `terminal.sendText`, `notifications.show`만 사용합니다. Orca plugin API v1은 panel document를 `default-src 'none'; connect-src 'none'`인 opaque sandbox로 감싸므로 sidebar에서 loopback HTTP를 읽을 수 없습니다. 따라서 sidebar는 public `terminal.sendText`로 명령만 전달하고, 응답과 실행 polling이 필요한 동작은 브리지가 여는 same-origin Orca browser tab으로 승격합니다. 브리지는 숨은 background worker가 아니라 사용자가 선택하고 종료할 수 있는 Orca terminal에서 동작합니다. 넓게 보기 탭을 재사용할 때도 현재 HTML을 명시적으로 reload한다. 전용 `ORCA_GRAPH_SOURCE_TOKEN`은 누락 시, 그리고 `ORCA_GRAPH_WORKSPACE_SESSION_TOKEN_VAR`로 토큰을 담은 전역 변수 이름을 설정한 경우에만 설정된 원천과 같은 origin의 공개 bootstrap에서 재취득하며 프로세스 밖으로 직렬화하거나 로그에 남기지 않는다. 그 밖의 인증 환경변수는 자동 탐색하지 않고 fail-closed로 처리한다.
 
 ## 데이터 모델
 

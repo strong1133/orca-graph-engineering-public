@@ -9,7 +9,14 @@ const MAX_FOLDER_STORE_BYTES = 10 * 1024 * 1024;
 const MAX_CATALOG_ITEMS = 500;
 const DEFAULT_TIMEOUT_MS = 8_000;
 const ORCA_SESSION_TOKEN_ENV = "ORCA_GRAPH_SOURCE_TOKEN";
-const HERMES_SESSION_TOKEN_PATTERN = /window\.__HERMES_SESSION_TOKEN__\s*=\s*"([A-Za-z0-9._~-]{20,4096})"/u;
+/* 세션 bootstrap 은 원천이 base page 에 토큰을 심어 두는 배포에서만 쓸 수 있다.
+   토큰을 담은 전역 변수 이름을 설정하지 않으면 bootstrap 자체를 시도하지 않는다. */
+function sessionTokenPattern(environment = process.env) {
+  const variable = String(environment.ORCA_GRAPH_WORKSPACE_SESSION_TOKEN_VAR || "").trim();
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$/u.test(variable)) return null;
+  const escaped = variable.replaceAll(".", "\\.");
+  return new RegExp(`${escaped}\\s*=\\s*"([A-Za-z0-9._~-]{20,4096})"`, "u");
+}
 export const FOLDER_SOURCE_DIRECTORY = ".orca-graph-engineering";
 export const FOLDER_SOURCE_FILENAME = "store.json";
 
@@ -144,7 +151,9 @@ async function bootstrapOrcaSessionToken(config, options) {
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const html = await boundedResponseText(response, MAX_SESSION_BOOTSTRAP_BYTES);
-    const token = HERMES_SESSION_TOKEN_PATTERN.exec(html)?.[1];
+    const pattern = sessionTokenPattern();
+    if (!pattern) throw new Error("session bootstrap is not configured; set ORCA_GRAPH_WORKSPACE_SESSION_TOKEN_VAR");
+    const token = pattern.exec(html)?.[1];
     if (!token) throw new Error("session token was not advertised by the configured origin");
     process.env[ORCA_SESSION_TOKEN_ENV] = token;
     return token;
