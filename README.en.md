@@ -162,6 +162,15 @@ Node-level execution contracts (`role`, `maxAttempts`, `permissions`, `dataClass
 | `ORCA_GRAPH_REQUIRE_RESULT_CONTRACT` | off | Treat an answer with no result line as a failure |
 | `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME` | host name | Display name for this machine |
 | `ORCA_CLI_COMMAND` | platform default | Orca CLI executable |
+| `ORCA_GRAPH_WORKSPACE_BASE_URL` | none | Structured source base URL (HTTPS) |
+| `ORCA_GRAPH_WORKSPACE_ENVIRONMENT` | host name | This device's execution environment name |
+| `ORCA_GRAPH_PRIMARY_ENVIRONMENT` | this device | Reference device for the project registry |
+| `ORCA_GRAPH_WORKSPACE_API_PATH` | `/api/plugins/orca-graph-engineering` | Source API path |
+| `ORCA_GRAPH_WORKSPACE_CLIENT_HEADER` | `X-Orca-Graph-Client` | Client identity header name |
+| `ORCA_GRAPH_WORKSPACE_SESSION_TOKEN_VAR` | none | Global holding the session token on the base page; bootstrap is attempted only when set |
+| `ORCA_GRAPH_WORKSPACE_SESSION_HEADER` | `X-Session-Token` | Session token header name |
+
+Everything a source connection needs comes from the variables above. The plugin source carries no address, name, or token convention belonging to any particular deployment, and a feature you do not configure stays off. Device names come from your setting and the source registry, never from a list the code knows.
 
 ## 12. Known boundaries
 

@@ -8,32 +8,34 @@ const {
   validateWorkTasksBaseUrl,
   workTasksClientFromDataSource,
   workTasksEnvironment,
-} = await import(`../bridge/${["work", "tasks"].join("-")}-client.mjs`);
-const sourceName = ["under", "joy"].join("");
-const apiPath = `/api/plugins/${sourceName}-workspace`;
-const clientHeader = ["X", `${sourceName[0]!.toUpperCase()}${sourceName.slice(1)}`, "MCP", "Client"].join("-");
+} = await import("../bridge/workspace-client.mjs");
+const apiPath = "/api/plugins/orca-graph-engineering";
+// 세션 bootstrap 은 원천이 base page 에 토큰을 심는 배포에서만 쓴다. 변수 이름을
+// 설정하지 않으면 시도조차 하지 않는 것이 새 계약이다.
+process.env.ORCA_GRAPH_WORKSPACE_SESSION_TOKEN_VAR = "window.__WORKSPACE_SESSION_TOKEN__";
+const clientHeader = "X-Orca-Graph-Client";
 
-describe("Work Tasks Hermes client", () => {
+describe("workspace client", () => {
   it("reuses the short-lived dashboard session headers without exposing or persisting the token", async () => {
     const requests: Array<{ url: string; init?: RequestInit }> = [];
     const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       requests.push(init ? { url, init } : { url });
-      if (url === "https://hermes.example.ts.net/") {
-        return new Response('<script>window.__HERMES_SESSION_TOKEN__="abcdefghijklmnopqrstuvwxyz012345"</script>', { status: 200 });
+      if (url === "https://workspace.example.com/") {
+        return new Response('<script>window.__WORKSPACE_SESSION_TOKEN__="abcdefghijklmnopqrstuvwxyz012345"</script>', { status: 200 });
       }
-      return Response.json({ item: { environment: "정석맥1" } });
+      return Response.json({ item: { environment: "device-a" } });
     });
     const client = new WorkTasksClient({
-      baseUrl: "https://hermes.example.ts.net",
+      baseUrl: "https://workspace.example.com",
       clientId: "orca-plugin-test",
       fetchImpl: fetchImpl as typeof fetch,
     });
-    await client.put("/orca-projects/%EC%A0%95%EC%84%9D%EB%A7%A51", { projects: [] });
+    await client.put("/orca-projects/device-a", { projects: [] });
 
     expect(requests).toHaveLength(2);
-    expect(requests[1]?.url).toBe(`https://hermes.example.ts.net${apiPath}/orca-projects/%EC%A0%95%EC%84%9D%EB%A7%A51`);
-    expect((requests[1]?.init?.headers as Record<string, string>)["X-Hermes-Session-Token"]).toBe("abcdefghijklmnopqrstuvwxyz012345");
+    expect(requests[1]?.url).toBe(`https://workspace.example.com${apiPath}/orca-projects/device-a`);
+    expect((requests[1]?.init?.headers as Record<string, string>)["X-Session-Token"]).toBe("abcdefghijklmnopqrstuvwxyz012345");
     expect((requests[1]?.init?.headers as Record<string, string>)[clientHeader]).toBe("orca-plugin-test");
   });
 
@@ -41,13 +43,13 @@ describe("Work Tasks Hermes client", () => {
     const original = "  첫 줄\r\n둘째 줄\n\n끝 공백  ";
     let requestBody = "";
     const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      if (String(input).endsWith(".ts.net/")) {
-        return new Response('window.__HERMES_SESSION_TOKEN__="abcdefghijklmnopqrstuvwxyz012345"', { status: 200 });
+      if (String(input).endsWith("workspace.example.com/")) {
+        return new Response('window.__WORKSPACE_SESSION_TOKEN__="abcdefghijklmnopqrstuvwxyz012345"', { status: 200 });
       }
       requestBody = String(init?.body ?? "");
       return Response.json({ item: { id: "GRAPH-1" } }, { status: 201 });
     });
-    const client = new WorkTasksClient({ baseUrl: "https://hermes.example.ts.net", fetchImpl: fetchImpl as typeof fetch });
+    const client = new WorkTasksClient({ baseUrl: "https://workspace.example.com", fetchImpl: fetchImpl as typeof fetch });
     await client.post("/graphs/GRAPH-1/runs", {
       expected_version: 7,
       trigger_kind: "manual",
@@ -57,8 +59,8 @@ describe("Work Tasks Hermes client", () => {
   });
 
   it("keeps the same URL allow-list as the MCP adapter", () => {
-    expect(validateWorkTasksBaseUrl("https://host.ts.net/")).toBe("https://host.ts.net");
-    expect(() => validateWorkTasksBaseUrl("https://example.com")).toThrow("HTTPS *.ts.net");
+    expect(validateWorkTasksBaseUrl("https://host.example.com/")).toBe("https://host.example.com");
+    expect(() => validateWorkTasksBaseUrl("http://example.com")).toThrow("must be HTTPS");
     expect(validateWorkTasksBaseUrl("http://127.0.0.1:9000", { allowInsecureLoopback: true })).toBe("http://127.0.0.1:9000");
   });
 
@@ -66,11 +68,11 @@ describe("Work Tasks Hermes client", () => {
     const client = workTasksClientFromDataSource({
       schemaVersion: 1,
       mode: "structured",
-      url: `https://hermes.example.ts.net${apiPath}/`,
+      url: `https://workspace.example.com${apiPath}/`,
       authEnv: "ORCA_GRAPH_SOURCE_TOKEN",
     });
-    expect(client?.baseUrl).toBe("https://hermes.example.ts.net");
-    expect(client?.apiBase).toBe(`https://hermes.example.ts.net${apiPath}`);
+    expect(client?.baseUrl).toBe("https://workspace.example.com");
+    expect(client?.apiBase).toBe(`https://workspace.example.com${apiPath}`);
 
     const loopback = workTasksClientFromDataSource({
       schemaVersion: 1,
@@ -81,9 +83,9 @@ describe("Work Tasks Hermes client", () => {
   });
 
   it("does not treat unrelated structured sources as a workspace API", () => {
-    expect(workTasksClientFromDataSource({ mode: "structured", url: "https://hermes.example.ts.net/other" })).toBeNull();
-    expect(workTasksClientFromDataSource({ mode: "structured", url: `https://example.com${apiPath}` })).toBeNull();
-    expect(workTasksClientFromDataSource({ mode: "unstructured", url: `https://hermes.example.ts.net${apiPath}` })).toBeNull();
+    expect(workTasksClientFromDataSource({ mode: "structured", url: "https://workspace.example.com/other" })).toBeNull();
+    expect(workTasksClientFromDataSource({ mode: "structured", url: "https://example.com/api/plugins/other" })).toBeNull();
+    expect(workTasksClientFromDataSource({ mode: "unstructured", url: `https://workspace.example.com${apiPath}` })).toBeNull();
   });
 });
 
@@ -105,12 +107,12 @@ describe("Orca project registry mapping", () => {
   });
 
   it("maps device aliases and relation shapes to the fixed server contract", () => {
-    expect(workTasksEnvironment(undefined, "jsj1")).toBe("정석맥1");
-    expect(workTasksEnvironment(undefined, "jsj-mac-1.local")).toBe("정석맥1");
-    expect(workTasksEnvironment(undefined, "jsj2-local")).toBe("정석맥2");
-    expect(workTasksEnvironment(undefined, "jsj-mac-2.local")).toBe("정석맥2");
-    expect(workTasksEnvironment(undefined, "jsj-air.local")).toBe("jsj-air");
-    expect(workTasksEnvironment(undefined, "Hermes")).toBe("Hermes");
+    // 명시한 이름이 우선이고, 없으면 이 장치의 이름을 그대로 쓴다. 코드가 아는
+    // 장치 목록은 없다 — 목록이 있으면 거기 없는 설치본은 아예 쓸 수 없다.
+    expect(workTasksEnvironment("build-box")).toBe("build-box");
+    expect(workTasksEnvironment("", "laptop-1.local")).toBe("laptop-1.local");
+    expect(workTasksEnvironment(undefined, "  desk-2  ")).toBe("desk-2");
+    expect(workTasksEnvironment(undefined, "")).toBeNull();
     expect(taskProjectInput({
       id: "TP-1", role: "target", locatorKind: "folder", locator: "/workspace/work",
       label: "work", branch: "refs/heads/feature/task-42", position: 2,

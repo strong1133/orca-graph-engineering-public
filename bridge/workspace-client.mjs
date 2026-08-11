@@ -1,15 +1,39 @@
-const SESSION_RE = /window\.__HERMES_SESSION_TOKEN__="(?<value>[A-Za-z0-9._~-]{20,})"/u;
+/* 외부 workspace 원천 클라이언트.
+
+   여기에는 특정 배포처의 이름·주소·토큰 규칙을 넣지 않는다. 전부 설정으로 받고,
+   설정이 없으면 그 기능을 켜지 않는다. 어떤 조직이든 자기 값을 넣어 쓰는 것이
+   목표이지, 누군가의 설치본이 기본값이 되는 것이 아니다. */
+
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
-const VALID_ENVIRONMENTS = new Set(["정석맥1", "정석맥2", "jsj-air", "Hermes"]);
 const SENSITIVE_KEYS = new Set(["authorization", "body", "content", "draft", "input", "input_prompt", "meta_prompt", "password", "prompt", "secret", "token"]);
-const SOURCE_NAME = ["under", "joy"].join("");
-const API_PATH = process.env.ORCA_GRAPH_WORKSPACE_API_PATH || `/api/plugins/${SOURCE_NAME}-workspace`;
-const CLIENT_HEADER = ["X", `${SOURCE_NAME[0].toUpperCase()}${SOURCE_NAME.slice(1)}`, "MCP", "Client"].join("-");
-const ENV_KEYS = {
-  baseUrl: ["WORK", "TASKS", "BASE", "URL"].join("_"),
-  clientId: ["WORK", "TASKS", "CLIENT", "ID"].join("_"),
-  insecure: ["WORK", "TASKS", "ALLOW", "INSECURE", "LOOPBACK"].join("_"),
-};
+const DEFAULT_API_PATH = "/api/plugins/orca-graph-engineering";
+const DEFAULT_CLIENT_HEADER = "X-Orca-Graph-Client";
+const DEFAULT_SESSION_HEADER = "X-Session-Token";
+
+function workspaceSessionHeader(environment = process.env) {
+  const configured = String(environment.ORCA_GRAPH_WORKSPACE_SESSION_HEADER || "").trim();
+  return configured || DEFAULT_SESSION_HEADER;
+}
+
+function workspaceApiPath(environment = process.env) {
+  const configured = String(environment.ORCA_GRAPH_WORKSPACE_API_PATH || "").trim();
+  return configured || DEFAULT_API_PATH;
+}
+
+function workspaceClientHeader(environment = process.env) {
+  const configured = String(environment.ORCA_GRAPH_WORKSPACE_CLIENT_HEADER || "").trim();
+  return configured || DEFAULT_CLIENT_HEADER;
+}
+
+/* 세션 bootstrap은 원천이 base page에 토큰을 심어 두는 배포에서만 쓸 수 있다.
+   전역 변수 이름을 설정하지 않으면 bootstrap 자체를 시도하지 않는다. */
+function sessionTokenPattern(environment = process.env) {
+  const variable = String(environment.ORCA_GRAPH_WORKSPACE_SESSION_TOKEN_VAR || "").trim();
+  // window.__X__ 처럼 전역 경로도 받는다. 정규식 메타문자가 섞이면 만들지 않는다.
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$/u.test(variable)) return null;
+  const escaped = variable.replaceAll(".", "\\.");
+  return new RegExp(`${escaped}="(?<value>[A-Za-z0-9._~-]{20,})"`, "u");
+}
 
 export class WorkTasksClientError extends Error {
   constructor(message, options = {}) {
@@ -35,26 +59,22 @@ export function validateWorkTasksBaseUrl(value, { allowInsecureLoopback = false 
   if (parsed.username || parsed.password || parsed.search || parsed.hash) {
     throw new WorkTasksClientError("the workspace API base URL must not contain credentials, query parameters, or fragments");
   }
-  const tailscale = parsed.protocol === "https:" && parsed.hostname.endsWith(".ts.net");
+  const secure = parsed.protocol === "https:";
   const loopback = allowInsecureLoopback && parsed.protocol === "http:"
     && ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname);
-  if (!tailscale && !loopback) {
-    throw new WorkTasksClientError("the workspace API base URL must be HTTPS *.ts.net (or an explicitly enabled loopback test URL)");
+  if (!secure && !loopback) {
+    throw new WorkTasksClientError("the workspace API base URL must be HTTPS (or an explicitly enabled loopback test URL)");
   }
   return normalized;
 }
 
 export function workTasksEnvironment(value, localName = "") {
-  if (value) {
-    if (!VALID_ENVIRONMENTS.has(value)) throw new WorkTasksClientError(`unknown Work Tasks environment: ${value}`);
-    return value;
-  }
-  const normalized = String(localName).trim().toLocaleLowerCase("ko-KR");
-  if (["jsj1", "jsj-mac-1", "정석맥1"].some((name) => normalized.includes(name))) return "정석맥1";
-  if (["jsj2", "jsj-mac-2", "정석맥2"].some((name) => normalized.includes(name))) return "정석맥2";
-  if (["jsj-air", "jsj air"].some((name) => normalized.includes(name))) return "jsj-air";
-  if (normalized.includes("hermes")) return "Hermes";
-  return null;
+  // 이 장치가 어떤 실행 환경으로 불릴지는 사용자가 정한다. 알려진 이름 목록을
+  // 코드가 들고 있으면 그 목록에 없는 설치본은 쓸 수 없다.
+  const explicit = String(value || "").trim();
+  if (explicit) return explicit;
+  const local = String(localName || "").trim();
+  return local || null;
 }
 
 export function mapOrcaRepos(value, worktreeValue = {}) {
@@ -131,7 +151,7 @@ export function normalizeWorkBranch(value) {
 export class WorkTasksClient {
   constructor({ baseUrl, clientId = "orca-graph-engineering", allowInsecureLoopback = false, fetchImpl = fetch, timeoutMs = 20_000 }) {
     this.baseUrl = validateWorkTasksBaseUrl(baseUrl, { allowInsecureLoopback });
-    this.apiBase = `${this.baseUrl}${API_PATH}`;
+    this.apiBase = `${this.baseUrl}${workspaceApiPath()}`;
     this.clientId = String(clientId || "orca-graph-engineering").trim() || "orca-graph-engineering";
     this.fetchImpl = fetchImpl;
     this.timeoutMs = timeoutMs;
@@ -143,12 +163,14 @@ export class WorkTasksClient {
     try {
       response = await this.fetchImpl(`${this.baseUrl}/`, { redirect: "error", signal: AbortSignal.timeout(this.timeoutMs) });
     } catch (error) {
-      throw new WorkTasksClientError("cannot reach Hermes over the configured Tailscale URL", { cause: error });
+      throw new WorkTasksClientError("cannot reach the workspace over the configured base URL", { cause: error });
     }
     if (!response.ok) throw await this.responseError(response);
     const body = await response.text();
-    const match = SESSION_RE.exec(body);
-    if (!match?.groups?.value) throw new WorkTasksClientError("Hermes did not expose the expected short-lived session bootstrap");
+    const pattern = sessionTokenPattern();
+    if (!pattern) return null;
+    const match = pattern.exec(body);
+    if (!match?.groups?.value) throw new WorkTasksClientError("the workspace did not expose the configured short-lived session bootstrap");
     this.session = match.groups.value;
     return this.session;
   }
@@ -177,14 +199,14 @@ export class WorkTasksClient {
           redirect: "error",
           signal: AbortSignal.timeout(timeoutMs),
           headers: {
-            "X-Hermes-Session-Token": this.session,
-            [CLIENT_HEADER]: this.clientId,
+            [workspaceSessionHeader()]: this.session,
+            [workspaceClientHeader()]: this.clientId,
             ...(payload !== undefined ? { "content-type": "application/json" } : {}),
           },
           ...(payload !== undefined ? { body: JSON.stringify(payload) } : {}),
         });
       } catch (error) {
-        throw new WorkTasksClientError("Work Tasks API request failed over the Tailscale connection", { cause: error });
+        throw new WorkTasksClientError("workspace API request failed", { cause: error });
       }
       if (response.status === 401 && attempt === 0) { this.session = null; continue; }
       if (!response.ok) throw await this.responseError(response);
@@ -206,12 +228,12 @@ export class WorkTasksClient {
 }
 
 export function workTasksClientFromEnvironment(environment = process.env) {
-  const baseUrl = environment.ORCA_GRAPH_WORKSPACE_BASE_URL || environment[ENV_KEYS.baseUrl];
+  const baseUrl = environment.ORCA_GRAPH_WORKSPACE_BASE_URL;
   if (!baseUrl) return null;
   return new WorkTasksClient({
     baseUrl,
-    clientId: environment.ORCA_GRAPH_WORKSPACE_CLIENT_ID || environment[ENV_KEYS.clientId] || "orca-graph-engineering",
-    allowInsecureLoopback: (environment.ORCA_GRAPH_WORKSPACE_ALLOW_INSECURE_LOOPBACK || environment[ENV_KEYS.insecure]) === "1",
+    clientId: environment.ORCA_GRAPH_WORKSPACE_CLIENT_ID || "orca-graph-engineering",
+    allowInsecureLoopback: environment.ORCA_GRAPH_WORKSPACE_ALLOW_INSECURE_LOOPBACK === "1",
   });
 }
 
@@ -220,7 +242,7 @@ export function workTasksClientFromDataSource(config) {
   let endpoint;
   try { endpoint = new URL(config.url); } catch { return null; }
   if (endpoint.username || endpoint.password || endpoint.search || endpoint.hash
-    || endpoint.pathname.replace(/\/+$/u, "") !== API_PATH) return null;
+    || endpoint.pathname.replace(/\/+$/u, "") !== workspaceApiPath()) return null;
   const allowInsecureLoopback = endpoint.protocol === "http:"
     && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
   try {

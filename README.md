@@ -162,6 +162,15 @@ Orca 안에서 **여러 에이전트 작업을 하나의 실행 그래프로 설
 | `ORCA_GRAPH_REQUIRE_RESULT_CONTRACT` | 꺼짐 | 결과 줄 없는 응답을 실패로 처리 |
 | `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME` | 호스트 이름 | 이 장치의 표시 이름 |
 | `ORCA_CLI_COMMAND` | 플랫폼 기본값 | Orca CLI 실행 파일 |
+| `ORCA_GRAPH_WORKSPACE_BASE_URL` | 없음 | 구조화 원천 base URL (HTTPS) |
+| `ORCA_GRAPH_WORKSPACE_ENVIRONMENT` | 호스트 이름 | 이 장치의 실행 환경 이름 |
+| `ORCA_GRAPH_PRIMARY_ENVIRONMENT` | 이 장치 | 프로젝트 registry의 기준 장치 |
+| `ORCA_GRAPH_WORKSPACE_API_PATH` | `/api/plugins/orca-graph-engineering` | 원천 API 경로 |
+| `ORCA_GRAPH_WORKSPACE_CLIENT_HEADER` | `X-Orca-Graph-Client` | 클라이언트 식별 헤더 이름 |
+| `ORCA_GRAPH_WORKSPACE_SESSION_TOKEN_VAR` | 없음 | base page의 세션 토큰 전역 변수. 설정해야 bootstrap을 시도합니다 |
+| `ORCA_GRAPH_WORKSPACE_SESSION_HEADER` | `X-Session-Token` | 세션 토큰 헤더 이름 |
+
+원천 연결에 필요한 값은 전부 위 환경변수로 받습니다. 플러그인 소스에는 특정 배포처의 주소·이름·토큰 규칙이 들어 있지 않으며, 설정하지 않은 기능은 켜지지 않습니다. 장치 이름도 코드가 아는 목록이 아니라 사용자가 정한 값과 원천 registry에서 옵니다.
 
 ## 12. 알려진 경계
 

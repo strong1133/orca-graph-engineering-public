@@ -133,6 +133,8 @@ type TaskProjectContext = {
   registryVersions?: Record<string, number>;
   recommended: RegistryProject[];
   environment: string;
+  /** registry의 기준 장치. 브리지가 알려 주지 않으면 현재 장치를 기준으로 본다. */
+  primaryEnvironment?: string;
   current: { repoId?: string; path?: string; projectId?: string; branch?: string; worktreeId?: string } | null;
 };
 
@@ -3005,8 +3007,14 @@ function mergeRegistryWorktrees(...collections: Array<NonNullable<RegistryProjec
   return [...merged.values()];
 }
 
+/** registry의 기준 장치. 원천이 알려 주지 않으면 현재 장치를 기준으로 본다. */
+function primaryRegistryEnvironment(context: TaskProjectContext): string {
+  return context.primaryEnvironment || context.environment;
+}
+
 function pickerRegistryProjects(context: TaskProjectContext, environment: string): PickerRegistryProject[] {
-  const source = context.registry.filter((project) => project.environment === "정석맥1");
+  const primary = primaryRegistryEnvironment(context);
+  const source = context.registry.filter((project) => project.environment === primary);
   const target = context.registry.filter((project) => project.environment === environment);
   const sourceByIdentity = new Map(source.map((project) => [registryProjectIdentity(project), project]));
   const targetIdentities = new Set(target.map(registryProjectIdentity));
@@ -3019,7 +3027,7 @@ function pickerRegistryProjects(context: TaskProjectContext, environment: string
       sourceWorktrees: mergeRegistryWorktrees(project.worktrees ?? [], sourceProject?.worktrees ?? []),
     };
   });
-  if (environment !== "정석맥1") {
+  if (environment !== primary) {
     for (const project of source) {
       if (targetIdentities.has(registryProjectIdentity(project))) continue;
       choices.push({
@@ -3052,12 +3060,10 @@ function pickerProjectNeedsProvision(project: PickerRegistryProject, branch: str
   return !registryProjectWorktrees(project).some((worktree) => shortBranch(worktree.branch ?? "") === branch);
 }
 
+// 장치 이름은 사용자가 정하고 원천이 registry로 알려 준다. 코드가 이름을 알고 있으면
+// 그 목록에 없는 설치본은 라벨도 선택지도 얻지 못한다.
 function projectEnvironmentLabel(environment: string, current: string): string {
-  if (environment === current) return `${environment} · 이 장치`;
-  if (environment === "정석맥1") return "정석맥1 · jsj1";
-  if (environment === "정석맥2") return "정석맥2 · jsj2";
-  if (environment === "jsj-air") return "jsj-air · MacBook Air";
-  return environment;
+  return environment === current ? `${environment} · 이 장치` : environment;
 }
 
 function taskProjectSection(task: LocalTask): string {
@@ -3084,7 +3090,11 @@ function taskProjectSection(task: LocalTask): string {
   const provisionCount = selectedProjects.filter((project) => pickerProjectNeedsProvision(
     project, selectedTaskProjectBundles.get(project.sourcePath) ?? "",
   )).length;
-  const environments = [...new Set([context.environment, "정석맥1", "정석맥2", "jsj-air", "Hermes", ...context.registry.map((project) => project.environment)])];
+  const environments = [...new Set([
+    context.environment,
+    primaryRegistryEnvironment(context),
+    ...context.registry.map((project) => project.environment),
+  ].filter(Boolean))];
   return `<section class="section task-projects"><div class="section-title">대상 프로젝트 · ${targetProjects.length} ${!targetProjects.length && context.recommended.length ? '<span class="badge">현재 컨텍스트 추천</span>' : ""}<button class="icon ghost" data-action="reload-task-projects" data-id="${esc(task.id)}" aria-label="프로젝트 다시 감지">↻</button></div>
     ${taskProjects.length ? `<ul class="work-link-list task-project-list">${taskProjects.map((project) => `<li><span><strong>${esc(project.label ?? project.locator.split("/").at(-1) ?? project.locator)}</strong><code>${esc(project.locator)}</code><small>${project.role === "target" ? "대상" : "관련"} · ${project.locatorKind}</small></span><label class="task-project-branch"><span>작업 브랜치</span><input data-scope="task-project-branch" data-task-id="${esc(task.id)}" data-project-id="${esc(project.id ?? "")}" data-locator="${esc(project.locator)}" value="${esc(project.branch ?? "")}" placeholder="예: feature/task-42"></label></li>`).join("")}</ul>` : '<p class="help">연결된 대상 프로젝트가 없습니다.</p>'}
     <p class="help">Task 실행 시 target · folder 경로와 작업 브랜치에 정확히 일치하는 Orca 워크트리를 우선 선택합니다.</p>

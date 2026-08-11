@@ -34,7 +34,7 @@ const {
   workTasksClientFromDataSource,
   workTasksClientFromEnvironment,
   workTasksEnvironment,
-} = await import(`./${["work", "tasks"].join("-")}-client.mjs`);
+} = await import("./workspace-client.mjs");
 
 const execFileAsync = promisify(execFile);
 const launchCwd = process.cwd();
@@ -101,12 +101,12 @@ const wideToken = crypto.randomUUID();
 const environmentWorkTasksClient = workTasksClientFromEnvironment();
 let dataSourceWorkTasksClient = workTasksClientFromDataSource(await readJson(dataSourcePath, defaultDataSourcePath));
 let workTasksClient = environmentWorkTasksClient ?? dataSourceWorkTasksClient;
-const workTasksEnvironmentKey = ["ORCA", "GRAPH", "WORK", "TASKS", "ENVIRONMENT"].join("_");
 const localWorkTasksEnvironment = workTasksEnvironment(
-  process.env.ORCA_GRAPH_WORKSPACE_ENVIRONMENT || process.env[workTasksEnvironmentKey],
+  process.env.ORCA_GRAPH_WORKSPACE_ENVIRONMENT,
   process.env.ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME || os.hostname(),
 );
-const primaryProjectEnvironment = "정석맥1";
+// 프로젝트 registry의 기준 장치. 설정하지 않으면 이 장치가 기준이다.
+const primaryProjectEnvironment = String(process.env.ORCA_GRAPH_PRIMARY_ENVIRONMENT || "").trim() || localWorkTasksEnvironment;
 let publishedProjectSignature = null;
 let publishedProjects = [];
 
@@ -200,7 +200,7 @@ async function readTargets() {
 function requireWorkTasks() {
   if (!workTasksClient) throw new Error("the workspace API base URL is not configured in the bridge terminal");
   if (!localWorkTasksEnvironment) {
-    throw new Error("the workspace execution environment must be 정석맥1, 정석맥2, jsj-air, or Hermes");
+    throw new Error("this device has no workspace execution environment name; set ORCA_GRAPH_WORKSPACE_ENVIRONMENT in the bridge terminal");
   }
   return workTasksClient;
 }
@@ -315,6 +315,7 @@ async function taskProjectContext(taskId, workspaceHint = "") {
     registryVersions: Object.fromEntries(registryItems.map((entry) => [entry.environment, Number(entry.version || 0)])),
     recommended,
     environment: localWorkTasksEnvironment,
+    primaryEnvironment: primaryProjectEnvironment,
     current,
   };
 }
@@ -394,7 +395,7 @@ function registryHasBranch(project, branch) {
 }
 
 async function connectTaskProjectBundles(taskId, targetEnvironment, rawSelections) {
-  if (![primaryProjectEnvironment, "정석맥2", "jsj-air", "Hermes"].includes(targetEnvironment)) {
+  if (!targetEnvironment) {
     throw new Error(`지원하지 않는 프로젝트 실행 장치입니다: ${targetEnvironment}`);
   }
   const client = requireWorkTasks();

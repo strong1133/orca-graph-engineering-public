@@ -95,6 +95,8 @@ describe("public plugin surface", () => {
     ];
     const findings: string[] = [];
     for (const file of files) {
+      // 파일 이름도 결합이다. 내용만 훑으면 사설 서비스 이름이 파일명으로 남는다.
+      for (const term of forbidden) if (file.toLowerCase().includes(term)) findings.push(`${file}: private coupling in the file name`);
       const content = await readFile(path.join(root, file), "utf8");
       for (const term of forbidden) if (content.toLowerCase().includes(term)) findings.push(`${file}: private coupling`);
       if (/\/Users\/[^/]+|[A-Za-z]:\\Users\\/u.test(content)) findings.push(`${file}: absolute user path`);

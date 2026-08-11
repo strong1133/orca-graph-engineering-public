@@ -9,6 +9,8 @@ export type FetchImplementation = (
 ) => Promise<Response>;
 
 export class WorkTasksClient {
+  readonly baseUrl: string;
+  readonly apiBase: string;
   constructor(options: {
     baseUrl: string;
     clientId?: string;
@@ -33,3 +35,5 @@ export function taskProjectInput(project: Record<string, unknown>): Record<strin
 export function workTasksClientFromEnvironment(
   environment?: Record<string, string | undefined>,
 ): WorkTasksClient | null;
+export function workTasksClientFromDataSource(config: unknown): WorkTasksClient | null;
+export function todoQuickTaskInput(todo: Record<string, unknown>, idempotencyKey?: string): Record<string, unknown>;
