@@ -1,202 +1,186 @@
 # Orca Graph Engineering
 
-Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 업무를 Orca 프로젝트, 워크트리, 기존 세션, 모델로 라우팅하는 오픈소스 플러그인입니다. 외부 서비스 없이 로컬 JSON만으로 완전히 동작하고, 선택적으로 공개 Data Source contract나 임의 JSON을 연결할 수 있습니다.
+한국어 · [English](README.en.md)
 
-## 주요 기능
+## 1. 빠른 설치
 
-- Task, 마름모 condition, graph-call 노드의 생성·편집과 포트 드래그 연결, 빈 캔버스 즉시 생성
-- 실제 SVG 도형, 4면 연결 포트, 장애물 회피 직교 connector, 편집 가능한 꺾임점·시작/도착, 색상별 화살촉과 Y/N 분기 배지
-- Shift 영역/보조키 다중 선택, 정렬·균등 배치·일괄 라우팅, 복사/붙여넣기/복제, 100단계 undo/redo
-- 고정 노드와 선택 영역을 보존하는 자동 배치 미리보기, Domain·Milestone·superstep·loop 파생 그룹 프레임
-- 확대·이동에 연동되는 점·주요선 모눈, semantic zoom, 정렬 가이드, 벡터 미니맵과 선택 노드 중앙 맞춤
-- 설계/실행 보기 분리, 기본·Task·실행·안전 Inspector 탭, 선택 문맥 툴바와 구조 Problems 패널
-- 그래프 호출 breadcrumb 탐색, 노드 검색, 단축키 도움말, 대형 그래프 드래그·이동 중 DOM 직접 갱신
-- Domain→Milestone→Task/Todo 업무 계층과 Domain·Milestone 독립 관리 화면
-- Task/Todo 목록의 Draft·Meta·Domain·Milestone 통합 검색, 범위·상태 필터, Task의 Domain→Milestone 및 Todo의 그룹→하위그룹 기본 계층, 상태/우선순위 그룹화·개별/전체 접기·펼치기와 정렬
-- 사람 Draft와 Meta Draft의 분리 저장, revision lineage, stale 감지, 자체 포함형 Meta Prompt 생성
-- 독립적인 Task/Todo 상태·우선순위·마감일·태그 관리와 Todo→Task 전환
-- 하나의 Task를 여러 그래프 노드에 연결하고 관리 화면에서 연결 위치로 이동
-- Task 상세에서 현재 Task를 1번으로 고정하고 같은 Domain·Milestone Task를 선택 순서대로 잇는 빠른 그래프 구성
-- sequence, blocks, informs, loop 엣지와 조건 분기, AND/OR join
-- 그래프 목록 검색, lifecycle·실행 단계 필터, 정렬, color dot, 상태 badge, 진행률
-- 그래프 생성, 복제, 보관, 초기화, pin, routine 메타데이터, JSON import/export
-- 🧭 업무프로세스 그래프, 실행별 원문 업무 입력과 회차별 입력 이력
-- 그래프와 노드의 project, Orca worktree branch, session, model, reasoning 라우팅
-- 장치의 Orca repo/worktree registry 게시, Task 대상 folder 프로젝트·실제 워크트리 브랜치 다중 선택, 다른 장치의 Git 프로젝트/worktree 준비
-- path, diamond, router, star, cycle, tree, tool-bipartite topology template
-- superstep, critical path, 병렬 writer/reducer, loop guard, 예산, 권한, provenance 검사
-- retry, timeout, idempotency, compensation, human gate, 실행 이력
-- 그래프에서 다른 그래프를 호출하는 재귀 실행, 라우팅 결합 정책, 실패 전파 정책, 부모/자식 run lineage
-- 좁은 우측 패널과 Orca 중앙 탭 넓게 보기, `목록 보기`/`그래프 보기` FAB
+### 요구 사항
 
-## 로컬 Domain·Milestone·Task·Todo 관리
+| 항목 | 버전 |
+| --- | --- |
+| Orca | `1.4.176` 이상 |
+| Node.js | `22` 이상 |
 
-상단 메뉴의 `Domain 관리`, `Milestone 관리`, `Task 관리`, `Todo 관리`는 데이터 원천을 연결하지 않아도 사용할 수 있습니다. 업무 데이터는 Graph와 함께 Orca 앱 데이터의 `plugin-runtime/orca-graph-engineering/store.json`에 저장되며 다음 관계를 가집니다.
+### 설치
 
-- Domain은 목표, 공통 메모, 제약사항과 owner를 가지며 여러 Milestone을 포함합니다. Milestone은 반드시 하나의 Domain에 속하고 목표, 성공 기준, 상태, 우선순위, 마감일을 가집니다.
-- Task와 Todo는 독립 항목일 수도 있고 Domain 또는 같은 Domain의 Milestone에 속할 수도 있습니다. Milestone을 선택하면 Domain이 자동으로 일치하며, 연결된 업무가 있는 Milestone의 Domain은 임의로 바꿀 수 없습니다.
-- Task/Todo 검색은 제목·ID·태그·사람 Draft·Meta Draft를 함께 찾고, Task는 Domain/Milestone, Todo는 그룹/하위그룹 이름까지 검색합니다. Task는 기본적으로 Domain→Milestone, Todo는 원천의 그룹→하위그룹별로 묶이며 상태와 우선순위 그룹으로 바꿀 수 있습니다. Todo 그룹 계층은 실행 scope인 Domain/Milestone과 독립적입니다. Todo는 원천 화면과 같은 활성 상태(할 일·진행 중)를 기본으로 표시하며, 완료·취소 이력은 `모든 상태` 또는 개별 상태 필터에서 확인할 수 있습니다.
-- 사람 Draft를 고치면 새 immutable revision을 추가하고 이전 Meta Draft는 삭제하지 않은 채 stale로 표시합니다. `Meta Prompt 만들기`는 선택된 Orca bridge worktree에 새 Codex 세션을 만들고 플러그인에 내장된 공개 prompt 계약으로 결과를 생성합니다. Task의 project 관계도 정렬된 context로 전달하며 target locator가 빠진 결과는 9개 H1 구조를 유지한 채 `작업 컨텍스트` 안에 결정적으로 보강합니다. 결과가 고정 9개 섹션 계약을 통과하고 실행 중 사람 Draft revision이 바뀌지 않았을 때만 Meta Draft로 저장합니다.
-- 하나의 Task를 여러 Graph의 Task 노드에 재사용할 수 있습니다. 최신 Meta Draft가 있으면 실행 payload로 사용하고, 없거나 stale이면 현재 사람 Draft를 사용합니다. 제목이나 유효 실행 지시문이 바뀌면 연결된 모든 노드도 함께 갱신됩니다.
-- Task 상세의 `빠른 그래프 구성`은 현재 Task를 시작점으로 고정하고 같은 Domain·Milestone의 활성 Task만 고르게 합니다. 선택 순서는 그대로 Task 노드와 sequence edge 순서가 되며, 구조화 원천에서는 마지막으로 읽은 Task version과 전체 순서를 한 번의 원자적 요청으로 전달합니다.
-- Task·Todo 목록과 상세의 `실행` 버튼은 그래프를 만들지 않고 현재 Meta Draft 또는 사람 Draft를 단건으로 보냅니다. 실행 창은 `머신 → 통합/프로젝트별 배정 → 프로젝트의 워크트리 branch 또는 기존 Orca session과 model`만 보여 줍니다. 현재 활성 Orca worktree와 저장된 Task target/branch를 먼저 추천하며, target folder가 없으면 사용자가 확인한 프로젝트·브랜치 묶음을 실행 직전에 기존 Task project 관계에 한 번의 CAS로 추가합니다. 대상이 여러 개면 모든 프로젝트 context를 통합 session/model로 보내거나 프로젝트별 session/model을 지정할 수 있습니다. 정확한 기존 Orca worktree가 없으면 실행 전에 차단합니다. 로컬 환경 이름은 `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME`으로 지정할 수 있고 저장된 원격 Orca 환경은 대상 갱신 때 자동으로 합쳐집니다.
-- Todo 빠른 실행은 이미 연결된 Task를 재사용하고, 연결이 없으면 원천의 원자적 `POST /todos/{id}/task` 계약과 재시도 가능한 idempotency key로 Task를 먼저 생성·연결한 뒤 그 Task를 실행합니다. Todo의 완료 상태는 바꾸지 않습니다. 로컬/폴더 원천에서도 같은 의미로 Task를 만들며 원래 Todo, Domain·Milestone, Prompt revision lineage를 보존합니다.
-- hard delete 대신 Domain/Milestone 보관, 확인 창이 있는 `Task 삭제`(복원 가능한 보관), Todo 취소를 사용합니다. 활성 하위 Milestone·Task·Todo가 남은 Domain이나 Milestone은 보관할 수 없습니다.
+```bash
+git clone https://github.com/strong1133/orca-graph-engineering-public.git
+cd orca-graph-engineering-public
+corepack enable
+corepack npm ci
+corepack npm run build
+```
 
-기존 Graph에 이미 들어 있던 Task는 처음 열 때 로컬 Task 목록과 사람 Draft revision에 자동 편입됩니다. `로컬 JSON`과 `구조 없음` 모드에서는 로컬 저장소를 직접 편집합니다. 양방향 capability를 제공하는 `구조화 Workspace`에서는 같은 관리 GUI가 Domain·Milestone·Task·Todo·Draft/Meta revision을 원천에 CAS 저장하고, 성공 직후 정본 snapshot으로 교체합니다. 파일 영속화와 Meta Prompt 생성에는 로컬 브리지가 필요하지만 별도의 데이터 원천 서버는 필요하지 않습니다.
+`corepack npm run build`가 `dist/panel.html`을 만듭니다. 이 파일이 없으면 Orca가 패널을 열지 못합니다.
 
-## 그래프 라우팅
+### Orca에 추가
 
-일반 Task 노드의 `project`, `branch`, `session`, `model`, `reasoning`은 필드별로 계산합니다.
+1. Orca 설정에서 플러그인 시스템을 켭니다.
+2. Development plugin 경로로 이 저장소 디렉터리를 지정합니다. 매니페스트는 최상위 `orca-plugin.json`입니다.
+3. 사이드바에 `Graph Engineering` 패널이 나타나면 설치가 끝난 것입니다.
+
+배포용 아카이브가 필요하면 `corepack npm run package:plugin`으로 만들고 `corepack npm run verify:plugin`으로 검증합니다. 압축을 푼 `package/` 디렉터리를 그대로 Development plugin 경로로 쓸 수 있습니다.
+
+### 준비 사항 — 브리지
+
+패널은 Orca 플러그인 API v1의 sandbox 안에서 돕니다. 파일을 저장하거나 에이전트 터미널을 만들려면 **로컬 브리지**가 필요합니다.
+
+1. 이 저장소 디렉터리에서 Orca 터미널을 하나 엽니다.
+2. 그 터미널에서 브리지를 실행합니다.
+
+```bash
+node ./bridge/index.mjs
+```
+
+3. 패널 상단에서 그 터미널을 브리지로 지정합니다.
+4. `Graph Engineering bridge ready`가 보이면 준비 완료입니다. 플러그인을 쓰는 동안 이 터미널은 열어 둡니다.
+
+브리지 없이도 그래프를 그리고 살펴볼 수 있지만, 저장·실행·Meta Prompt 생성은 되지 않습니다.
+
+### 데이터를 어디에 둘지 고르기
+
+패널의 `데이터 원천`에서 셋 중 하나를 고릅니다. 외부 서버 없이도 완전히 동작합니다.
+
+| 모드 | 저장 위치 | 쓰는 경우 |
+| --- | --- | --- |
+| **로컬 JSON**(기본) | Orca 앱 데이터의 `plugin-runtime/orca-graph-engineering/store.json` | 혼자 쓰거나 바로 시작할 때 |
+| **폴더** | 지정한 디렉터리의 `.orca-graph-engineering/store.json` | 일반 저장소나 폴더에 업무 데이터를 함께 두고 Git으로 관리할 때 |
+| **구조화 Workspace** | 외부 HTTP 원천 | 여러 사람·여러 장치가 같은 그래프를 CAS로 공유할 때 |
+
+폴더 모드는 어떤 Git 저장소든 일반 디렉터리든 가리킬 수 있습니다. 첫 연결 시 파일이 없으면 현재 패널 내용으로 한 번 만들고, 이미 있으면 그 파일이 항상 우선합니다.
+
+## 2. 이 플러그인은 무엇인가
+
+Orca 안에서 **여러 에이전트 작업을 하나의 실행 그래프로 설계하고, 각 노드를 실제 Orca 프로젝트·워크트리·세션·모델로 라우팅해 실행**하는 플러그인입니다. 업무 정의(Domain·Milestone·Task·Todo)와 실행 이력을 같은 화면에서 관리합니다.
+
+## 3. 지향하는 바
+
+**추측해서 실행하지 않습니다.** 라우팅 대상이 모호하거나 안전 계약이 충족되지 않으면 실행 전에 멈춥니다. 존재하지 않는 워크트리를 만들어 내지 않고, 지정되지 않은 세션에 작업을 보내지 않습니다.
+
+**무슨 일이 있었는지 남깁니다.** 노드마다 어떤 세션에서 몇 번 시도해 얼마나 걸렸고 무엇을 반환했는지 기록합니다. 실패는 사유 원문과 함께 남고, 사용자가 멈춘 것은 실패가 아니라 취소로 구분합니다.
+
+**되돌릴 수 없는 일에는 사람을 세웁니다.** 비가역 노드는 승인 게이트가 실행 경로를 지배해야 통과하며, 그 게이트는 에이전트가 대신 통과할 수 없습니다.
+
+**로컬에서 완결됩니다.** 외부 서비스 없이 로컬 JSON만으로 전부 동작합니다. 외부 원천은 선택이며, 공개 계약을 따르는 어떤 구현과도 연결할 수 있습니다.
+
+**파괴하지 않습니다.** hard delete 대신 보관을 씁니다. 실행 이력은 초기화해도 지난 run을 지우지 않습니다.
+
+## 4. 그래프 편집
+
+- Task 노드, 마름모 조건 노드, 그래프 호출 노드를 만들고 4면 포트를 드래그해 연결합니다.
+- 장애물을 피하는 직교 connector, 편집 가능한 꺾임점, 분기별 색상과 Y/N 배지.
+- Shift 영역 선택과 보조키 다중 선택, 정렬·균등 배치, 복사/붙여넣기/복제, 100단계 undo/redo.
+- 고정한 노드와 선택 영역을 보존하는 자동 배치 미리보기.
+- 확대·이동에 연동되는 모눈, semantic zoom, 정렬 가이드, 벡터 미니맵.
+- `path`, `diamond`, `router`, `star`, `cycle`, `tree`, `tool-bipartite` topology 템플릿.
+- 노드 검색, 그래프 호출 breadcrumb 탐색, 단축키 도움말.
+
+엣지는 `sequence`, `blocks`, `informs`, `loop` 네 가지이고 조건 분기와 AND/OR join을 지원합니다.
+
+## 5. 업무 관리 — Domain·Milestone·Task·Todo
+
+데이터 원천을 연결하지 않아도 상단 메뉴의 관리 화면을 그대로 씁니다.
+
+- Domain은 목표·제약·owner를 갖고 여러 Milestone을 포함합니다. Milestone은 반드시 한 Domain에 속합니다.
+- Task와 Todo는 독립 항목일 수도, Domain이나 Milestone에 속할 수도 있습니다.
+- 제목·ID·태그·사람 Draft·Meta Draft를 함께 검색하며, 상태·우선순위로 묶고 접을 수 있습니다.
+- 사람 Draft를 고치면 새 immutable revision이 쌓이고 이전 Meta Draft는 지우지 않은 채 stale로 표시됩니다.
+- 하나의 Task를 여러 그래프 노드에 재사용할 수 있고, 제목이나 실행 지시문이 바뀌면 연결된 노드가 함께 갱신됩니다.
+- Task 상세의 `빠른 그래프 구성`은 같은 범위의 Task를 고른 순서대로 이어 그래프를 만듭니다.
+- hard delete 없이 Domain/Milestone 보관, 복원 가능한 Task 보관, Todo 취소를 씁니다.
+
+`Meta Prompt 만들기`는 선택한 브리지 워크트리에 새 에이전트 세션을 만들어, 내장된 공개 프롬프트 계약으로 실행용 프롬프트를 생성합니다. 고정된 9개 섹션 구조를 통과하고 그 사이 사람 Draft가 바뀌지 않았을 때만 저장합니다.
+
+## 6. 라우팅
+
+노드의 `project`, `branch`, `session`, `model`, `reasoning`은 필드마다 이 순서로 정해집니다.
 
 1. 노드 값
 2. 그래프 기본값
 3. Orca 또는 에이전트 기본값
 
-기존 session은 실제 실행 위치와 branch를 결정합니다. 이때 model 값은 session agent family와의 호환성 제약으로만 검사하며 실행 중인 model을 바꾸지 않습니다. 기존 session의 현재 effort를 조회하거나 변경하는 공개 primitive가 없으므로 reasoning 값이 있으면 계획과 실행을 모두 사전 거절합니다. reasoning을 비우면 session의 현재 effort를 그대로 유지합니다. session 없이 project와 branch를 선택하면 그 branch의 기존 Orca-managed worktree에 새 에이전트 terminal을 만듭니다. 아직 Orca worktree가 없는 임의 branch를 플러그인이 묵시적으로 만들지는 않습니다.
+기존 세션을 고르면 그 세션의 프로젝트·워크트리·브랜치가 실제 실행 위치가 됩니다. 이때 model은 세션의 에이전트 종류와 호환되는지만 검사하고 실행 중인 model을 바꾸지 않습니다. 세션 없이 프로젝트와 브랜치를 고르면 그 브랜치의 기존 Orca 워크트리에 새 에이전트 터미널을 만듭니다. **없는 워크트리를 플러그인이 만들어 내지는 않습니다.**
 
-Task·Graph 실행에서 project 선택은 필수가 아닙니다. 실행 머신으로 현재 Mac의 `jsj1`을 선택하면 해당 Orca에 열린 모든 실행 가능한 agent session을 project와 무관하게 선택할 수 있고, 기존 session을 고른 경우 그 session의 project·worktree·branch가 실제 실행 위치가 됩니다.
+새 세션의 reasoning은 모델 catalog가 선언한 값만 고를 수 있습니다. Claude CLI는 `--effort`, Codex는 `model_reasoning_effort`로 받습니다. catalog에 없는 값은 터미널을 만들기 전에 거절합니다.
 
-새 session의 reasoning은 model catalog에 선언된 capability만 선택할 수 있습니다. Claude CLI는 `low`, `medium`, `high`, `xhigh`, `max`를 `--effort`로 받습니다. Codex는 Sol/Terra에서 `low`부터 `ultra`까지, Luna에서 `low`부터 `max`까지를 `model_reasoning_effort`로 받습니다. catalog에 없거나 model이 지원하지 않는 값은 terminal 생성 전에 fail-closed합니다.
+## 7. 실행
 
-대화형 에이전트 terminal은 Orca가 렌더러 경로로 만들며, 그 입구에서 메인 창의 터미널 그래프가 `ready`인지 검사합니다. 창이 다시 로드되는 동안에는 `runtime_unavailable`이 확정적으로 돌아오므로, 브리지는 `orca status`의 graph 상태를 먼저 확인하고 일시적 실패에 한해 지수 백오프로 다시 시도합니다. 대기 예산 기본값은 90초이고 `ORCA_GRAPH_TERMINAL_CREATE_TIMEOUT_MS`로 바꿀 수 있습니다. 예산을 넘기면 마지막 원문 오류와 관측된 graph 상태를 함께 보고하며, 일시적이지 않은 실패는 기다리지 않고 즉시 보고합니다.
+`▶ 실행`은 라우팅과 안전 계약을 먼저 검사하고, 통과한 것만 Orca 터미널로 보냅니다. dry-run 계획은 Orca도 원천도 건드리지 않습니다.
 
-새로 만든 에이전트 세션은 MCP 서버 로딩까지 끝나야 상태를 보고하므로 준비 대기 기본값은 60초이며 `ORCA_GRAPH_AGENT_READY_TIMEOUT_MS`로 바꿀 수 있습니다.
+**실행 전 차단** — 구조 오류, 라벨 없는 조건 분기, 위험 권한 조합, 민감 데이터의 network 정책 위반, idempotency key 누락, 승인 게이트 누락, 토큰 예산 초과, 사용할 수 없는 워크트리·세션.
 
-배정된 에이전트는 마지막 응답 첫 줄에 `RESULT: done` 또는 `RESULT: failed — <이유>`를 남깁니다. Graph 노드의 로컬·원격 실행과 Task·Todo 단건 실행이 모두 같은 계약과 같은 판정을 쓰며, 굵게 쓰거나 목록 기호가 앞에 붙어도 같게 읽습니다. 실패 보고는 실패로 기록하고 후속 노드를 진행하지 않으며, 실패한 실행에도 어느 Orca session에서 돌았는지 남깁니다.
+**에이전트 결과 계약** — 배정된 에이전트는 마지막 응답 첫 줄에 `RESULT: done` 또는 `RESULT: failed — <이유>`를 남깁니다. 굵게 쓰거나 목록 기호가 붙어도 같게 읽습니다. 결과 줄이 아예 없는 응답은 기본적으로 성공으로 보며, `ORCA_GRAPH_REQUIRE_RESULT_CONTRACT=1`을 켜면 그것도 실패로 닫습니다.
 
-브리지의 Orca CLI 호출은 변이 명령만 한 줄로 직렬화합니다. 읽기와 대기(`terminal wait`, `terminal show`, `worktree ps`, `status` 등)는 직렬화하지 않습니다. 이것들을 변이와 같은 줄에 세우면 최대 90초짜리 `tui-idle` 대기 하나가 뒤에 선 모든 호출의 예산을 먹어 Task `프로젝트별 배정` 동시 실행에서 다른 프로젝트가 위양성으로 실패합니다.
+**일시적 실패 회복** — 대화형 에이전트 터미널은 Orca 메인 창 렌더러가 준비된 상태에서만 만들 수 있습니다. 브리지는 `orca status`를 먼저 확인하고 일시적 실패에 한해 지수 백오프로 다시 시도합니다(기본 90초). 일시적이지 않은 실패는 기다리지 않고 보고합니다.
 
-실행 중에도 저장·원천 새로고침·실행 초기화는 즉시 처리됩니다. 실행은 별도 레인에서 서로 겹치지 않게 직렬화하며, 실행 진행 기록은 store를 통째로 덮어쓰지 않고 디스크 최신본 위에 실행 중인 그래프만 얹습니다. 실행 중 사용자가 저장한 다른 편집은 그대로 남습니다.
+**재시도** — 노드의 재시도 예산만큼 다시 보냅니다. 실패한 턴을 남긴 세션은 재사용하지 않고 그 경로의 세션만 새로 만듭니다. 다른 경로의 세션과 문맥 연속성은 유지됩니다.
 
-`실행 현황`의 진행 중 실행에는 `실행 중단`이 있습니다. 중단은 노드 경계에서 관측되므로 진행 중인 노드가 끝난 뒤 멈추며, 이미 에이전트에게 보낸 작업은 되돌리지 않습니다. 중단으로 끝난 실행은 실패가 아니라 `취소`로 기록해 사고와 의도를 구분합니다.
+**가드** — run 시간 한도를 노드 경계에서 검사합니다. 승인 게이트는 사람 승인 없이 통과하지 않습니다.
 
-노드 단위 실행 계약(`role`, `maxAttempts`, `permissions`, `dataClass`, `idempotencyKey`, `timeoutSeconds` 등)은 계약 v1에서 Graph aggregate로 왕복하되 provider가 무시해도 됩니다. 저장 직후 원천이 그 값을 돌려주지 않으면 무엇이 보존되지 않았는지 알립니다 — 그 노드의 승인 게이트·재시도·권한 검사는 실행 시 적용되지 않습니다. Task·Todo 단건 실행의 제한 시간은 `ORCA_GRAPH_WORK_ITEM_TIMEOUT_SECONDS`(기본 900초)로 조절합니다.
+**중단** — 진행 중인 실행에 `■ 실행 중단`이 있습니다. 노드 경계에서 관측되므로 진행 중인 노드가 끝난 뒤 멈추며, 이미 보낸 에이전트 작업은 되돌리지 않습니다. 에이전트 턴을 중간에 끊으면 원격 노드가 점유된 채 남기 때문에 이 경계를 택했습니다. 중단으로 끝난 실행은 실패가 아니라 취소로 기록하며, `graph_call`로 들어간 자식 그래프도 같은 경계에서 멈춥니다.
 
-원격 실행은 승인 게이트를 사람 승인 없이 통과시키지 않고, `graph_call` 노드는 자식 그래프 run 계약이 없으므로 에이전트 작업으로 보내는 대신 차단합니다. 노드 재시도와 `runGuards.maxWallSeconds`는 로컬과 같은 규칙으로 적용합니다.
+**초기화** — `↺ 실행 초기화`는 노드와 연결을 그대로 두고 실행 상태만 되돌립니다. 지난 run 이력은 지우지 않습니다. 실행 중에는 거절하며 먼저 중단해야 합니다.
 
-구조화 원천 실행에서 claim과 complete 사이에 graph version이 움직이면 최신 version으로 한 번 다시 맞춥니다. 그 사이 다른 실행자나 임대 회수로 이미 종결된 노드는 덮어쓰지 않고 그 상태를 받아들입니다. 이 재조정이 없으면 노드가 running으로 잠긴 채 임대가 끝날 때까지 그래프를 다시 돌릴 수 없습니다.
+## 8. 실행 현황과 이력
 
-## 그래프 → 그래프
+`실행 현황`은 실행 레코드와 함께 **노드별 진행 경과**를 보여 줍니다. run마다 회차·상태·집계·업무 입력 원문이 있고, 노드마다 상태·시도 횟수·소요 시간·실행된 Orca 세션·결과 또는 실패 사유 원문이 나옵니다. 캔버스 노드에 마우스를 올리면 같은 내용이 툴팁으로 뜹니다.
 
-`graph_call` 노드는 보관되지 않은 다른 그래프를 자식으로 선택합니다. 호출 순환, 누락된 대상, 보관된 대상은 계획과 실행 전에 차단합니다. 기본 재귀 깊이는 8이며 루트 그래프의 `탐색 hop 제한`으로 바꿀 수 있습니다.
+실행 레코드는 앱 데이터의 `executions.json`에만 저장되고 그래프 데이터나 외부 원천에 섞이지 않습니다. 브리지를 다시 시작하면 끝나지 않은 레코드를 실패로 마감해 유령 상태를 남기지 않습니다.
 
-라우팅 결합 정책은 세 가지입니다.
+## 9. 그래프에서 그래프 호출
 
-- `자식 그래프 설정만`: 자식 그래프 기본값 사용
-- `부모를 채우고 자식 우선`: 부모와 호출 노드 값을 빈칸의 기본값으로 사용하고 자식 값 우선
-- `호출 노드 값 우선`: 부모와 자식 값을 합친 뒤 호출 노드 값 우선
+`graph_call` 노드는 보관되지 않은 다른 그래프를 자식으로 부릅니다. 호출 순환, 없는 대상, 보관된 대상은 실행 전에 차단합니다. 기본 재귀 깊이는 8이며 루트 그래프에서 바꿀 수 있습니다.
 
-자식 그래프 내부에서는 각 자식 노드의 값이 언제나 최종 우선순위입니다. 자식 run에는 `parentRunId`, `parentGraphId`, `parentNodeId`가, 부모 run에는 `childRunIds`가 기록됩니다. 실패 정책은 부모 실패 또는 실패 기록 후 계속 중에서 선택합니다.
+라우팅 결합 정책은 `자식 그래프 설정만`, `부모를 채우고 자식 우선`, `호출 노드 값 우선` 세 가지입니다. 자식 내부에서는 언제나 자식 노드 값이 최종 우선입니다. 자식 run에는 부모 run·그래프·노드가, 부모 run에는 자식 run 목록이 기록됩니다.
 
-## 개발 설치
+## 10. 데이터 원천 연결
 
-요구 사항은 Orca `1.4.176+`와 Node.js `22+`입니다.
+`구조화 Workspace`는 공개 Data Source contract v1을 따르는 어떤 HTTP 구현과도 연결됩니다. 계약은 [docs/data-source-contract.md](docs/data-source-contract.md)에 있습니다.
 
-```bash
-corepack enable
-corepack install
-corepack npm ci
-corepack npm run check
-```
+인증 토큰 값은 저장하지 않습니다. 브리지를 실행할 터미널에 토큰을 환경변수로 두고, UI에는 그 **환경변수 이름만** 입력합니다. 연결 snapshot은 교체 가능한 `source-cache.json`에 저장되며 Git과 배포 패키지에서 제외됩니다.
 
-Orca의 Settings → Plugins에서 Plugin system을 켜고 Development plugin 경로로 이 저장소 루트를 추가합니다. 플러그인 패널에서 다음 순서로 로컬 브리지를 연결합니다.
+노드 단위 실행 계약(`role`, `maxAttempts`, `permissions`, `dataClass`, `idempotencyKey`, `timeoutSeconds` 등)은 Graph aggregate로 왕복하지만 계약상 provider가 무시해도 됩니다. 저장 직후 원천이 그 값을 돌려주지 않으면 무엇이 보존되지 않았는지 알립니다 — 그 노드의 승인 게이트·재시도·권한 검사는 실행 시 적용되지 않습니다.
 
-1. `브리지`를 누릅니다.
-2. 현재 Orca worktree의 쓰기 가능한 shell terminal을 고릅니다.
-3. `브리지 시작`을 누르고 terminal을 열어 둡니다.
-4. `저장` 후 `대상 새로고침`으로 Orca project/session 목록을 불러옵니다.
+## 11. 환경변수
 
-브리지는 플러그인 디렉터리 밖의 Orca 앱 데이터에 로컬 상태를 저장합니다. macOS 기본 경로는 `~/Library/Application Support/Orca/plugin-runtime/orca-graph-engineering`이며 `ORCA_GRAPH_RUNTIME_DIR`로 바꿀 수 있습니다. 이전 버전의 저장소 내부 `runtime/` 데이터는 새 위치가 비어 있을 때 한 번 복사되며 원본은 삭제하지 않습니다. Orca plugin API v1의 sidebar는 `connect-src 'none'` sandbox이므로 응답이 필요한 실행과 실시간 현황은 자동으로 Orca 중앙 탭에 열립니다. 그 화면은 상태 조각만 갱신하며 전체 화면을 재로드하지 않습니다. 상단 `⛶`로도 같은 화면을 직접 열 수 있습니다.
+| 이름 | 기본값 | 뜻 |
+| --- | --- | --- |
+| `ORCA_GRAPH_RUNTIME_DIR` | Orca 앱 데이터 | 브리지 상태 저장 위치 |
+| `ORCA_GRAPH_TERMINAL_CREATE_TIMEOUT_MS` | `90000` | 터미널 생성 재시도 예산 |
+| `ORCA_GRAPH_AGENT_READY_TIMEOUT_MS` | `60000` | 새 에이전트 세션 준비 대기 |
+| `ORCA_GRAPH_WORK_ITEM_TIMEOUT_SECONDS` | `900` | Task·Todo 단건 실행 제한 시간 |
+| `ORCA_GRAPH_REQUIRE_RESULT_CONTRACT` | 꺼짐 | 결과 줄 없는 응답을 실패로 처리 |
+| `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME` | 호스트 이름 | 이 장치의 표시 이름 |
+| `ORCA_CLI_COMMAND` | 플랫폼 기본값 | Orca CLI 실행 파일 |
 
-## 데이터 원천 연결
+## 12. 알려진 경계
 
-상단 `데이터 원천`에서 다음 네 모드를 선택할 수 있습니다.
+- **loop 엣지 실행** — 편집·검사·계획까지만 제공하고 live 실행은 차단합니다. routine scheduler도 아직 메타데이터입니다.
+- **원격 `graph_call`** — 구조화 원천 실행에서는 자식 그래프 run 계약이 없어 차단합니다. 자식 그래프를 직접 실행하거나 로컬·폴더 원천을 쓰십시오.
+- **중단 지점** — 노드 경계에서만 관측됩니다. Task·Todo 단건 실행은 dispatch가 하나뿐이라 중단 지점이 없습니다.
+- **넓게 보기 탭** — 공식 editor contribution이 아니라, 사용자가 실행한 로컬 브리지가 loopback 주소를 Orca 브라우저 탭에 여는 호환 계층입니다.
 
-- `로컬 JSON`: Graph를 Orca 앱 데이터의 `plugin-runtime/orca-graph-engineering/store.json`에 저장합니다.
-- `폴더 / 로컬 Git 저장소`: 이미 존재하는 절대 경로 아래 `.orca-graph-engineering/store.json`에 Graph·Domain·Milestone·Task·Todo를 함께 저장합니다. 파일이 없으면 현재 화면의 데이터를 최초 정본으로 만들고, 이후 `새로고침`은 Git pull이나 외부 편집으로 바뀐 파일을 다시 읽습니다. Git commit·push는 자동 실행하지 않습니다.
-- `구조화 Workspace`: [Data Source contract v1](docs/data-source-contract.md)을 구현한 서버의 Graph·Domain·Milestone·Task·Todo·Prompt lineage와 CAS 버전을 원격 정본으로 사용합니다. Graph aggregate와 플러그인 지원 업무 필드는 모두 양방향이며 stale version은 409로 거절되고 자동 재시도하지 않습니다.
-- `구조 없음`: 임의 JSON의 레코드 배열을 자동 탐색하거나 필드 경로를 지정해 읽기 전용 Task 후보로 사용합니다. 쓰기/CAS 계약이 없으므로 Graph 정본은 로컬에 남습니다.
-
-인증 토큰 값은 저장하지 않습니다. 브리지를 시작할 terminal에 토큰을 환경변수로 설정하고 UI에는 그 환경변수 이름만 입력합니다. Orca/Hermes 연동의 전용 `ORCA_GRAPH_SOURCE_TOKEN`이 브리지 재시작 뒤 비어 있으면 설정된 동일 origin의 세션 bootstrap에서 자동으로 다시 가져오며, 값은 현재 브리지 프로세스에만 유지하고 로그·설정·패키지에는 기록하지 않습니다. 다른 인증 환경변수는 기존처럼 값이 없으면 즉시 실패합니다. 연결 snapshot은 앱 데이터의 교체 가능한 `source-cache.json`에 저장되며 Git과 배포 package에서 제외됩니다. 폴더 모드는 단일 사용자 파일 저장 방식이라 분산 CAS를 제공하지 않으며, 같은 파일을 여러 프로세스가 동시에 수정하지 않는 것을 전제로 합니다.
-
-### 호환 Workspace aggregate API
-
-업무프로세스 run과 장치별 repo registry, Task project 관계를 제공하는 호환 Workspace에 연결할 때 bridge terminal에 다음 공개 설정을 둡니다.
+## 개발
 
 ```bash
-export ORCA_GRAPH_WORKSPACE_BASE_URL="https://your-workspace.ts.net"
-export ORCA_GRAPH_WORKSPACE_ENVIRONMENT="정석맥1" # 정석맥1 | 정석맥2 | jsj-air | Hermes
-export ORCA_GRAPH_WORKSPACE_CLIENT_ID="orca-graph-engineering"
+corepack npm run check      # typecheck + test + build
+corepack npm run typecheck
+corepack npm test
+corepack npm run build
 ```
 
-기본 API prefix가 다른 호환 서버는 `ORCA_GRAPH_WORKSPACE_API_PATH`로 바꿀 수 있습니다. 브리지는 base page에서 짧은 session bootstrap을 얻고 값을 파일·Graph·로그에 남기지 않습니다. 기동 시 `orca repo list --json`의 repo ID, 표시 이름, 로컬 경로, kind, canonical remote를 `PUT /orca-projects/{environment}`에 전체 교체 게시합니다. 이후에는 사용자가 `대상 새로고침`을 실행한 변경 이벤트에서만 다시 비교하며 같은 payload는 보내지 않아 주기 polling을 만들지 않습니다. Task 상세에서 다른 실행 장치를 고르면 그 장치 registry와 기준 장치의 canonical remote를 대조하고, 프로젝트나 선택 branch worktree가 없을 때만 `POST /orca-projects/{environment}/provision`을 호출합니다. 반환된 실제 target path를 Task에 저장하며 source registry version이 충돌하면 최신 목록을 보여 주고 자동 재시도하지 않습니다.
+기여 방법은 [CONTRIBUTING.md](CONTRIBUTING.md), 취약점 신고는 [SECURITY.md](SECURITY.md), 내부 구조는 [docs/architecture.md](docs/architecture.md)를 보십시오.
 
-구조화 snapshot이 업무프로세스 확장을 아직 직접 투영하지 않더라도 aggregate Graph 조회의 `process_enabled`, `current_run.input_prompt`, `recent_runs[].input_prompt`를 같은 CAS 정본에서 보강합니다. 새 업무프로세스 run은 입력이 비어 있으면 시작할 수 없고, 재개는 저장된 입력을 읽기 전용으로 표시합니다. 클라이언트는 입력 문자열을 trim하거나 줄바꿈을 바꾸지 않고 요청 JSON에 그대로 넣습니다.
+## 라이선스
 
-## 배포 artifact
-
-이 프로젝트의 npm tarball은 TypeScript, bridge, 테스트, 문서를 전달하는 **source-only package**입니다. `npm pack`에는 `orca-plugin.json`이 들어가지만 생성물인 `dist/panel.html`은 들어가지 않으므로 그 tarball 자체를 Orca 설치물로 사용하지 않습니다.
-
-Orca에서 바로 읽을 수 있는 별도 plugin bundle은 다음 명령으로 만듭니다.
-
-```bash
-corepack npm run package:plugin
-# release/orca-graph-engineering-plugin-0.2.0.tgz
-```
-
-bundle에는 manifest가 선언한 `dist/panel.html`, bridge, source, fixture, tests, CI와 `npm-shrinkwrap.json`이 함께 들어갑니다. 빌드는 공개 fixture만 사용하고 contributor의 절대 경로를 넣지 않습니다. 압축을 푼 `package/` 디렉터리는 추가 설치 없이 Orca Development plugin 경로로 사용할 수 있으며 기본 bridge의 ping, 저장, reload도 Node.js 내장 모듈과 이미 번들된 panel만 사용합니다. 브리지 기동 시 tokenized loopback response endpoint가 넓게 보기 runtime에 주입됩니다. sidebar는 Orca의 CSP를 우회하지 않고 public terminal action만 사용하며, 응답형 작업은 same-origin 넓게 보기 탭으로 승격합니다. 기존 넓게 보기 탭은 다시 열 때 강제로 reload합니다. 저장 시 TypeScript를 다시 compile하지 않고 `dist/panel.html`의 안전한 JSON bootstrap만 원자적으로 갱신합니다. `corepack npm ci && corepack npm run check`는 기여자용 전체 source/test 재검증 경로이지 plugin 사용 전제조건이 아닙니다. 브리지를 선택할 때는 plugin root에서 열린 shell terminal을 사용해야 portable `node ./bridge/index.mjs` 시작 명령이 정확히 동작합니다.
-
-artifact를 만들지 않고 내용 계약만 검사하려면 `corepack npm run package:plugin -- --dry-run`을 사용합니다. 만들어진 tgz 자체를 독립적으로 검사하려면 `corepack npm run verify:plugin -- release/orca-graph-engineering-plugin-0.2.0.tgz`를 실행하십시오. plugin tar는 정렬된 경로, 고정 timestamp/owner/mode와 canonical gzip header로 생성되며 npm의 `pack` 구현에 의존하지 않습니다. CI는 실제 tgz를 dependency install 전에 추출해 manifest schema, entry, 금지 경로, bridge ping과 realistic save/`dist/panel.html` 갱신을 확인합니다. 그 뒤 pinned `corepack npm ci`/`corepack npm run check`를 별도로 확인하고, 별도 clean directory의 npm 10/11 결과가 byte-for-byte 같은지도 비교합니다. 일부 Node 배포는 기존 bare `npm`을 Corepack shim으로 바꾸지 않으므로 재현 가능한 명령은 `corepack npm ...` 형식을 사용합니다.
-
-## 안전한 실행
-
-그래프 보기 상단의 고정 `실행` 버튼도 같은 세 단계 실행 창을 사용합니다. 통합 session/model을 고르면 모든 Task와 자동 condition evaluator가 한 routing을 상속하고, 프로젝트별 배정을 고르면 Task target folder별 Orca worktree/session/model이 적용됩니다. 실행 창에는 머신·배정 방식·프로젝트·브랜치 또는 기존 세션·모델만 노출합니다. reasoning, 노드별 저수준 override, 조건 강제 선택, 별도 실행 계획 버튼은 노출하지 않으며 저장된 정책을 적용하고 조건은 선행 결과로 자동 판정합니다. 실제 실행을 시작하기 전에 bridge가 AND/OR join과 graph-call routing 결합을 따라 전체 execution plan을 내부 계산하고, 선택된 모든 descendant Task와 자동 condition evaluator의 pure route를 같은 resolver로 검사합니다. graph-call 순환·누락·보관·root hop limit, session/project/worktree, model allow-list/agent family/reasoning capability를 어떤 run record나 Orca call보다 먼저 검사하므로 잘못된 실행은 이력이나 Orca 호출을 남기지 않습니다.
-
-`실행 현황` 메뉴는 시작 요청과 동시에 만들어지는 머신 로컬 실행 레코드를 보여 줍니다. queued/running/completed/failed 상태, 프로젝트별 session·branch·model과 진행률을 표시하며 Task 목록·상세, 그래프 목록·캔버스에도 같은 컴포넌트를 사용합니다. sidebar에서 누르면 same-origin Orca 탭의 실행 현황으로 열리고, 그 화면은 실행 중에 loopback bridge를 짧게 polling한 뒤 완료되면 자동으로 멈춥니다. 레코드는 앱 데이터의 `executions.json`에만 저장되고 portable GraphStore나 외부 데이터 원천에는 섞이지 않으며, 브리지 재시작 시 끝나지 않은 레코드는 실패로 닫아 유령 실행 상태를 남기지 않습니다. 폴링은 내용이 바뀌었을 때만 해당 UI 조각을 갱신하고 panel HTML을 다시 만들지 않습니다.
-
-구조 오류, 존재하지 않는 조건 분기, 위험 권한 조합, loop guard 누락, idempotency·승인 gate 누락, 민감/제한 데이터의 network 정책 위반, token budget 초과도 같은 경계에서 차단됩니다. 조건 분기를 비워 두면 선행 노드의 완료 결과를 별도 evaluator가 읽어 허용된 branch 중 하나를 JSON으로 판정하고, 실행 창에서 branch를 고정하면 evaluator 없이 그 경로를 사용합니다. panel의 실행 modal은 실행 대상 문제를 엔지니어링 finding과 분리해서 보여 주고 idempotency와 sensitive-network 위반은 bridge와 같은 error로 차단합니다. 비가역 노드는 선택된 모든 non-loop 실행 경로를 지배하는 approved human gate가 있어야 하며, unrelated/downstream/pending gate는 승인 경계로 인정되지 않습니다. 로컬 브리지가 아직 지원하지 않는 loop 재진입도 live-run 전에 fail-closed로 차단하며 dry-run 계획과 정적 검사는 계속 제공합니다.
-
-기존 session route는 일반 shell terminal에 전송하지 않습니다. Orca 1.4.176의 `worktree ps` agent pane과 `terminal list`의 tab/leaf identity가 일치하고 agent가 idle이며 `terminal wait --for tui-idle`이 성공해야만 허용합니다. 이 증명은 전체 preflight와 실제 send 직전에 반복하며, target cache가 오래됐거나 agent가 busy이거나 identity를 증명할 수 없으면 fail-closed합니다. 그런 경우 `대상 갱신` 후 다시 시도하거나 project route로 새 agent terminal을 생성하십시오. 이 이중 확인은 경쟁 구간을 줄이지만 Orca가 atomic idle-and-send를 제공하기 전까지 매우 짧은 TOCTOU 가능성은 남습니다.
-
-```bash
-npm run typecheck
-npm test
-npm run build
-npm run check
-npm run bridge
-```
-
-## Orca UI 위치
-
-Orca plugin API v1의 `panels` contribution은 우측 activity bar에만 표시됩니다. 현재 API에는 좌측 사이드바 상단 메뉴 contribution이 없고 manifest의 `contributes` 객체도 strict schema이므로 비공식 필드를 추가할 수 없습니다. 이 플러그인은 지원되는 `blocks` 아이콘으로 우측 진입점을 표시하며, 좌측 메뉴와 중앙 editor contribution은 [upstream proposal](docs/upstream-proposal.md)에 제안 항목으로 기록합니다.
-
-Graph Engineering을 우측 activity bar에서 한 번 선택한 뒤 Orca의 기본 `Mod+L`로 우측 패널을 빠르게 열고 닫을 수 있습니다. macOS에서는 `⌘L`, Windows/Linux에서는 `Ctrl+L`입니다. Orca API가 특정 plugin panel을 직접 선택하는 action은 아직 제공하지 않으므로, 다른 우측 탭을 선택했다면 그 탭이 열립니다.
-
-## 편집기 빠른 사용
-
-- 캔버스에서 노드를 한 번 클릭하면 우측 Inspector가 해당 노드의 `Task/조건/호출` 편집 탭으로 바로 열립니다. Task 탭에서 사람 Draft·Meta Prompt·Meta Draft·Domain·Milestone·상태와 Orca 프로젝트/세션/모델 override를 한 번에 관리하며, 구조화 원천의 Task도 같은 CAS 양방향 저장 경로를 사용합니다.
-- `Task 관리`는 목록과 상세를 분리합니다. 목록의 Task를 누르거나 노드의 `Task 풀페이지 상세 열기`를 누르면 목록 없이 전체 상세 화면이 열리고, `← Task 목록`으로 돌아가기 전까지 상세 편집에 집중합니다.
-- 그래프 설정은 캔버스를 가리지 않도록 기본으로 닫혀 있으며 툴바의 `그래프 설정`에서 명시적으로 엽니다. 그래프 설정과 노드/Task 설정은 한 번에 하나만 열리고, `×`는 다른 설정으로 전환하지 않고 Inspector를 닫습니다.
-- 목록의 두 상태는 `상태 · …`(그래프 lifecycle)와 `최근 실행 · …`(최신 run)으로 구분합니다. `running` run에 30분 이상 실행 중·대기 노드가 없으면 `확인 필요`로 표시하고 `남은 실행 상태 정리`로 run을 취소 마감한 뒤 저장할 수 있습니다.
-- 노드의 네 방향 포트를 끌어 다른 노드에 놓으면 바로 연결됩니다. 빈 캔버스에 놓으면 연결된 Task·Condition·Graph call을 고르는 빠른 생성 메뉴가 열리며, 빈 캔버스 우클릭으로도 같은 메뉴를 열 수 있습니다.
-- `Shift` 드래그는 영역 선택, `⌘/Ctrl` 또는 `Shift` 클릭은 선택 추가/해제입니다. `⌘/Ctrl+C/V/D`, `⌘/Ctrl+Z`, `⌘/Ctrl+Shift+Z`, Delete, 방향키를 지원하며 `?`에서 전체 단축키를 확인합니다.
-- 자동 정렬은 즉시 덮어쓰지 않고 미리보기를 표시합니다. 선택 노드만 정렬할 수 있고 `위치 고정` 노드는 유지됩니다.
-- `설계`는 구조와 라우팅을 편집하고, `실행 보기`는 Inspector와 구조 편집을 잠근 채 상태·시도 횟수·소요 시간·오류·Human gate를 강조합니다.
-- 축소하면 부가 정보가 단계적으로 사라지는 semantic zoom이 적용됩니다. `Problems`는 구조·라우팅 문제를 한곳에 모으고 항목을 누르면 해당 노드로 이동합니다.
-
-## 현재 한계
-
-- 중앙 탭 넓게 보기는 공식 editor contribution이 아니라 사용자가 실행한 로컬 브리지가 loopback 주소를 Orca browser tab에 여는 호환 계층입니다.
-- condition 판정은 사용자가 branch label을 지정합니다.
-- routine scheduler와 loop edge 재진입은 아직 편집·검사 모델만 제공합니다.
-- 체크포인트, 권한, provenance의 일부는 선언과 사전 검사 단계이며 Orca가 결과·사용량 API를 제공해야 완전하게 강제할 수 있습니다.
-- 로컬 단일 사용자 저장소는 분산 CAS/claim을 제공하지 않습니다.
-- 구조화 원천의 기존 Domain·Milestone·Task·Todo·Draft/Meta는 capability가 켜져 있으면 플러그인에서도 편집할 수 있습니다. 원천 고유의 Reference·Journal·Execution 같은 메뉴까지 복제하지 않습니다.
-- Data Source contract v1은 분산 실행 claim/complete를 아직 정의하지 않습니다. 구조화 원천 연결 중 실제 실행은 원천 Workspace에서 시작하며 로컬 브리지는 실행 상태가 갈라지지 않도록 fail-closed합니다.
-
-설계는 [Architecture](docs/architecture.md), Orca 제안은 [Upstream proposal](docs/upstream-proposal.md), 책의 장별 반영 검수는 [Graph Engineering reference](docs/graph-engineering-reference.md)를 참고하십시오.
-
-기여 절차와 재현 가능한 품질 게이트는 [Contributing](CONTRIBUTING.md), 보안 제보와 신뢰 경계는 [Security policy](SECURITY.md)를 참고하십시오. 모든 pull request는 Node.js 22에서 `npm ci`와 `npm run check`를 실행하는 CI를 통과해야 합니다.
-
-Orca 공식 upstream은 [`stablyai/orca`](https://github.com/stablyai/orca)입니다. 이 저장소는 MIT License로 배포합니다.
+MIT
