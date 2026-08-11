@@ -1298,6 +1298,27 @@ describe("bridge graph calls", () => {
     expect(await readCallLog(fake.callLog)).toBe("");
   });
 
+  it("lets an explicitly selected Orca session determine the actual project", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const fake = await installFakeOrca(runtimeDirectory);
+    const graph = executionGraph("existing-session-project-mismatch", [taskNode("work")], [], {
+      projectId: "second-project",
+      sessionId: "fake-session",
+    });
+    await writeGraphStore(runtimeDirectory, [graph]);
+
+    await sendToBridge(
+      runtimeDirectory,
+      { type: "run", graphId: graph.id, dryRun: false },
+      `graph ${graph.id} executed`,
+      { ORCA_CLI_COMMAND: fake.command, ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "send")).toHaveLength(1);
+  });
+
   describe.each([true, false])("existing-session reasoning override dryRun=%s", (dryRun) => {
     it("rejects instead of silently ignoring the requested effort", async () => {
       const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));

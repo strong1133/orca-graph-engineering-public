@@ -1395,15 +1395,41 @@ function branchOptions(projectId: string | undefined, selected: string | undefin
   ].join("");
 }
 
-function sessionOptions(selected: string | undefined, inherit = false, environmentId?: string, projectId?: string): string {
+function sessionOptions(selected: string | undefined, inherit = false, environmentId?: string, _projectId?: string): string {
   const targetEnvironmentId = routeEnvironmentId(environmentId);
   return [
     option("", inherit ? "그래프 기본값 상속" : "세션 미지정 · 새 세션", selected),
     ...targets.sessions
-      .filter((item) => routeEnvironmentId(item.environmentId) === targetEnvironmentId
-        && (!projectId || !item.projectId || item.projectId === projectId))
+      .filter((item) => routeEnvironmentId(item.environmentId) === targetEnvironmentId)
       .map((item) => option(item.id, `${item.title} · ${projectName(item.projectId, item.environmentId)}${item.branch ? ` · ${shortBranch(item.branch)}` : ""}`, selected)),
   ].join("");
+}
+
+function sessionForRoute(route: RoutingTarget, sessionId: string): OrcaTargets["sessions"][number] | undefined {
+  return targets.sessions.find((item) => item.id === sessionId
+    && routeEnvironmentId(item.environmentId) === routeEnvironmentId(route.environmentId));
+}
+
+function syncRouteSession(route: RoutingTarget, sessionId: string): boolean {
+  if (!sessionId) {
+    delete route.sessionId;
+    return true;
+  }
+  const session = sessionForRoute(route, sessionId);
+  if (!session) return false;
+  route.sessionId = session.id;
+  if (session.projectId) route.projectId = session.projectId;
+  if (session.branch) route.branch = shortBranch(session.branch);
+  const matchingModel = targets.models.find((item) => item.agent === session.agentType);
+  if (matchingModel) route.model = matchingModel.id;
+  delete route.reasoning;
+  return true;
+}
+
+function clearMismatchedRouteSession(route: RoutingTarget): void {
+  if (!route.sessionId) return;
+  const session = sessionForRoute(route, route.sessionId);
+  if (!session || (route.projectId && session.projectId !== route.projectId)) delete route.sessionId;
 }
 
 function routingTargetMode(route: RoutingTarget): "worktree" | "session" {
@@ -1416,17 +1442,9 @@ function setRoutingTargetMode(route: RoutingTarget, mode: string): boolean {
     return true;
   }
   const environmentId = routeEnvironmentId(route.environmentId);
-  const session = targets.sessions.find((item) => routeEnvironmentId(item.environmentId) === environmentId
-    && (!route.projectId || !item.projectId || item.projectId === route.projectId)
-    && (!route.branch || !item.branch || shortBranch(item.branch) === shortBranch(route.branch)));
+  const session = targets.sessions.find((item) => routeEnvironmentId(item.environmentId) === environmentId);
   if (!session) return false;
-  route.sessionId = session.id;
-  if (session.projectId) route.projectId = session.projectId;
-  if (session.branch) route.branch = shortBranch(session.branch);
-  const matchingModel = targets.models.find((item) => item.agent === session.agentType);
-  if (matchingModel) route.model = matchingModel.id;
-  delete route.reasoning;
-  return true;
+  return syncRouteSession(route, session.id);
 }
 
 function modelOptions(selected: string | undefined, inherit = false): string {
@@ -2090,7 +2108,7 @@ function graphInspector(graph: GraphDefinition): string {
         <div class="section-title">Orca 실행 기본값</div>
         <p class="help">프로젝트·세션·모델은 독립적으로 지정할 수 있습니다. 노드에 값이 있으면 그 필드만 우선합니다.</p>
         <label class="field"><span>프로젝트</span><select data-scope="graph-routing" data-field="projectId">${projectOptions(graph.defaults.projectId)}</select></label>
-        <label class="field"><span>세션</span><select data-scope="graph-routing" data-field="sessionId">${sessionOptions(graph.defaults.sessionId)}</select></label>
+        <label class="field"><span>세션</span><select data-scope="graph-routing" data-field="sessionId">${sessionOptions(graph.defaults.sessionId, false, graph.defaults.environmentId, graph.defaults.projectId)}</select></label>
         <div class="field-row">
           <label class="field"><span>모델</span><select data-scope="graph-routing" data-field="model">${modelOptions(graph.defaults.model)}</select></label>
           <label class="field"><span>Reasoning</span><select data-scope="graph-routing" data-field="reasoning">
@@ -2190,7 +2208,7 @@ function nodeRoutingEditor(graph: GraphDefinition, node: GraphNode): string {
     <div class="section-title">Orca 실행 대상</div>
     <p class="help">프로젝트·세션·모델을 필요한 항목만 지정할 수 있습니다. 비운 항목은 그래프 기본값을 상속하고, 이 노드의 선택값이 우선합니다.</p>
     <label class="field"><span>프로젝트</span><select data-scope="node-routing" data-field="projectId">${projectOptions(node.routing?.projectId, true)}</select></label>
-    <label class="field"><span>세션</span><select data-scope="node-routing" data-field="sessionId">${sessionOptions(node.routing?.sessionId, true)}</select></label>
+    <label class="field"><span>세션</span><select data-scope="node-routing" data-field="sessionId">${sessionOptions(node.routing?.sessionId, true, route.environmentId, route.projectId)}</select></label>
     <div class="field-row">
       <label class="field"><span>모델</span><select data-scope="node-routing" data-field="model">${modelOptions(node.routing?.model, true)}</select></label>
       <label class="field"><span>Reasoning</span><select data-scope="node-routing" data-field="reasoning">${reasoningOptions(node.routing?.reasoning, route.model, { inherit: true, existingSession })}</select></label>
@@ -2397,6 +2415,8 @@ function renderModal(): string {
   if (!view.modal) return "";
   if (view.modal.kind === "bridge") {
     const context = view.modal.context;
+    const bridgeTerminalAvailable = Boolean(store.bridgeTerminalId)
+      && Boolean(context?.terminals.some((terminal) => terminal.id === store.bridgeTerminalId));
     return `<div class="modal-backdrop"><section class="modal" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="modal-title">
       <div class="modal-head"><strong id="modal-title">로컬 브리지 연결</strong><button class="icon ghost" data-action="close-modal" data-modal-initial-focus aria-label="닫기">×</button></div>
       <div class="modal-body">
@@ -2408,7 +2428,7 @@ function renderModal(): string {
         </div>` : ""}
         <p class="help">셸 터미널을 고른 뒤 브리지 시작을 누르십시오. Codex/Claude TUI가 실행 중인 터미널은 선택하지 마십시오.</p>
       </div>
-      <div class="modal-actions"><button data-action="close-modal">닫기</button><button class="primary" data-action="start-bridge" ${store.bridgeTerminalId ? "" : "disabled"}>브리지 시작</button></div>
+      <div class="modal-actions"><button data-action="close-modal">닫기</button><button class="primary" data-action="start-bridge" ${bridgeTerminalAvailable ? "" : "disabled"}>브리지 시작</button></div>
     </section></div>`;
   }
   if (view.modal.kind === "data-source") {
@@ -3738,11 +3758,43 @@ async function chooseBridge(): Promise<void> {
   openModal({ kind: "bridge", loading: true, context: null });
   try {
     const context = await hostCall<WorkspaceContext>("workspace.readContext", {});
-    view.modal = { kind: "bridge", loading: false, context };
+    const staleSelection = Boolean(store.bridgeTerminalId)
+      && !context?.terminals.some((terminal) => terminal.id === store.bridgeTerminalId);
+    if (staleSelection) {
+      delete store.bridgeTerminalId;
+      delete store.bridgeWorkspace;
+      view.dirty = true;
+    }
+    view.modal = {
+      kind: "bridge",
+      loading: false,
+      context,
+      ...(staleSelection ? { error: "저장된 브리지 터미널이 현재 Orca worktree에 없어 선택을 해제했습니다. 현재 worktree의 셸 터미널을 다시 선택하십시오." } : {}),
+    };
   } catch (error) {
     view.modal = { kind: "bridge", loading: false, context: null, error: error instanceof Error ? error.message : String(error) };
   }
   render();
+}
+
+async function requireCurrentBridgeTerminal(): Promise<string> {
+  const terminalId = store.bridgeTerminalId;
+  if (!terminalId) throw new Error("먼저 브리지 터미널을 선택하십시오.");
+  const context = await hostCall<WorkspaceContext>("workspace.readContext", {});
+  if (context?.terminals.some((terminal) => terminal.id === terminalId)) return terminalId;
+  delete store.bridgeTerminalId;
+  delete store.bridgeWorkspace;
+  view.dirty = true;
+  render();
+  throw new Error("브리지 터미널이 현재 Orca worktree에 없습니다. 브리지에서 현재 worktree의 셸 터미널을 다시 선택하십시오.");
+}
+
+async function startBridge(): Promise<void> {
+  const terminalId = await requireCurrentBridgeTerminal();
+  const command = `node ${JSON.stringify(`${bootstrap.pluginRoot}/bridge/index.mjs`)}`;
+  await hostCall("terminal.sendText", { terminalId, text: command, enter: true });
+  closeModal();
+  toast("브리지 시작 명령을 보냈습니다. 1초 뒤 저장해 보십시오.");
 }
 
 async function sendBridge<T = unknown>(payload: unknown): Promise<T | undefined> {
@@ -3767,13 +3819,14 @@ async function sendBridge<T = unknown>(payload: unknown): Promise<T | undefined>
     }
   }
   if (!store.bridgeTerminalId) throw new Error("먼저 브리지 터미널을 선택하십시오.");
+  const terminalId = await requireCurrentBridgeTerminal();
   const frames = encodeBridgeFrames(payload);
   if (frames.length > 128) throw new Error("Graph·Domain·Milestone·Task·Todo 데이터가 현재 패널 전송 한도를 넘었습니다. Graph 또는 업무 목록을 나누어 주십시오.");
   for (const frame of frames) {
     // Some Orca terminal backends expose a line-buffered PTY even though the
     // bridge requests raw mode. Enter commits the frame in both modes; the
     // bridge strips the trailing control character before parsing it.
-    await hostCall("terminal.sendText", { terminalId: store.bridgeTerminalId, text: frame, enter: true });
+    await hostCall("terminal.sendText", { terminalId, text: frame, enter: true });
   }
   try { window.sessionStorage.setItem(pendingBridgeSyncKey, new Date().toISOString()); } catch { /* optional WebView storage */ }
   window.setTimeout(() => {
@@ -5091,10 +5144,7 @@ app.addEventListener("click", (event) => {
       view.dirty = true; render(); break;
     }
     case "start-bridge": {
-      if (!store.bridgeTerminalId) return;
-      const command = `node ${JSON.stringify(`${bootstrap.pluginRoot}/bridge/index.mjs`)}`;
-      void hostCall("terminal.sendText", { terminalId: store.bridgeTerminalId, text: command, enter: true })
-        .then(() => { closeModal(); toast("브리지 시작 명령을 보냈습니다. 1초 뒤 저장해 보십시오."); })
+      void startBridge()
         .catch((error) => toast(error instanceof Error ? error.message : String(error)));
       break;
     }
@@ -5312,7 +5362,7 @@ app.addEventListener("change", (event) => {
     if (!locator || !view.modal.projectRoutings[locator]) return;
     const routing = view.modal.projectRoutings[locator]!;
     if (field === "targetMode") {
-      if (!setRoutingTargetMode(routing, String(raw))) toast("선택한 프로젝트에 사용 가능한 Orca 세션이 없습니다.");
+      if (!setRoutingTargetMode(routing, String(raw))) toast("현재 Orca 환경에 사용 가능한 에이전트 세션이 없습니다.");
       else {
         if (view.modal.executionMode === "single_session") syncRunPrimaryRouting(view.modal, runModalReferences(view.modal));
         render();
@@ -5323,11 +5373,10 @@ app.addEventListener("change", (event) => {
     else delete (routing as Record<string, unknown>)[field];
     if (field === "model") delete routing.reasoning;
     if (field === "sessionId" && typeof raw === "string" && raw) {
-      const session = targets.sessions.find((item) => item.id === raw);
-      if (session?.branch) routing.branch = shortBranch(session.branch);
-      const matchingModel = targets.models.find((item) => item.agent === session?.agentType);
-      if (matchingModel) routing.model = matchingModel.id;
-      delete routing.reasoning;
+      if (!syncRouteSession(routing, raw)) {
+        delete routing.sessionId;
+        toast("선택한 Orca 환경의 세션만 사용할 수 있습니다.");
+      }
     }
     if (view.modal.executionMode === "single_session") syncRunPrimaryRouting(view.modal, runModalReferences(view.modal));
     render();
@@ -5335,7 +5384,7 @@ app.addEventListener("change", (event) => {
   } else if (scope === "task-run-routing" && view.modal?.kind === "task-run") {
     const modal = view.modal;
     if (field === "targetMode") {
-      if (!setRoutingTargetMode(modal.routing, String(raw))) toast("선택한 프로젝트에 사용 가능한 Orca 세션이 없습니다.");
+      if (!setRoutingTargetMode(modal.routing, String(raw))) toast("현재 Orca 환경에 사용 가능한 에이전트 세션이 없습니다.");
       else render();
       return;
     }
@@ -5357,13 +5406,12 @@ app.addEventListener("change", (event) => {
         && routeEnvironmentId(item.environmentId) === routeEnvironmentId(modal.routing.environmentId));
       if (project?.branch) view.modal.routing.branch = project.branch;
       else delete view.modal.routing.branch;
+      clearMismatchedRouteSession(view.modal.routing);
     } else if (field === "sessionId" && typeof raw === "string" && raw) {
-      const environmentId = routeEnvironmentId(view.modal.routing.environmentId);
-      const session = targets.sessions.find((item) => item.id === raw && routeEnvironmentId(item.environmentId) === environmentId);
-      const matchingModel = targets.models.find((item) => item.agent === session?.agentType);
-      if (matchingModel) view.modal.routing.model = matchingModel.id;
-      if (session?.branch) view.modal.routing.branch = session.branch;
-      delete view.modal.routing.reasoning;
+      if (!syncRouteSession(view.modal.routing, raw)) {
+        delete view.modal.routing.sessionId;
+        toast("선택한 Orca 환경의 세션만 사용할 수 있습니다.");
+      }
     }
     render();
     return;
@@ -5377,7 +5425,7 @@ app.addEventListener("change", (event) => {
     if (!locator || !view.modal.projectRoutings[locator]) return;
     const routing = view.modal.projectRoutings[locator]!;
     if (field === "targetMode") {
-      if (!setRoutingTargetMode(routing, String(raw))) toast("선택한 프로젝트에 사용 가능한 Orca 세션이 없습니다.");
+      if (!setRoutingTargetMode(routing, String(raw))) toast("현재 Orca 환경에 사용 가능한 에이전트 세션이 없습니다.");
       else {
         if (view.modal.executionMode === "single_session") syncRunPrimaryRouting(view.modal, runModalReferences(view.modal));
         render();
@@ -5388,11 +5436,10 @@ app.addEventListener("change", (event) => {
     else delete (routing as Record<string, unknown>)[field];
     if (field === "model") delete routing.reasoning;
     if (field === "sessionId" && typeof raw === "string" && raw) {
-      const session = targets.sessions.find((item) => item.id === raw);
-      if (session?.branch) routing.branch = shortBranch(session.branch);
-      const matchingModel = targets.models.find((item) => item.agent === session?.agentType);
-      if (matchingModel) routing.model = matchingModel.id;
-      delete routing.reasoning;
+      if (!syncRouteSession(routing, raw)) {
+        delete routing.sessionId;
+        toast("선택한 Orca 환경의 세션만 사용할 수 있습니다.");
+      }
     }
     if (view.modal.executionMode === "single_session") syncRunPrimaryRouting(view.modal, runModalReferences(view.modal));
     render();
@@ -5400,7 +5447,7 @@ app.addEventListener("change", (event) => {
   } else if (scope === "run-routing" && view.modal?.kind === "run") {
     const modal = view.modal;
     if (field === "targetMode") {
-      if (!setRoutingTargetMode(modal.defaults, String(raw))) toast("선택한 프로젝트에 사용 가능한 Orca 세션이 없습니다.");
+      if (!setRoutingTargetMode(modal.defaults, String(raw))) toast("현재 Orca 환경에 사용 가능한 에이전트 세션이 없습니다.");
       else render();
       return;
     }
@@ -5422,13 +5469,12 @@ app.addEventListener("change", (event) => {
         && routeEnvironmentId(item.environmentId) === routeEnvironmentId(modal.defaults.environmentId));
       if (project?.branch) view.modal.defaults.branch = project.branch;
       else delete view.modal.defaults.branch;
-      delete view.modal.defaults.sessionId;
+      clearMismatchedRouteSession(view.modal.defaults);
     } else if (field === "sessionId" && typeof raw === "string" && raw) {
-      const session = targets.sessions.find((item) => item.id === raw);
-      const matchingModel = targets.models.find((item) => item.agent === session?.agentType);
-      if (matchingModel) view.modal.defaults.model = matchingModel.id;
-      if (session?.branch) view.modal.defaults.branch = session.branch;
-      delete view.modal.defaults.reasoning;
+      if (!syncRouteSession(view.modal.defaults, raw)) {
+        delete view.modal.defaults.sessionId;
+        toast("선택한 Orca 환경의 세션만 사용할 수 있습니다.");
+      }
     }
     render();
     return;
@@ -5531,8 +5577,16 @@ app.addEventListener("change", (event) => {
     const mutable = graph as unknown as Record<string, unknown>;
     mutable[field] = input.type === "number" ? (input.value ? Number(input.value) : undefined) : raw;
   } else if (scope === "graph-routing") {
-    if (raw) (graph.defaults as Record<string, unknown>)[field] = raw;
-    else delete (graph.defaults as Record<string, unknown>)[field];
+    if (field === "sessionId") {
+      if (!syncRouteSession(graph.defaults, String(raw))) {
+        delete graph.defaults.sessionId;
+        toast("선택한 Orca 환경의 세션만 사용할 수 있습니다.");
+      }
+    } else {
+      if (raw) (graph.defaults as Record<string, unknown>)[field] = raw;
+      else delete (graph.defaults as Record<string, unknown>)[field];
+      if (field === "projectId" || field === "environmentId") clearMismatchedRouteSession(graph.defaults);
+    }
   } else if (scope === "guard") {
     if (input.value) (graph.runGuards as unknown as Record<string, unknown>)[field] = Number(input.value);
     else delete (graph.runGuards as unknown as Record<string, unknown>)[field];
@@ -5579,8 +5633,27 @@ app.addEventListener("change", (event) => {
     }
   } else if (scope === "node-routing" && node) {
     node.routing ??= {};
-    if (raw) (node.routing as unknown as Record<string, unknown>)[field] = raw;
-    else delete (node.routing as unknown as Record<string, unknown>)[field];
+    if (field === "sessionId") {
+      if (!raw) {
+        delete node.routing.sessionId;
+      } else {
+      const effective = effectiveRouting(graph, node);
+      const candidateRoute: RoutingTarget = {
+        ...(effective.environmentId ? { environmentId: effective.environmentId } : {}),
+        ...(effective.projectId ? { projectId: effective.projectId } : {}),
+        ...node.routing,
+      };
+      if (syncRouteSession(candidateRoute, String(raw))) node.routing = { ...node.routing, ...candidateRoute };
+      else {
+        delete node.routing.sessionId;
+        toast("선택한 Orca 환경의 세션만 사용할 수 있습니다.");
+      }
+      }
+    } else {
+      if (raw) (node.routing as unknown as Record<string, unknown>)[field] = raw;
+      else delete (node.routing as unknown as Record<string, unknown>)[field];
+      if (field === "projectId" || field === "environmentId") clearMismatchedRouteSession(node.routing);
+    }
   } else if (scope === "node-engineering" && node) {
     node.engineering ??= {};
     const mutable = node.engineering as unknown as Record<string, unknown>;

@@ -55,6 +55,8 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 �
 
 기존 session은 실제 실행 위치와 branch를 결정합니다. 이때 model 값은 session agent family와의 호환성 제약으로만 검사하며 실행 중인 model을 바꾸지 않습니다. 기존 session의 현재 effort를 조회하거나 변경하는 공개 primitive가 없으므로 reasoning 값이 있으면 계획과 실행을 모두 사전 거절합니다. reasoning을 비우면 session의 현재 effort를 그대로 유지합니다. session 없이 project와 branch를 선택하면 그 branch의 기존 Orca-managed worktree에 새 에이전트 terminal을 만듭니다. 아직 Orca worktree가 없는 임의 branch를 플러그인이 묵시적으로 만들지는 않습니다.
 
+Task·Graph 실행에서 project 선택은 필수가 아닙니다. 실행 머신으로 현재 Mac의 `jsj1`을 선택하면 해당 Orca에 열린 모든 실행 가능한 agent session을 project와 무관하게 선택할 수 있고, 기존 session을 고른 경우 그 session의 project·worktree·branch가 실제 실행 위치가 됩니다.
+
 새 session의 reasoning은 model catalog에 선언된 capability만 선택할 수 있습니다. Claude CLI는 `low`, `medium`, `high`, `xhigh`, `max`를 `--effort`로 받습니다. Codex는 Sol/Terra에서 `low`부터 `ultra`까지, Luna에서 `low`부터 `max`까지를 `model_reasoning_effort`로 받습니다. catalog에 없거나 model이 지원하지 않는 값은 terminal 생성 전에 fail-closed합니다.
 
 ## 그래프 → 그래프

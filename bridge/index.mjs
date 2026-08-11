@@ -993,10 +993,10 @@ async function refreshEnvironmentTargets(environment) {
     }];
   });
 
-  const liveWorktrees = worktrees.filter((worktree) => Number(worktree.liveTerminalCount ?? 0) > 0).slice(0, 40);
+  const liveWorktrees = worktrees.filter((worktree) => Number(worktree.liveTerminalCount ?? 0) > 0);
   const sessionResults = await Promise.allSettled(
     liveWorktrees.map((worktree) =>
-      runOrca(["terminal", "list", "--worktree", `id:${worktree.worktreeId}`, "--limit", "50"], 30_000, root, environment.selector),
+      runOrca(["terminal", "list", "--worktree", `id:${worktree.worktreeId}`, "--limit", "300"], 30_000, root, environment.selector),
     ),
   );
   const sessions = [];

@@ -116,6 +116,49 @@ function focusables(dialog: Element): HTMLElement[] {
   )];
 }
 
+it("drops a saved bridge terminal that belongs to another Orca worktree", async () => {
+  const requests: Array<{ action: string; params?: Record<string, unknown> }> = [];
+  const dom = await mountPanel(false, ({ store }) => {
+    store.bridgeTerminalId = "terminal-from-previous-worktree";
+    store.bridgeWorkspace = "previous-worktree";
+  }, (window) => {
+    window.addEventListener("message", (event) => {
+      const request = event.data as { type?: string; requestId?: string; action?: string; params?: Record<string, unknown> } | null;
+      if (request?.type !== "orca-panel-action" || !request.requestId || !request.action) return;
+      requests.push({ action: request.action, ...(request.params ? { params: request.params } : {}) });
+      const value = request.action === "workspace.readContext"
+        ? { branch: "refs/heads/main", displayName: "current-worktree", terminals: [{ id: "current-shell" }] }
+        : undefined;
+      window.postMessage({ type: "orca-panel-action-result", requestId: request.requestId, ok: true, value }, "*");
+    });
+  });
+  try {
+    const { document } = dom.window;
+    document.querySelector<HTMLButtonElement>('[data-action="connect-bridge"]')?.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog?.textContent).toContain("저장된 브리지 터미널이 현재 Orca worktree에 없어 선택을 해제했습니다");
+    expect(dialog?.querySelector<HTMLButtonElement>('[data-action="start-bridge"]')?.disabled).toBe(true);
+    expect(dialog?.querySelector('[data-id="terminal-from-previous-worktree"]')).toBeNull();
+
+    dialog?.querySelector<HTMLButtonElement>('[data-action="choose-terminal"][data-id="current-shell"]')?.click();
+    dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog?.querySelector<HTMLButtonElement>('[data-action="start-bridge"]')?.disabled).toBe(false);
+    dialog?.querySelector<HTMLButtonElement>('[data-action="start-bridge"]')?.click();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(requests.map((request) => request.action)).toContain("terminal.sendText");
+    expect(requests.find((request) => request.action === "terminal.sendText")?.params).toMatchObject({
+      terminalId: "current-shell",
+      enter: true,
+    });
+  } finally {
+    dom.window.close();
+  }
+});
+
 describe.each([
   ["side panel", false],
   ["wide view", true],
@@ -279,6 +322,52 @@ describe.each([
       dialog = document.querySelector<HTMLElement>('[role="dialog"]');
       expect([...dialog?.querySelectorAll<HTMLOptionElement>('[data-scope="task-run-routing"][data-field="sessionId"] option') ?? []]
         .map((option) => option.textContent)).toEqual(["세션 미지정 · 새 세션", "Remote Codex · remote-project"]);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("offers every agent session in the selected jsj1 Orca for Task and Graph execution", async () => {
+    const dom = await mountPanel(wide, ({ store, targets }) => {
+      store.graphs[0].defaults = { environmentId: "local", projectId: "project-a", model: "gpt-5.6-sol" };
+      targets.environments = [{ id: "local", name: "jsj1", local: true, connected: true }];
+      targets.projects = [
+        { id: "project-a", name: "Project A", environmentId: "local", worktreeId: "worktree-a", path: "/workspace/a", branch: "main", current: true },
+        { id: "project-b", name: "Project B", environmentId: "local", worktreeId: "worktree-b", path: "/workspace/b", branch: "dev" },
+      ];
+      targets.sessions = [
+        { id: "session-a-main", title: "A Main", environmentId: "local", worktreeId: "worktree-a", projectId: "project-a", branch: "main", paneKey: "a:main", agentType: "codex", agentState: "done", connected: true, writable: true },
+        { id: "session-a-review", title: "A Review", environmentId: "local", worktreeId: "worktree-a-review", projectId: "project-a", branch: "review", paneKey: "a:review", agentType: "claude", agentState: "done", connected: true, writable: true },
+        { id: "session-b-dev", title: "B Dev", environmentId: "local", worktreeId: "worktree-b", projectId: "project-b", branch: "dev", paneKey: "b:dev", agentType: "codex", agentState: "done", connected: true, writable: true },
+      ];
+    });
+    try {
+      const { document, Event } = dom.window;
+      const expectEverySession = (select: HTMLSelectElement | null | undefined): void => {
+        expect([...(select?.options ?? [])].map((item) => item.value)).toEqual([
+          "", "session-a-main", "session-a-review", "session-b-dev",
+        ]);
+      };
+
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"]')?.click();
+      let targetMode = document.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="targetMode"]');
+      if (targetMode) {
+        targetMode.value = "session";
+        targetMode.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      expectEverySession(document.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="sessionId"]'));
+
+      document.querySelector<HTMLButtonElement>('[data-action="close-modal"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="canvas"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
+      targetMode = document.querySelector<HTMLSelectElement>('[data-scope="run-routing"][data-field="targetMode"]');
+      if (targetMode) {
+        targetMode.value = "session";
+        targetMode.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      expectEverySession(document.querySelector<HTMLSelectElement>('[data-scope="run-routing"][data-field="sessionId"]'));
     } finally {
       dom.window.close();
     }
