@@ -48,6 +48,8 @@ export interface GraphEngineeringPolicy {
   requireProvenance?: boolean;
   humanGateForIrreversible?: boolean;
   maturity?: "standard" | "de_facto" | "experimental";
+  /** Preferred launch assignment saved independently from an individual run. */
+  executionMode?: "single_session" | "per_project";
   /** Portable presentation metadata kept inside the existing v1 engineering extension. */
   editor?: GraphEditorPolicy;
 }
@@ -531,6 +533,9 @@ function normalizeGraph(graph: GraphDefinition): GraphDefinition {
       ...(graph.engineering.requireProvenance !== undefined ? { requireProvenance: graph.engineering.requireProvenance } : {}),
       ...(graph.engineering.humanGateForIrreversible !== undefined ? { humanGateForIrreversible: graph.engineering.humanGateForIrreversible } : {}),
       ...(graph.engineering.maturity ? { maturity: graph.engineering.maturity } : {}),
+      ...(graph.engineering.executionMode === "single_session" || graph.engineering.executionMode === "per_project"
+        ? { executionMode: graph.engineering.executionMode }
+        : {}),
       ...(normalizedEditor ? { editor: normalizedEditor } : {}),
     } } : {}),
     nodes: graph.nodes.map((node) => ({

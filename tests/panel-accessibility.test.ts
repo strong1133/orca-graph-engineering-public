@@ -612,6 +612,109 @@ describe.each([
     }
   });
 
+  it("groups repeated execution history under its Graph instead of rendering separate Graph rows", async () => {
+    const dom = await mountPanel(wide, (bootstrap) => {
+      const base = {
+        itemKind: "graph", itemId: "graph-orca-demo", title: "Orca 그래프 엔지니어링", executionMode: "single_session",
+        progress: { completed: 0, failed: 1, total: 4 },
+        targets: [{ id: "target-1", label: "current-project", status: "failed", environmentId: "local", projectId: "current-project" }],
+      };
+      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [
+        { ...base, id: "exec-graph-3", status: "failed", createdAt: "2026-08-10T03:00:00.000Z", updatedAt: "2026-08-10T03:01:00.000Z", error: "세 번째 실패" },
+        { ...base, id: "exec-graph-2", status: "failed", createdAt: "2026-08-10T02:00:00.000Z", updatedAt: "2026-08-10T02:01:00.000Z", error: "두 번째 실패" },
+        { ...base, id: "exec-graph-1", status: "failed", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:01:00.000Z", error: "첫 번째 실패" },
+      ];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
+      const groups = document.querySelectorAll<HTMLElement>('.execution-group[data-execution-kind="graph"][data-execution-item-id="graph-orca-demo"]');
+      expect(groups).toHaveLength(1);
+      expect(groups[0]?.querySelector(".execution-group-header")?.textContent).toContain("실행 3회");
+      expect(groups[0]?.querySelectorAll(".execution-card")).toHaveLength(3);
+      expect(groups[0]?.querySelectorAll('[data-action="open-execution-item"]')).toHaveLength(1);
+      expect(groups[0]?.textContent).toContain("최근 실행");
+      expect(groups[0]?.textContent).toContain("이전 실행 2");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("morphs execution status in place without replacing the manager, Graph group, or run card", async () => {
+    let resolveStatus: ((response: Response) => void) | undefined;
+    const running = {
+      id: "exec-morph", itemKind: "graph", itemId: "graph-orca-demo", title: "동적 Graph", status: "running",
+      executionMode: "single_session", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:01:00.000Z",
+      progress: { completed: 1, failed: 0, total: 4 },
+      targets: [{ id: "target-1", label: "current-project", status: "running", environmentId: "local", projectId: "current-project" }],
+    };
+    const failed = {
+      ...running, status: "failed", updatedAt: "2026-08-10T01:02:00.000Z",
+      progress: { completed: 1, failed: 1, total: 4 }, error: "두 번째 노드 실패",
+      targets: [{ ...running.targets[0], status: "failed", error: "두 번째 노드 실패" }],
+    };
+    const dom = await mountPanel(wide, (bootstrap) => {
+      const live = bootstrap as typeof bootstrap & { bridgeApiUrl: string; executions: unknown[] };
+      live.bridgeApiUrl = "/test/api";
+      live.executions = [running];
+    }, (window) => {
+      Object.defineProperty(window, "fetch", {
+        configurable: true,
+        value: vi.fn(() => new Promise<Response>((resolve) => { resolveStatus = resolve; })),
+      });
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
+      const manager = document.querySelector(".execution-manager");
+      const body = document.querySelector(".execution-manager-body");
+      const group = document.querySelector(".execution-group");
+      const card = document.querySelector(".execution-card");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      resolveStatus?.(Response.json({ ok: true, value: { executions: [failed] } }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(document.querySelector(".execution-manager")).toBe(manager);
+      expect(document.querySelector(".execution-manager-body")).toBe(body);
+      expect(document.querySelector(".execution-group")).toBe(group);
+      expect(document.querySelector(".execution-card")).toBe(card);
+      expect(card?.textContent).toContain("두 번째 노드 실패");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("prepares a failed active process run as a new run with its previous work input", async () => {
+    const dom = await mountPanel(wide, (bootstrap) => {
+      const { store } = bootstrap;
+      (bootstrap as typeof bootstrap & { dataSource: Record<string, unknown> }).dataSource = {
+        config: { schemaVersion: 1, mode: "structured", url: "https://workspace.example.test" },
+        status: "ready", catalog: [], capabilities: { execution: { nodeKinds: ["task", "condition", "graph_call"] } },
+      };
+      const graph = store.graphs[0]!;
+      graph.processEnabled = true;
+      graph.edges = graph.edges.filter((edge: { kind: string }) => edge.kind !== "loop");
+      graph.nodes[0]!.status = "failed";
+      graph.runs = [{
+        id: "run-failed-active", runNo: 7, status: "running", trigger: "manual",
+        startedAt: "2026-08-10T01:00:00.000Z", inputPrompt: "기존 업무 입력",
+        stats: { completed: 0, failed: 1, attempts: 1 }, nodeResults: [],
+      }];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).toContain("실패 Run #7 재실행");
+      expect(dialog?.querySelector('[data-field="startNewRun"]')).toBeNull();
+      expect(dialog?.querySelector<HTMLTextAreaElement>('[data-field="inputPrompt"]')?.value).toBe("기존 업무 입력");
+      expect(dialog?.querySelector<HTMLTextAreaElement>('[data-field="inputPrompt"]')?.readOnly).toBe(false);
+    } finally {
+      dom.window.close();
+    }
+  });
+
   it("refreshes cross-surface execution state immediately when the status view opens", async () => {
     const requests: any[] = [];
     const execution = {
@@ -646,6 +749,267 @@ describe.each([
       expect(document.querySelector(".execution-manager")?.textContent).toContain("다른 Orca 표면 실행");
       expect(document.querySelector(".execution-target")?.textContent).toContain("Orca 세션 · Review Agent");
       expect(document.querySelector(".execution-target")?.textContent).not.toContain("session-sensitive-id");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("patches graph execution polling in place without replacing the plugin or status button", async () => {
+    let resolveStatus: ((response: Response) => void) | undefined;
+    const runningExecution = {
+      id: "exec-graph-live", itemKind: "graph", itemId: "graph-orca-demo", title: "그래프 실시간 실행", status: "running",
+      executionMode: "single_session", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:01:00.000Z",
+      progress: { completed: 0, failed: 0, total: 4 },
+      targets: [{ id: "target-1", label: "current-project", status: "running", environmentId: "local", projectId: "current-project", branch: "main", model: "gpt-5.6-sol" }],
+    };
+    const failedExecution = {
+      ...runningExecution,
+      status: "failed",
+      updatedAt: "2026-08-10T01:01:01.000Z",
+      progress: { completed: 0, failed: 1, total: 4 },
+      error: "실행 세션을 시작하지 못했습니다.",
+      targets: [{ ...runningExecution.targets[0], status: "failed", error: "실행 세션을 시작하지 못했습니다." }],
+    };
+    const dom = await mountPanel(wide, (bootstrap) => {
+      const liveBootstrap = bootstrap as typeof bootstrap & { bridgeApiUrl: string; executions: unknown[] };
+      liveBootstrap.bridgeApiUrl = "/test/api";
+      liveBootstrap.executions = [runningExecution];
+    }, (window) => {
+      const nativeSetTimeout = window.setTimeout.bind(window);
+      Object.defineProperty(window, "setTimeout", {
+        configurable: true,
+        value: (handler: TimerHandler, delay?: number, ...args: unknown[]) => nativeSetTimeout(handler, delay === 1_500 ? 0 : delay, ...args),
+      });
+      Object.defineProperty(window, "fetch", {
+        configurable: true,
+        value: vi.fn(() => new Promise<Response>((resolve) => { resolveStatus = resolve; })),
+      });
+    });
+    try {
+      const { document } = dom.window;
+      const shell = document.querySelector(".app-shell");
+      const statusButton = document.querySelector<HTMLButtonElement>('.execution-banner [data-action="set-view"][data-id="executions"]');
+      const firstNode = document.querySelector<HTMLElement>('.node[data-node-id="node-design"]');
+      expect(firstNode?.classList.contains("execution-queued")).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(resolveStatus).toBeTypeOf("function");
+      resolveStatus?.(Response.json({ ok: true, value: { executions: [failedExecution] } }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(document.querySelector(".app-shell")).toBe(shell);
+      expect(document.querySelector('.execution-banner [data-action="set-view"][data-id="executions"]')).toBe(statusButton);
+      expect(document.querySelector(".execution-banner")?.textContent).toContain("실패");
+      expect(firstNode?.classList.contains("execution-blocked")).toBe(true);
+      expect(firstNode?.querySelector(".node-execution-chip")?.textContent).toContain("시작 실패");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("keeps the execution status button actionable after an immediate graph failure", async () => {
+    const dom = await mountPanel(wide, (bootstrap) => {
+      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [{
+        id: "exec-graph-failed", itemKind: "graph", itemId: "graph-orca-demo", title: "실패한 그래프", status: "failed",
+        executionMode: "single_session", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:00:01.000Z",
+        progress: { completed: 0, failed: 1, total: 4 }, error: "실행 시작 실패",
+        targets: [{ id: "target-1", label: "current-project", status: "failed", environmentId: "local", projectId: "current-project", branch: "main", model: "gpt-5.6-sol", error: "실행 시작 실패" }],
+      }];
+    });
+    try {
+      const { document } = dom.window;
+      const statusButton = document.querySelector<HTMLButtonElement>('.execution-banner [data-action="set-view"][data-id="executions"]');
+      expect(statusButton).not.toBeNull();
+      statusButton?.click();
+      expect(document.querySelector(".execution-manager")?.textContent).toContain("실패한 그래프");
+      expect(document.querySelector(".execution-card.status-failed")?.textContent).toContain("실행 시작 실패");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("does not let canvas pointer handling swallow a real execution status button click", async () => {
+    const dom = await mountPanel(wide, (bootstrap) => {
+      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [{
+        id: "exec-pointer-failed", itemKind: "graph", itemId: "graph-orca-demo", title: "포인터 실패 그래프", status: "failed",
+        executionMode: "single_session", createdAt: "2026-08-11T01:00:00.000Z", updatedAt: "2026-08-11T01:00:01.000Z",
+        progress: { completed: 0, failed: 1, total: 4 }, error: "포인터 실행 실패",
+        targets: [{ id: "target-1", label: "current-project", status: "failed", environmentId: "local", projectId: "current-project" }],
+      }];
+    });
+    try {
+      const { document, MouseEvent } = dom.window;
+      const statusButton = document.querySelector<HTMLButtonElement>('.execution-banner [data-action="set-view"][data-id="executions"]');
+      expect(statusButton).not.toBeNull();
+      statusButton?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientX: 10, clientY: 10 }));
+      statusButton?.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, clientX: 10, clientY: 10 }));
+      expect(document.contains(statusButton)).toBe(true);
+      statusButton?.click();
+      expect(document.querySelector(".execution-manager")?.textContent).toContain("포인터 실패 그래프");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("saves graph launch settings without starting an execution", async () => {
+    const requests: any[] = [];
+    const dom = await mountPanel(wide, (bootstrap) => {
+      (bootstrap as typeof bootstrap & { bridgeApiUrl: string }).bridgeApiUrl = "/test/api";
+    }, (window) => {
+      Object.defineProperty(window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          const request = JSON.parse(String(init.body));
+          requests.push(request);
+          if (request.type === "save") return Response.json({ ok: true, value: { mode: "local", store: request.store } });
+          return Response.json({ ok: true, value: undefined });
+        }),
+      });
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      const saveButton = dialog?.querySelector<HTMLButtonElement>('[data-action="save-run-settings"]');
+      expect(saveButton?.textContent).toBe("저장");
+      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.textContent).toContain("실행 시작");
+      saveButton?.click();
+      expect(document.querySelector('[role="dialog"]')?.getAttribute("aria-busy")).toBe("true");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const saveRequest = requests.find((request) => request.type === "save");
+      expect(saveRequest?.rebuildPanel).toBe(false);
+      expect(saveRequest?.store.graphs.find((graph: any) => graph.id === "graph-orca-demo")?.engineering?.executionMode).toBe("single_session");
+      expect(requests.some((request) => request.type === "start-graph-execution")).toBe(false);
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+      expect(document.querySelector(".execution-manager")).toBeNull();
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("saves and restores Task launch settings without starting the Task", async () => {
+    const requests: any[] = [];
+    const dom = await mountPanel(wide, (bootstrap) => {
+      (bootstrap as typeof bootstrap & { bridgeApiUrl: string }).bridgeApiUrl = "/test/api";
+    }, (window) => {
+      Object.defineProperty(window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          const request = JSON.parse(String(init.body));
+          requests.push(request);
+          if (request.type === "save") return Response.json({ ok: true, value: { mode: "local", store: request.store } });
+          return Response.json({ ok: true, value: undefined });
+        }),
+      });
+    });
+    try {
+      const { document, Event } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-design"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
+      let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      const model = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="model"]');
+      if (model) {
+        model.value = "claude-opus-5";
+        model.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      const saveButton = dialog?.querySelector<HTMLButtonElement>('[data-action="save-task-run-settings"]');
+      expect(saveButton?.textContent).toBe("저장");
+      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.textContent).toContain("실행 시작");
+      saveButton?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const saveRequest = requests.find((request) => request.type === "save");
+      expect(saveRequest?.rebuildPanel).toBe(false);
+      const savedTask = saveRequest?.store.tasks.find((task: any) => task.id === "task-design");
+      expect(savedTask?.metadata?.orcaGraphRunSettings).toMatchObject({
+        schemaVersion: 1,
+        routing: { model: "claude-opus-5" },
+        executionMode: "single_session",
+      });
+      expect(requests.some((request) => request.type === "start-task-execution")).toBe(false);
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
+      expect(document.querySelector<HTMLSelectElement>('[role="dialog"] [data-scope="task-run-routing"][data-field="model"]')?.value).toBe("claude-opus-5");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("starts a structured Graph without committing and rebuilding the panel first", async () => {
+    const requests: any[] = [];
+    const now = "2026-08-11T00:00:00.000Z";
+    const dom = await mountPanel(wide, (bootstrap) => {
+      const liveBootstrap = bootstrap as typeof bootstrap & { bridgeApiUrl: string; dataSource: Record<string, unknown> };
+      liveBootstrap.bridgeApiUrl = "/test/api";
+      liveBootstrap.dataSource = {
+        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/api/" },
+        status: "ready", source: { id: "workspace", name: "Workspace" }, catalog: [],
+        capabilities: { execution: { mode: "remote-claim", nodeKinds: ["task", "condition", "graph_call"] } },
+      };
+      const graph = bootstrap.store.graphs[0];
+      graph.nodes = [graph.nodes.find((node: any) => node.id === "node-design")];
+      graph.edges = [];
+      graph.defaults = { environmentId: "local", model: "gpt-5.6-sol" };
+    }, (window) => {
+      Object.defineProperty(window, "fetch", {
+        configurable: true,
+        value: vi.fn(async (_url: string, init: RequestInit) => {
+          const request = JSON.parse(String(init.body));
+          requests.push(request);
+          if (request.type === "start-graph-execution") return Response.json({ ok: true, value: {
+            id: "exec-structured", itemKind: "graph", itemId: request.graphId, title: "Structured Graph", status: "queued",
+            executionMode: "single_session", createdAt: now, updatedAt: now,
+            progress: { completed: 0, failed: 0, total: 4 }, targets: [],
+          } });
+          return Response.json({ ok: true, value: undefined });
+        }),
+      });
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
+      const confirm = document.querySelector<HTMLButtonElement>('[data-action="confirm-run"]');
+      expect(confirm?.disabled, document.querySelector('[role="dialog"]')?.textContent ?? "run dialog missing").toBe(false);
+      confirm?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(requests.some((request) => request.type === "save")).toBe(false);
+      const startRequest = requests.find((request) => request.type === "start-graph-execution");
+      expect(startRequest?.graphId).toBe("graph-orca-demo");
+      expect(startRequest?.openWide).toBe(wide ? undefined : true);
+      expect(document.querySelector(".execution-manager")).not.toBeNull();
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("shows commercial-grade execution states on graph nodes during a run", async () => {
+    const dom = await mountPanel(wide, (bootstrap) => {
+      bootstrap.store.graphs[0].nodes[0].status = "running";
+      (bootstrap as typeof bootstrap & { executions: unknown[] }).executions = [{
+        id: "exec-graph-running", itemKind: "graph", itemId: "graph-orca-demo", title: "실행 중 그래프", status: "running",
+        executionMode: "single_session", createdAt: "2026-08-10T01:00:00.000Z", updatedAt: "2026-08-10T01:00:01.000Z",
+        progress: { completed: 0, failed: 0, total: 4 },
+        targets: [{ id: "target-1", label: "current-project", status: "running", environmentId: "local", projectId: "current-project", branch: "main", model: "gpt-5.6-sol" }],
+      }];
+    });
+    try {
+      const { document } = dom.window;
+      const runningNode = document.querySelector<HTMLElement>('.node[data-node-id="node-design"]');
+      const queuedNode = document.querySelector<HTMLElement>('.node[data-node-id="node-quality"]');
+      expect(runningNode?.classList.contains("execution-running")).toBe(true);
+      expect(runningNode?.querySelector(".node-execution-chip.running")?.textContent).toContain("실행 중");
+      expect(runningNode?.querySelector(".node-run-meta.status-running")?.textContent).toContain("실행 중");
+      expect(queuedNode?.classList.contains("execution-queued")).toBe(true);
+      expect(queuedNode?.querySelector(".node-execution-chip.queued")?.textContent).toContain("실행 대기");
+      expect(queuedNode?.getAttribute("aria-label")).toContain("실행 상태 실행 대기");
     } finally {
       dom.window.close();
     }
@@ -1458,10 +1822,11 @@ describe("work process and branch execution surface", () => {
           const request = JSON.parse(String(init.body));
           requests.push(request);
           if (request.type === "save") return Response.json({ ok: true, value: { mode: "local", store: request.store } });
-          if (request.type === "start-graph-execution") return Response.json({ ok: true, value: {
-            id: "exec-graph", itemKind: "graph", itemId: request.graphId, title: "Graph", status: "completed", executionMode: "per_project",
-            createdAt: now, updatedAt: now, progress: { completed: 2, failed: 0, total: 2 }, targets: [],
-          } });
+          if (request.type === "start-graph-execution") return Response.json({ ok: true, value: undefined });
+          if (request.type === "execution-status") return Response.json({ ok: true, value: { executions: [{
+            id: "exec-graph", itemKind: "graph", itemId: request.graphId ?? "graph-orca-demo", title: "Graph", status: "running", executionMode: "per_project",
+            createdAt: now, updatedAt: now, progress: { completed: 0, failed: 0, total: 2 }, targets: [],
+          }] } });
           return Response.json({ ok: true, value: undefined });
         }),
       });
@@ -1484,7 +1849,9 @@ describe("work process and branch execution surface", () => {
           { locator: "/workspace/web", routing: { environmentId: "local", projectId: "project-web", branch: "release", model: "gpt-5.6-sol" } },
         ],
       });
+      expect(requests).toContainEqual({ type: "execution-status" });
       expect(document.querySelector(".execution-manager")).not.toBeNull();
+      expect(document.querySelector(".execution-manager")?.textContent).toContain("Graph");
     } finally {
       dom.window.close();
     }
@@ -1561,11 +1928,11 @@ describe("work process and branch execution surface", () => {
 });
 
 describe("structured source work editing", () => {
-  it("refreshes an embedded side panel through the bridge response API", async () => {
+  it("refreshes the same-origin wide panel through the bridge response API", async () => {
     const now = "2026-08-10T00:00:00.000Z";
     const requests: any[] = [];
     let refreshedStore: Record<string, any> | null = null;
-    const dom = await mountPanel(false, (bootstrap) => {
+    const dom = await mountPanel(true, (bootstrap) => {
       bootstrap.store.tasks = [{
         id: "TASK-refresh", version: 3, title: "새로고침 전", prompt: "work", draft: "work",
         promptRevisions: [], status: "backlog", priority: "medium", tags: [], createdAt: now, updatedAt: now,

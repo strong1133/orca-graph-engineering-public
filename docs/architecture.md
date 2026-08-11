@@ -14,14 +14,15 @@ Orca plugin panel (sandboxed iframe)
                  ▼
 visible Orca shell terminal
   └─ bridge/index.mjs
-       ├─ runtime/store.json
-       ├─ runtime/targets.json
-       ├─ runtime/executions.json
+       ├─ Orca app data/plugin-runtime/orca-graph-engineering
+       │    ├─ store.json
+       │    ├─ targets.json
+       │    └─ executions.json
        ├─ Data Source provider
        │    ├─ folder / local Git checkout → portable full GraphStore
        │    ├─ structured workspace v1 → remote Graph + work-item CAS mutations
        │    └─ unstructured JSON → read-only candidate catalog
-       ├─ runtime/data-source.json + replaceable source-cache.json
+       ├─ app data/data-source.json + replaceable source-cache.json
        ├─ public orca CLI
        │    └─ fresh Codex session → built-in Meta Prompt contract
        ├─ tokenized 127.0.0.1 response bridge / wide-view server
@@ -29,7 +30,7 @@ visible Orca shell terminal
        └─ rebuild dist/panel.html → Orca dev reload
 ```
 
-패널은 Orca가 제공하는 `workspace.readContext`, `terminal.sendText`, `notifications.show`만 사용합니다. 브리지는 숨은 background worker가 아니라 사용자가 선택하고 종료할 수 있는 Orca terminal에서 동작합니다. 기동한 브리지는 임의 token 경로의 loopback response API를 runtime bootstrap에 주입한다. 따라서 사이드 패널도 mutation·원천 새로고침의 완료 응답과 최신 store를 즉시 받아 렌더링한다. 브리지 재시작으로 endpoint가 바뀌면 terminal channel로 한 번 fallback하고, 새 bootstrap을 다시 읽은 뒤 직렬화 queue의 완료까지 ping해 자동 재동기화한다. 넓게 보기 탭을 재사용할 때도 현재 HTML을 명시적으로 reload한다. Orca/Hermes 전용 `ORCA_GRAPH_SOURCE_TOKEN`은 누락 시 설정된 원천과 같은 origin의 공개 bootstrap에서만 재취득하며 프로세스 밖으로 직렬화하거나 로그에 남기지 않는다. 그 밖의 인증 환경변수는 자동 탐색하지 않고 fail-closed로 처리한다.
+패널은 Orca가 제공하는 `workspace.readContext`, `terminal.sendText`, `notifications.show`만 사용합니다. Orca plugin API v1은 panel document를 `default-src 'none'; connect-src 'none'`인 opaque sandbox로 감싸므로 sidebar에서 loopback HTTP를 읽을 수 없습니다. 따라서 sidebar는 public `terminal.sendText`로 명령만 전달하고, 응답과 실행 polling이 필요한 동작은 브리지가 여는 same-origin Orca browser tab으로 승격합니다. 브리지는 숨은 background worker가 아니라 사용자가 선택하고 종료할 수 있는 Orca terminal에서 동작합니다. 넓게 보기 탭을 재사용할 때도 현재 HTML을 명시적으로 reload한다. Orca/Hermes 전용 `ORCA_GRAPH_SOURCE_TOKEN`은 누락 시 설정된 원천과 같은 origin의 공개 bootstrap에서만 재취득하며 프로세스 밖으로 직렬화하거나 로그에 남기지 않는다. 그 밖의 인증 환경변수는 자동 탐색하지 않고 fail-closed로 처리한다.
 
 ## 데이터 모델
 
@@ -77,13 +78,13 @@ unstructured source에는 보편적인 쓰기 의미나 concurrency contract가 
 
 Orca plugin API v1의 panel contribution은 우측 activity bar의 sandboxed iframe으로만 렌더링됩니다. 좁은 폭에서는 inspector를 기본으로 닫고 핵심 버튼 네 개만 표시하며, 나머지 명령은 `•••` 메뉴로 모읍니다.
 
-`⛶`는 브리지에 `open-wide`를 보내 현재 worktree의 Orca 중앙 browser tab을 엽니다. 같은 화면이 이미 열려 있으면 그 탭을 다시 활성화합니다. 브리지는 임의 포트의 `127.0.0.1`에 추측하기 어려운 일회성 경로를 만들고, 최신 panel bundle과 같은 메시지 API를 제공합니다. CORS를 허용하지 않고 응답을 캐시하지 않으며 브리지가 종료되면 넓은 화면도 함께 종료됩니다. 넓은 화면의 Graph FAB는 목록과 편집 캔버스를 전환합니다. 이는 중앙 plugin contribution이 생길 때까지의 호환 계층입니다.
+`⛶`는 브리지에 `open-wide`를 보내 현재 worktree의 Orca 중앙 browser tab을 엽니다. 같은 화면이 이미 열려 있으면 그 탭을 다시 활성화합니다. sidebar에서 Graph·Task·Todo 실행 또는 실시간 실행 현황을 요청해도 이 탭의 `#executions` 화면으로 자동 승격합니다. 브리지는 임의 포트의 `127.0.0.1`에 추측하기 어려운 일회성 경로를 만들고, 최신 panel bundle과 같은 메시지 API를 제공합니다. CORS를 허용하지 않고 응답을 캐시하지 않으며 브리지가 종료되면 넓은 화면도 함께 종료됩니다. 넓은 화면의 Graph FAB는 목록과 편집 캔버스를 전환합니다. 이는 panel ↔ worker 응답 API와 중앙 plugin contribution이 생길 때까지의 호환 계층입니다.
 
 상단의 고정 메뉴는 `그래프 목록`, `그래프 보기`, `실행 현황`, `Domain 관리`, `Milestone 관리`, `Task 관리`, `Todo 관리`를 명시적으로 전환한다. 실행 현황은 머신 로컬 레코드의 queued/running/completed/failed, 프로젝트별 target/session/model과 진행률을 보여 주고 활성 건수를 메뉴 badge로 표시한다. 목록 화면은 lifecycle status와 최신 run stage를 분리합니다. status는 badge, 실행 단계는 color dot와 별도 badge로 표시하며 이름·설명·ID 검색, 두 종류의 필터, 수정일·이름·상태 정렬을 클라이언트에서 수행합니다. Task/Todo 화면은 Draft·Meta·scope까지 통합 검색하고 상태·Domain·Milestone 필터, Domain/Milestone/상태/우선순위 그룹화, 우선순위·마감일·수정일 정렬을 제공한다. Task의 기본 그룹은 Domain→Milestone이고, Todo의 기본 그룹은 실행 scope와 독립적인 free-form `groupName`→`subgroupName` 계층이다. 활성 그룹화 모드의 각 그룹은 독립적으로 접고 펼칠 수 있으며, 현재 필터에 보이는 그룹 전체를 한 번에 접거나 펼칠 수도 있다. 그룹 항목 수와 접힘 상태는 유지한다. Todo의 기본 projection은 `open|in_progress`인 활성 항목이며, `done|cancelled` 이력은 삭제하지 않고 모든 상태 또는 개별 상태 필터로 노출한다. 헤더는 현재 표시 수·활성 수·전체 수를 분리해 원천 집계 의미를 보존한다.
 
 Task·Todo와 Graph 실행 창은 `머신 → 통합/프로젝트별 배정 → project의 worktree branch 또는 기존 Orca session + model`의 세 단계만 노출한다. reasoning은 설계에 저장된 정책이나 선택한 agent의 기본값을 사용하고 실행 확인창에서는 숨긴다. 대상 갱신은 현재 Orca와 `environment list`에 저장된 원격 Orca를 각각 조회하고 environment별 project/worktree branch/agent session을 한 snapshot에 합친다. 구조화 원천의 Task 프로젝트 편집기는 registry project와 그 project가 게시한 실제 worktree branch를 여러 묶음으로 선택해 `target/folder` 관계로 한 번의 CAS에 저장한다. 대상이 여러 개면 첫 target을 cwd로 쓰는 `single_session`과 locator별 routing을 만드는 `per_project`를 지원하며, 프로젝트마다 새 session 또는 일치하는 기존 session과 model을 검증한다. 브리지는 현재 GraphStore나 구조화 원천 snapshot에서 업무와 유효 실행 Prompt를 다시 읽고 그래프 실행과 같은 target allow-list, agent family, reasoning, live worktree/session attestation을 적용한다. Task에서 사용자가 project/session을 명시하지 않았으면 첫 `role=target`, `locatorKind=folder` 관계를 같은 environment의 Orca repo/worktree path에 대조하고 relation branch와 일치하는 기존 worktree를 선택한다. Todo 빠른 실행은 구조화 원천에서 `POST /todos/{id}/task`의 Todo CAS와 안정적인 idempotency key로 Task를 먼저 준비한다. 단건 실행은 그래프 run·node claim이나 Task/Todo lifecycle을 만들지 않는다.
 
-실행 시작 메시지는 검증·dispatch 완료를 기다리지 않고 `RuntimeExecution`을 즉시 반환하고 실제 작업을 bridge queue에 넣는다. panel은 `실행 현황` 진입 즉시 다른 Orca 표면의 최신 상태를 읽고 active record가 있으면 `execution-status`를 1.5초 간격으로 갱신한다. 다중 프로젝트 실행은 모든 target이 완료 또는 실패로 정착할 때까지 기다린 뒤 전체 상태를 마감하므로 부분 성공 상태를 잃지 않는다. `runtime/executions.json`은 최대 200개 머신 로컬 이력만 원자적으로 보존하고 Prompt 원문을 저장하지 않는다. GraphStore와 structured source의 실행 정본은 그대로 유지되며 이 파일은 Orca session 관찰용 projection이다. bridge 재시작 시 queued/running record는 명시적 실패로 마감한다.
+실행 시작 메시지는 검증·dispatch 완료를 기다리지 않고 `RuntimeExecution`을 즉시 반환하고 실제 작업을 bridge queue에 넣는다. same-origin 넓게 보기 화면은 `실행 현황` 진입 즉시 다른 Orca 표면의 최신 상태를 읽고 active record가 있으면 `execution-status`를 1.5초 간격으로 갱신한다. sandboxed sidebar는 네트워크 polling을 시도하지 않습니다. 다중 프로젝트 실행은 모든 target이 완료 또는 실패로 정착할 때까지 기다린 뒤 전체 상태를 마감하므로 부분 성공 상태를 잃지 않는다. 앱 데이터의 `executions.json`은 최대 200개 머신 로컬 이력만 원자적으로 보존하고 Prompt 원문을 저장하지 않는다. 폴링은 변경 없는 파일 쓰기를 생략하고 execution surface만 DOM에서 패치하므로 넓게 보기 화면 전체를 재로드하지 않는다. GraphStore와 structured source의 실행 정본은 그대로 유지되며 이 파일은 Orca session 관찰용 projection이다. bridge 재시작 시 queued/running record는 명시적 실패로 마감한다.
 
 호환 Workspace aggregate API를 설정하면 bridge 기동과 명시적 대상 갱신에서만 로컬 `orca repo list --json`과 `orca worktree list --json`을 읽어 장치별 project/worktree registry를 전체 교체 게시한다. Task를 열거나 실행할 때 target folder 관계가 비어 있으면 현재/활성 Orca worktree를 repo ID와 경로로 registry에 대조한다. 한 후보면 추천하고, Task 상세에서는 장치·검색·remote/path 그룹별 목록에서 여러 project/worktree branch 묶음을 체크한다. 대상 장치에 canonical Git project나 선택 branch가 없으면 versioned source registry를 근거로 provision하고 서버가 반환한 실제 경로만 관계에 쓴다. 실행 확인 뒤에만 최신 Task version과 기존 project 관계 전체를 다시 읽어 `role=target`, `locatorKind=folder` 항목을 추가하거나 branch를 바꾼다. branch selector에는 선택한 project에 실제 존재하는 Orca worktree만 표시한다. branch는 `refs/heads/`를 제거해 저장하고 Git ref 안전 규칙과 255자 상한을 적용한다. 409에서는 최신 Task/registry를 재조회하지만 stale version으로 쓰기를 자동 재시도하지 않는다.
 

@@ -31,7 +31,7 @@ Orca 안에서 실행 그래프를 설계하고 Task·Todo를 관리하며 각 �
 
 ## 로컬 Domain·Milestone·Task·Todo 관리
 
-상단 메뉴의 `Domain 관리`, `Milestone 관리`, `Task 관리`, `Todo 관리`는 데이터 원천을 연결하지 않아도 사용할 수 있습니다. 업무 데이터는 Graph와 함께 `runtime/store.json`에 저장되며 다음 관계를 가집니다.
+상단 메뉴의 `Domain 관리`, `Milestone 관리`, `Task 관리`, `Todo 관리`는 데이터 원천을 연결하지 않아도 사용할 수 있습니다. 업무 데이터는 Graph와 함께 Orca 앱 데이터의 `plugin-runtime/orca-graph-engineering/store.json`에 저장되며 다음 관계를 가집니다.
 
 - Domain은 목표, 공통 메모, 제약사항과 owner를 가지며 여러 Milestone을 포함합니다. Milestone은 반드시 하나의 Domain에 속하고 목표, 성공 기준, 상태, 우선순위, 마감일을 가집니다.
 - Task와 Todo는 독립 항목일 수도 있고 Domain 또는 같은 Domain의 Milestone에 속할 수도 있습니다. Milestone을 선택하면 Domain이 자동으로 일치하며, 연결된 업무가 있는 Milestone의 Domain은 임의로 바꿀 수 없습니다.
@@ -89,18 +89,18 @@ Orca의 Settings → Plugins에서 Plugin system을 켜고 Development plugin �
 3. `브리지 시작`을 누르고 terminal을 열어 둡니다.
 4. `저장` 후 `대상 새로고침`으로 Orca project/session 목록을 불러옵니다.
 
-브리지는 Git에서 제외된 `runtime/`의 로컬 상태와 생성된 `dist/`만 사용합니다. 사이드바가 좁으면 상단 `⛶`로 같은 편집기를 Orca 중앙 탭에 엽니다.
+브리지는 플러그인 디렉터리 밖의 Orca 앱 데이터에 로컬 상태를 저장합니다. macOS 기본 경로는 `~/Library/Application Support/Orca/plugin-runtime/orca-graph-engineering`이며 `ORCA_GRAPH_RUNTIME_DIR`로 바꿀 수 있습니다. 이전 버전의 저장소 내부 `runtime/` 데이터는 새 위치가 비어 있을 때 한 번 복사되며 원본은 삭제하지 않습니다. Orca plugin API v1의 sidebar는 `connect-src 'none'` sandbox이므로 응답이 필요한 실행과 실시간 현황은 자동으로 Orca 중앙 탭에 열립니다. 그 화면은 상태 조각만 갱신하며 전체 화면을 재로드하지 않습니다. 상단 `⛶`로도 같은 화면을 직접 열 수 있습니다.
 
 ## 데이터 원천 연결
 
 상단 `데이터 원천`에서 다음 네 모드를 선택할 수 있습니다.
 
-- `로컬 JSON`: 기존처럼 Graph를 `runtime/store.json`에 저장합니다.
+- `로컬 JSON`: Graph를 Orca 앱 데이터의 `plugin-runtime/orca-graph-engineering/store.json`에 저장합니다.
 - `폴더 / 로컬 Git 저장소`: 이미 존재하는 절대 경로 아래 `.orca-graph-engineering/store.json`에 Graph·Domain·Milestone·Task·Todo를 함께 저장합니다. 파일이 없으면 현재 화면의 데이터를 최초 정본으로 만들고, 이후 `새로고침`은 Git pull이나 외부 편집으로 바뀐 파일을 다시 읽습니다. Git commit·push는 자동 실행하지 않습니다.
 - `구조화 Workspace`: [Data Source contract v1](docs/data-source-contract.md)을 구현한 서버의 Graph·Domain·Milestone·Task·Todo·Prompt lineage와 CAS 버전을 원격 정본으로 사용합니다. Graph aggregate와 플러그인 지원 업무 필드는 모두 양방향이며 stale version은 409로 거절되고 자동 재시도하지 않습니다.
 - `구조 없음`: 임의 JSON의 레코드 배열을 자동 탐색하거나 필드 경로를 지정해 읽기 전용 Task 후보로 사용합니다. 쓰기/CAS 계약이 없으므로 Graph 정본은 로컬에 남습니다.
 
-인증 토큰 값은 저장하지 않습니다. 브리지를 시작할 terminal에 토큰을 환경변수로 설정하고 UI에는 그 환경변수 이름만 입력합니다. Orca/Hermes 연동의 전용 `ORCA_GRAPH_SOURCE_TOKEN`이 브리지 재시작 뒤 비어 있으면 설정된 동일 origin의 세션 bootstrap에서 자동으로 다시 가져오며, 값은 현재 브리지 프로세스에만 유지하고 로그·설정·패키지에는 기록하지 않습니다. 다른 인증 환경변수는 기존처럼 값이 없으면 즉시 실패합니다. 연결 snapshot은 교체 가능한 `runtime/source-cache.json`에 저장되며 Git과 배포 package에서 제외됩니다. 폴더 모드는 단일 사용자 파일 저장 방식이라 분산 CAS를 제공하지 않으며, 같은 파일을 여러 프로세스가 동시에 수정하지 않는 것을 전제로 합니다.
+인증 토큰 값은 저장하지 않습니다. 브리지를 시작할 terminal에 토큰을 환경변수로 설정하고 UI에는 그 환경변수 이름만 입력합니다. Orca/Hermes 연동의 전용 `ORCA_GRAPH_SOURCE_TOKEN`이 브리지 재시작 뒤 비어 있으면 설정된 동일 origin의 세션 bootstrap에서 자동으로 다시 가져오며, 값은 현재 브리지 프로세스에만 유지하고 로그·설정·패키지에는 기록하지 않습니다. 다른 인증 환경변수는 기존처럼 값이 없으면 즉시 실패합니다. 연결 snapshot은 앱 데이터의 교체 가능한 `source-cache.json`에 저장되며 Git과 배포 package에서 제외됩니다. 폴더 모드는 단일 사용자 파일 저장 방식이라 분산 CAS를 제공하지 않으며, 같은 파일을 여러 프로세스가 동시에 수정하지 않는 것을 전제로 합니다.
 
 ### 호환 Workspace aggregate API
 
@@ -127,7 +127,7 @@ corepack npm run package:plugin
 # release/orca-graph-engineering-plugin-0.2.0.tgz
 ```
 
-bundle에는 manifest가 선언한 `dist/panel.html`, bridge, source, fixture, tests, CI와 `npm-shrinkwrap.json`이 함께 들어갑니다. 빌드는 공개 fixture만 사용하고 contributor의 절대 경로를 넣지 않습니다. 압축을 푼 `package/` 디렉터리는 추가 설치 없이 Orca Development plugin 경로로 사용할 수 있으며 기본 bridge의 ping, 저장, reload도 Node.js 내장 모듈과 이미 번들된 panel만 사용합니다. 브리지 기동 시 tokenized loopback response endpoint가 runtime bootstrap에 주입되어 사이드 패널도 저장·원천 새로고침 결과를 즉시 받습니다. 브리지가 재시작되면 terminal fallback 뒤 새 endpoint로 자동 재동기화하고, 기존 넓게 보기 탭도 다시 열 때 강제로 reload합니다. 저장 시 TypeScript를 다시 compile하지 않고 `dist/panel.html`의 안전한 JSON bootstrap만 원자적으로 갱신합니다. `corepack npm ci && corepack npm run check`는 기여자용 전체 source/test 재검증 경로이지 plugin 사용 전제조건이 아닙니다. 브리지를 선택할 때는 plugin root에서 열린 shell terminal을 사용해야 portable `node ./bridge/index.mjs` 시작 명령이 정확히 동작합니다.
+bundle에는 manifest가 선언한 `dist/panel.html`, bridge, source, fixture, tests, CI와 `npm-shrinkwrap.json`이 함께 들어갑니다. 빌드는 공개 fixture만 사용하고 contributor의 절대 경로를 넣지 않습니다. 압축을 푼 `package/` 디렉터리는 추가 설치 없이 Orca Development plugin 경로로 사용할 수 있으며 기본 bridge의 ping, 저장, reload도 Node.js 내장 모듈과 이미 번들된 panel만 사용합니다. 브리지 기동 시 tokenized loopback response endpoint가 넓게 보기 runtime에 주입됩니다. sidebar는 Orca의 CSP를 우회하지 않고 public terminal action만 사용하며, 응답형 작업은 same-origin 넓게 보기 탭으로 승격합니다. 기존 넓게 보기 탭은 다시 열 때 강제로 reload합니다. 저장 시 TypeScript를 다시 compile하지 않고 `dist/panel.html`의 안전한 JSON bootstrap만 원자적으로 갱신합니다. `corepack npm ci && corepack npm run check`는 기여자용 전체 source/test 재검증 경로이지 plugin 사용 전제조건이 아닙니다. 브리지를 선택할 때는 plugin root에서 열린 shell terminal을 사용해야 portable `node ./bridge/index.mjs` 시작 명령이 정확히 동작합니다.
 
 artifact를 만들지 않고 내용 계약만 검사하려면 `corepack npm run package:plugin -- --dry-run`을 사용합니다. 만들어진 tgz 자체를 독립적으로 검사하려면 `corepack npm run verify:plugin -- release/orca-graph-engineering-plugin-0.2.0.tgz`를 실행하십시오. plugin tar는 정렬된 경로, 고정 timestamp/owner/mode와 canonical gzip header로 생성되며 npm의 `pack` 구현에 의존하지 않습니다. CI는 실제 tgz를 dependency install 전에 추출해 manifest schema, entry, 금지 경로, bridge ping과 realistic save/`dist/panel.html` 갱신을 확인합니다. 그 뒤 pinned `corepack npm ci`/`corepack npm run check`를 별도로 확인하고, 별도 clean directory의 npm 10/11 결과가 byte-for-byte 같은지도 비교합니다. 일부 Node 배포는 기존 bare `npm`을 Corepack shim으로 바꾸지 않으므로 재현 가능한 명령은 `corepack npm ...` 형식을 사용합니다.
 
@@ -135,7 +135,7 @@ artifact를 만들지 않고 내용 계약만 검사하려면 `corepack npm run 
 
 그래프 보기 상단의 고정 `실행` 버튼도 같은 세 단계 실행 창을 사용합니다. 통합 session/model을 고르면 모든 Task와 자동 condition evaluator가 한 routing을 상속하고, 프로젝트별 배정을 고르면 Task target folder별 Orca worktree/session/model이 적용됩니다. 실행 창에는 머신·배정 방식·프로젝트·브랜치 또는 기존 세션·모델만 노출합니다. reasoning, 노드별 저수준 override, 조건 강제 선택, 별도 실행 계획 버튼은 노출하지 않으며 저장된 정책을 적용하고 조건은 선행 결과로 자동 판정합니다. 실제 실행을 시작하기 전에 bridge가 AND/OR join과 graph-call routing 결합을 따라 전체 execution plan을 내부 계산하고, 선택된 모든 descendant Task와 자동 condition evaluator의 pure route를 같은 resolver로 검사합니다. graph-call 순환·누락·보관·root hop limit, session/project/worktree, model allow-list/agent family/reasoning capability를 어떤 run record나 Orca call보다 먼저 검사하므로 잘못된 실행은 이력이나 Orca 호출을 남기지 않습니다.
 
-`실행 현황` 메뉴는 시작 요청과 동시에 만들어지는 머신 로컬 실행 레코드를 보여 줍니다. queued/running/completed/failed 상태, 프로젝트별 session·branch·model과 진행률을 표시하며 Task 목록·상세, 그래프 목록·캔버스에도 같은 컴포넌트를 사용합니다. 실행 중에는 loopback bridge를 짧게 polling하고 완료되면 자동으로 멈춥니다. 레코드는 `runtime/executions.json`에만 저장되고 portable GraphStore나 외부 데이터 원천에는 섞이지 않으며, 브리지 재시작 시 끝나지 않은 레코드는 실패로 닫아 유령 실행 상태를 남기지 않습니다.
+`실행 현황` 메뉴는 시작 요청과 동시에 만들어지는 머신 로컬 실행 레코드를 보여 줍니다. queued/running/completed/failed 상태, 프로젝트별 session·branch·model과 진행률을 표시하며 Task 목록·상세, 그래프 목록·캔버스에도 같은 컴포넌트를 사용합니다. sidebar에서 누르면 same-origin Orca 탭의 실행 현황으로 열리고, 그 화면은 실행 중에 loopback bridge를 짧게 polling한 뒤 완료되면 자동으로 멈춥니다. 레코드는 앱 데이터의 `executions.json`에만 저장되고 portable GraphStore나 외부 데이터 원천에는 섞이지 않으며, 브리지 재시작 시 끝나지 않은 레코드는 실패로 닫아 유령 실행 상태를 남기지 않습니다. 폴링은 내용이 바뀌었을 때만 해당 UI 조각을 갱신하고 panel HTML을 다시 만들지 않습니다.
 
 구조 오류, 존재하지 않는 조건 분기, 위험 권한 조합, loop guard 누락, idempotency·승인 gate 누락, 민감/제한 데이터의 network 정책 위반, token budget 초과도 같은 경계에서 차단됩니다. 조건 분기를 비워 두면 선행 노드의 완료 결과를 별도 evaluator가 읽어 허용된 branch 중 하나를 JSON으로 판정하고, 실행 창에서 branch를 고정하면 evaluator 없이 그 경로를 사용합니다. panel의 실행 modal은 실행 대상 문제를 엔지니어링 finding과 분리해서 보여 주고 idempotency와 sensitive-network 위반은 bridge와 같은 error로 차단합니다. 비가역 노드는 선택된 모든 non-loop 실행 경로를 지배하는 approved human gate가 있어야 하며, unrelated/downstream/pending gate는 승인 경계로 인정되지 않습니다. 로컬 브리지가 아직 지원하지 않는 loop 재진입도 live-run 전에 fail-closed로 차단하며 dry-run 계획과 정적 검사는 계속 제공합니다.
 

@@ -2,12 +2,15 @@ import { build } from "esbuild";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { panelBootstrapScript } from "./panel-bootstrap.mjs";
+import { prepareRuntimeDirectory, resolveRuntimeDirectory } from "./runtime-path.mjs";
 
 const root = process.cwd();
 const outputPath = process.env.ORCA_GRAPH_BUILD_OUTPUT
   ? path.resolve(process.env.ORCA_GRAPH_BUILD_OUTPUT)
   : path.join(root, "dist/panel.html");
 const fixturesOnly = process.env.ORCA_GRAPH_BUILD_FIXTURES_ONLY === "1";
+const runtimeDir = resolveRuntimeDirectory();
+if (!fixturesOnly) await prepareRuntimeDirectory(root, runtimeDir, { migrate: !process.env.ORCA_GRAPH_RUNTIME_DIR });
 const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH;
 const sourceTimestamp = sourceDateEpoch === undefined ? null : Number(sourceDateEpoch);
 if (sourceTimestamp !== null && !Number.isFinite(sourceTimestamp)) {
@@ -28,17 +31,17 @@ async function readJson(primary, fallback) {
 const [localStore, currentTargets, defaultTargets, dataSourceConfig, sourceCache, css] = await Promise.all([
   fixturesOnly
     ? readJson(path.join(root, "fixtures/default-store.json"), path.join(root, "fixtures/default-store.json"))
-    : readJson(path.join(root, "runtime/store.json"), path.join(root, "fixtures/default-store.json")),
+    : readJson(path.join(runtimeDir, "store.json"), path.join(root, "fixtures/default-store.json")),
   fixturesOnly
     ? readJson(path.join(root, "fixtures/default-targets.json"), path.join(root, "fixtures/default-targets.json"))
-    : readJson(path.join(root, "runtime/targets.json"), path.join(root, "fixtures/default-targets.json")),
+    : readJson(path.join(runtimeDir, "targets.json"), path.join(root, "fixtures/default-targets.json")),
   readJson(path.join(root, "fixtures/default-targets.json"), path.join(root, "fixtures/default-targets.json")),
   fixturesOnly
     ? readJson(path.join(root, "fixtures/default-data-source.json"), path.join(root, "fixtures/default-data-source.json"))
-    : readJson(path.join(root, "runtime/data-source.json"), path.join(root, "fixtures/default-data-source.json")),
+    : readJson(path.join(runtimeDir, "data-source.json"), path.join(root, "fixtures/default-data-source.json")),
   fixturesOnly
     ? readJson(path.join(root, "fixtures/default-source-cache.json"), path.join(root, "fixtures/default-source-cache.json"))
-    : readJson(path.join(root, "runtime/source-cache.json"), path.join(root, "fixtures/default-source-cache.json")),
+    : readJson(path.join(runtimeDir, "source-cache.json"), path.join(root, "fixtures/default-source-cache.json")),
   readFile(path.join(root, "src/panel.css"), "utf8"),
 ]);
 const useSourceStore = ["structured", "folder"].includes(dataSourceConfig.mode)

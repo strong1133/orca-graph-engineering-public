@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { updatePanelBootstrap } from "../scripts/panel-bootstrap.mjs";
+import { prepareRuntimeDirectory, resolveRuntimeDirectory } from "../scripts/runtime-path.mjs";
 import {
   claimStructuredNode,
   commitFolderStore,
@@ -31,9 +32,7 @@ const {
 const execFileAsync = promisify(execFile);
 const launchCwd = process.cwd();
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const runtimeDir = process.env.ORCA_GRAPH_RUNTIME_DIR
-  ? path.resolve(process.env.ORCA_GRAPH_RUNTIME_DIR)
-  : path.join(root, "runtime");
+const runtimeDir = resolveRuntimeDirectory();
 const storePath = path.join(runtimeDir, "store.json");
 const targetsPath = path.join(runtimeDir, "targets.json");
 const dataSourcePath = path.join(runtimeDir, "data-source.json");
@@ -44,11 +43,35 @@ const defaultTargetsPath = path.join(root, "fixtures/default-targets.json");
 const defaultDataSourcePath = path.join(root, "fixtures/default-data-source.json");
 const defaultSourceCachePath = path.join(root, "fixtures/default-source-cache.json");
 
+await prepareRuntimeDirectory(root, runtimeDir, { migrate: !process.env.ORCA_GRAPH_RUNTIME_DIR });
+
 const orcaCommand = process.env.ORCA_CLI_COMMAND ||
   (process.env.ORCA_DEV_REPO_ROOT ? "orca-dev" : process.platform === "linux" ? "orca-ide" : "orca");
 
+async function resolveOrcaInvocation() {
+  if (process.env.ORCA_CLI_COMMAND || process.env.ORCA_DEV_REPO_ROOT || process.platform !== "darwin") {
+    return { command: orcaCommand, prefix: [] };
+  }
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/which", [orcaCommand], { timeout: 5_000 });
+    const launcher = await realpath(String(stdout).trim());
+    const entrypoint = path.resolve(path.dirname(launcher), "..", "app.asar.unpacked", "out", "cli", "index.js");
+    await access(entrypoint);
+    // The macOS launcher re-enters Electron with ELECTRON_RUN_AS_NODE. That wrapper
+    // can lose the desktop runtime transport when called repeatedly by a long-lived
+    // plugin bridge. The shipped JS entrypoint is the same public CLI contract and
+    // runs reliably in the bridge's existing Node process environment.
+    return { command: process.execPath, prefix: [entrypoint] };
+  } catch {
+    return { command: orcaCommand, prefix: [] };
+  }
+}
+
+const orcaInvocation = await resolveOrcaInvocation();
+
 const assemblies = new Map();
 let queue = Promise.resolve();
+let orcaQueue = Promise.resolve();
 let executionRegistryQueue = Promise.resolve();
 let rebuildQueue = Promise.resolve();
 let inputBuffer = "";
@@ -99,13 +122,16 @@ async function readExecutions() {
   }
 }
 
-function mutateExecutionRegistry(mutator, { rebuildPanel = false } = {}) {
+function mutateExecutionRegistry(mutator, { rebuildPanel = false, writeWhenUnchanged = true } = {}) {
   const task = executionRegistryQueue.then(async () => {
     const records = await readExecutions();
+    const before = JSON.stringify(records);
     const value = await mutator(records);
     records.sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")));
-    await atomicJson(executionsPath, records.slice(0, 200));
-    if (rebuildPanel) await rebuild();
+    const next = records.slice(0, 200);
+    const changed = JSON.stringify(next) !== before;
+    if (changed || writeWhenUnchanged) await atomicJson(executionsPath, next);
+    if (rebuildPanel && (changed || writeWhenUnchanged)) await rebuild();
     return value;
   });
   executionRegistryQueue = task.catch(() => undefined);
@@ -177,6 +203,12 @@ async function publishLocalOrcaProjects({ force = false } = {}) {
     response = await client.put(`/orca-projects/${encodeURIComponent(localWorkTasksEnvironment)}`, { projects });
     publishedProjectSignature = signature;
   } catch (error) {
+    try {
+      const payload = JSON.parse(String(error?.stdout || ""));
+      if (payload?.ok === true && payload.result) return payload.result;
+    } catch {
+      // Fall through to the enriched process diagnostic below.
+    }
     const detail = JSON.stringify(error?.detail ?? "");
     const olderRegistry = error?.status === 422 && detail.includes("extra_forbidden") && detail.includes("worktrees");
     if (!olderRegistry) throw error;
@@ -641,7 +673,7 @@ function rebuild() {
   return task;
 }
 
-async function saveStore(store, message) {
+async function saveStore(store, message, { rebuildPanel = true } = {}) {
   if (!store || store.schemaVersion !== 1 || !Array.isArray(store.graphs)
     || (store.domains !== undefined && !Array.isArray(store.domains))
     || (store.milestones !== undefined && !Array.isArray(store.milestones))
@@ -659,7 +691,7 @@ async function saveStore(store, message) {
     await atomicJson(sourceCachePath, sourceCache);
   }
   await atomicJson(storePath, store);
-  await rebuild();
+  if (rebuildPanel) await rebuild();
   return sourceCache;
 }
 
@@ -669,7 +701,7 @@ async function readDataSourceConfig() {
   return config;
 }
 
-async function refreshConfiguredDataSource(config, preferredGraphId) {
+async function refreshConfiguredDataSource(config, preferredGraphId, { rebuildPanel = true } = {}) {
   config ??= await readDataSourceConfig();
   let cache = await refreshDataSource(config);
   cache = await enrichWorkProcessSource(cache);
@@ -683,7 +715,7 @@ async function refreshConfiguredDataSource(config, preferredGraphId) {
     result = await cacheWithBridgeRuntime(cache, localStore);
     await atomicJson(storePath, result.store);
   }
-  await rebuild();
+  if (rebuildPanel) await rebuild();
   return result;
 }
 
@@ -707,7 +739,7 @@ async function configureDataSource(rawConfig, seedStore) {
   return result;
 }
 
-async function savePanelStore(store) {
+async function savePanelStore(store, { rebuildPanel = true } = {}) {
   if (!store || store.schemaVersion !== 1 || !Array.isArray(store.graphs)
     || (store.domains !== undefined && !Array.isArray(store.domains))
     || (store.milestones !== undefined && !Array.isArray(store.milestones))
@@ -715,7 +747,7 @@ async function savePanelStore(store) {
     || (store.todos !== undefined && !Array.isArray(store.todos))) throw new Error("invalid graph store payload");
   const config = await readDataSourceConfig();
   if (config.mode !== "structured") {
-    const cache = await saveStore(store, `저장했습니다 · ${store.graphs.length} graphs · ${store.domains?.length ?? 0} domains · ${store.milestones?.length ?? 0} milestones · ${store.tasks?.length ?? 0} tasks · ${store.todos?.length ?? 0} todos`);
+    const cache = await saveStore(store, `저장했습니다 · ${store.graphs.length} graphs · ${store.domains?.length ?? 0} domains · ${store.milestones?.length ?? 0} milestones · ${store.tasks?.length ?? 0} tasks · ${store.todos?.length ?? 0} todos`, { rebuildPanel });
     if (config.mode === "folder" && cache) return { ...cache, store: mergeBridgeRuntime(cache.store, store) };
     return { mode: config.mode, store };
   }
@@ -760,18 +792,92 @@ async function adoptBridgeTerminal(terminalId) {
   return { terminalId: store.bridgeTerminalId, store };
 }
 
-async function runOrca(args, timeout = 30_000, cwd = root, environmentSelector = null) {
+async function runOrcaNow(args, timeout = 30_000, cwd = root, environmentSelector = null) {
   const scopedArgs = environmentSelector ? [...args, "--environment", environmentSelector] : args;
-  const { stdout } = await execFileAsync(orcaCommand, [...scopedArgs, "--json"], {
-    cwd,
-    timeout,
-    maxBuffer: 32 * 1024 * 1024,
-  });
+  // The bridge is itself hosted in an Orca terminal. Do not leak that pane's
+  // implicit session selectors into child CLI processes: mutation commands such
+  // as `terminal create` can otherwise be routed through the occupied bridge
+  // pane and intermittently return runtime_unavailable. Every bridge call uses
+  // an explicit selector (or a cwd that Orca can resolve) instead.
+  const childEnv = { ...process.env };
+  for (const key of [
+    "ORCA_PANE_KEY",
+    "ORCA_TAB_ID",
+    "ORCA_TERMINAL_HANDLE",
+    "ORCA_WORKSPACE_ID",
+    "ORCA_WORKTREE_ID",
+    "ORCA_SHELL_READY_MARKER",
+  ]) delete childEnv[key];
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync(orcaInvocation.command, [...orcaInvocation.prefix, ...scopedArgs, "--json"], {
+      cwd,
+      env: childEnv,
+      timeout,
+      maxBuffer: 32 * 1024 * 1024,
+    }));
+  } catch (error) {
+    const details = [error?.stderr, error?.stdout]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+      .join("\n")
+      .slice(0, 4_000);
+    const diagnostic = [
+      error instanceof Error ? error.message.trim() : String(error),
+      details,
+      error?.signal ? `signal=${error.signal}` : "",
+      error?.code !== undefined ? `code=${error.code}` : "",
+    ].filter(Boolean).join("\n");
+    throw new Error(diagnostic, { cause: error });
+  }
   const payload = JSON.parse(stdout);
   if (!payload.ok) {
     throw new Error(payload.error?.message || payload.error?.code || `${orcaCommand} ${args.join(" ")} failed`);
   }
   return payload.result;
+}
+
+function runOrca(args, timeout = 30_000, cwd = root, environmentSelector = null) {
+  const task = orcaQueue.then(() => runOrcaNow(args, timeout, cwd, environmentSelector));
+  orcaQueue = task.catch(() => undefined);
+  return task;
+}
+
+async function createOrRecoverOrcaTerminal({ worktreeId, title, command, environmentSelector = null }) {
+  const create = () => runOrca([
+    "terminal", "create",
+    "--worktree", `id:${worktreeId}`,
+    "--title", title,
+    "--command", command,
+  ], 30_000, root, environmentSelector);
+  try {
+    return await create();
+  } catch (firstError) {
+    // Orca can finish creating the tab while its CLI transport is being reconnected.
+    // Recover that tab by identity before retrying so a transient response failure does
+    // not either abort the graph or create a duplicate agent session.
+    try {
+      const listed = await runOrca([
+        "terminal", "list", "--worktree", `id:${worktreeId}`, "--limit", "100",
+      ], 30_000, root, environmentSelector);
+      const recovered = (listed.terminals ?? []).find((terminal) => terminal.title === title
+        && terminal.connected !== false && terminal.writable !== false);
+      if (recovered) return { terminal: recovered };
+    } catch {
+      // The original create error remains the useful diagnostic if recovery also fails.
+    }
+    // A fresh Work Tasks claim and the preceding routing snapshot can overlap the
+    // desktop runtime's mutation hand-off. Give Orca one full UI turn before the
+    // single retry; an immediate retry only repeats runtime_unavailable.
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    try {
+      return await create();
+    } catch (retryError) {
+      const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
+      const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
+      throw new Error(retryMessage === firstMessage ? retryMessage : `${retryMessage}\n첫 시도: ${firstMessage}`, { cause: retryError });
+    }
+  }
 }
 
 async function readRequestJson(request) {
@@ -791,6 +897,7 @@ function sendJson(response, status, value) {
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
     "access-control-allow-origin": "*",
+    "access-control-allow-private-network": "true",
   });
   response.end(`${JSON.stringify(value)}\n`);
 }
@@ -836,6 +943,7 @@ async function ensureWideServer() {
         response.writeHead(204, {
           "cache-control": "no-store",
           "access-control-allow-origin": "*",
+          "access-control-allow-private-network": "true",
           "access-control-allow-methods": "POST, OPTIONS",
           "access-control-allow-headers": "content-type",
         });
@@ -862,8 +970,9 @@ async function ensureWideServer() {
   return wideUrl;
 }
 
-async function openWideView() {
-  const url = await ensureWideServer();
+async function openWideView(initialView = "") {
+  const baseUrl = await ensureWideServer();
+  const url = initialView === "executions" ? `${baseUrl}#executions` : baseUrl;
   const current = await runOrca(["tab", "list"], 30_000, launchCwd);
   const existing = Array.isArray(current.tabs) ? current.tabs.find((tab) => tab?.url === url) : null;
   if (existing?.browserPageId) {
@@ -871,7 +980,10 @@ async function openWideView() {
     await runOrca(["reload", "--page", existing.browserPageId], 30_000, launchCwd);
     return { url, reused: true };
   }
-  await runOrca(["tab", "create", "--url", url], 30_000, launchCwd);
+  const created = await runOrca(["tab", "create", "--url", url], 30_000, launchCwd);
+  if (created?.browserPageId) {
+    await runOrca(["tab", "switch", "--page", created.browserPageId, "--focus"], 30_000, launchCwd);
+  }
   return { url, reused: false };
 }
 
@@ -1175,7 +1287,7 @@ function validateMetaPromptOutput(value) {
   return text;
 }
 
-async function terminalAgentMessage(handle, environmentSelector = null) {
+async function terminalAgentSnapshot(handle, environmentSelector = null) {
   const shown = await runOrca(["terminal", "show", "--terminal", handle], 30_000, root, environmentSelector);
   const terminal = shown?.terminal;
   if (!terminal?.worktreeId || !terminal.tabId || !terminal.leafId) throw new Error("agent terminal identity is unavailable");
@@ -1184,8 +1296,64 @@ async function terminalAgentMessage(handle, environmentSelector = null) {
   const paneKey = `${terminal.tabId}:${terminal.leafId}`;
   const agent = (worktree?.agents ?? []).find((candidate) => candidate.paneKey === paneKey);
   if (!agent) throw new Error("agent state is unavailable");
+  return { state: String(agent.state || "").toLowerCase(), message: String(agent.lastAssistantMessage || "") };
+}
+
+async function terminalAgentMessage(handle, environmentSelector = null) {
+  const agent = await terminalAgentSnapshot(handle, environmentSelector);
   if (!["done", "idle"].includes(String(agent.state || "").toLowerCase())) throw new Error(`agent did not finish cleanly (${agent.state || "unknown"})`);
-  return agent.lastAssistantMessage;
+  return agent.message;
+}
+
+async function waitForAgentReady(handle, environmentSelector = null, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const snapshot = await terminalAgentSnapshot(handle, environmentSelector);
+      if (["done", "idle"].includes(snapshot.state)) return snapshot;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  throw new Error(`agent terminal did not become ready${lastError instanceof Error ? `: ${lastError.message}` : ""}`);
+}
+
+async function waitForAgentTurnStart(handle, previousMessage, environmentSelector = null, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const snapshot = await terminalAgentSnapshot(handle, environmentSelector);
+      if (["working", "running", "busy"].includes(snapshot.state)) return { started: true, completed: false, snapshot };
+      if (["done", "idle"].includes(snapshot.state) && snapshot.message && snapshot.message !== previousMessage) {
+        return { started: true, completed: true, snapshot };
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  throw new Error(`agent did not start after Orca accepted the prompt${lastError instanceof Error ? `: ${lastError.message}` : ""}`);
+}
+
+async function waitForAgentCompletion(handle, previousMessage, environmentSelector = null, timeoutMs = 900_000, initialTurn = null) {
+  if (initialTurn?.completed && initialTurn.snapshot?.message && initialTurn.snapshot.message !== previousMessage) {
+    return initialTurn.snapshot;
+  }
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const snapshot = await terminalAgentSnapshot(handle, environmentSelector);
+      if (["done", "idle"].includes(snapshot.state) && snapshot.message && snapshot.message !== previousMessage) return snapshot;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  throw new Error(`agent did not complete with a new result${lastError instanceof Error ? `: ${lastError.message}` : ""}`);
 }
 
 async function persistMetaPromptFailure(kind, id, revisionId, error) {
@@ -1222,11 +1390,11 @@ async function generateMetaPrompt({ itemKind, itemId, draftRevisionId }) {
     if (!worktreeId) throw new Error("the selected bridge terminal has no Orca worktree");
     const targets = await readTargets();
     const model = resolveModel(targets, "gpt-5.6-sol", { required: true });
-    const created = await runOrca([
-      "terminal", "create", "--worktree", `id:${worktreeId}`,
-      "--title", `Meta Prompt · ${String(item.title || item.id).slice(0, 80)}`,
-      "--command", commandForModel(model, "medium"),
-    ]);
+    const created = await createOrRecoverOrcaTerminal({
+      worktreeId,
+      title: `Meta Prompt · ${String(item.title || item.id).slice(0, 80)}`,
+      command: commandForModel(model, "medium"),
+    });
     handle = findTerminalHandle(created);
     if (!handle) throw new Error("Orca did not return a Meta Prompt terminal handle");
     await runOrca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "90000"], 100_000);
@@ -1327,8 +1495,18 @@ function buildPrompt(graph, node, runId, workInput) {
     engineering.evidenceRequired || graph.engineering?.requireProvenance
       ? "Return evidence/provenance references for every material claim and side effect."
       : null,
-    "Complete only this node and finish with a concise result summary.",
+    "The Graph Engineering bridge already claimed this node and exclusively owns Graph/run/node lifecycle updates.",
+    "Do not claim, complete, reset, start, or change the status of this Graph run or node through Work Tasks tools.",
+    "You may record Task execution evidence and append-only Work Logs when the Task contract requires it.",
+    "Complete only the assigned work, then make the first line of the final response exactly `RESULT: done` or `RESULT: failed — <reason>`.",
+    "Use `RESULT: failed` for blocked, incomplete, unverifiable, or failed work; follow it with a concise result summary.",
   ].filter(Boolean).join("\n");
+}
+
+function dispatchedResultFailure(summary) {
+  const firstLine = String(summary || "").trim().split(/\r?\n/, 1)[0] || "";
+  const match = firstLine.match(/^RESULT:\s*failed\b\s*(?:[—:-]\s*)?(.*)$/i);
+  return match ? (match[1]?.trim() || "agent reported failed or blocked work") : "";
 }
 
 function standaloneRouting(value) {
@@ -1614,6 +1792,7 @@ async function dispatchTask(graph, node, targets, runId, options = {}) {
   const route = resolveTaskRoute(graph, node, targets);
   let handle = null;
   let sessionTitle = "";
+  let before = null;
   if (route.mode === "existing-session") {
     const evidence = await loadLiveRoutingEvidence([route.session.worktreeId], [route.session.worktreeId], route.environmentSelector);
     await waitForExistingSessionIdle(route, evidence);
@@ -1630,38 +1809,35 @@ async function dispatchTask(graph, node, targets, runId, options = {}) {
     if (pooled) {
       handle = pooled.handle;
       sessionTitle = pooled.title;
-      const configuredTimeout = Number(process.env.ORCA_GRAPH_SESSION_IDLE_TIMEOUT_MS || 5_000);
-      const timeoutMs = Number.isFinite(configuredTimeout) ? Math.max(1_000, configuredTimeout) : 5_000;
-      const idle = await runOrca([
-        "terminal", "wait", "--terminal", handle,
-        "--for", "tui-idle", "--timeout-ms", String(timeoutMs),
-      ], timeoutMs + 10_000, root, route.environmentSelector);
-      if (idle.wait?.satisfied !== true) throw new Error(`pooled session did not reach tui-idle: ${handle}`);
+      const configuredTimeout = Number(process.env.ORCA_GRAPH_SESSION_IDLE_TIMEOUT_MS || 20_000);
+      const timeoutMs = Number.isFinite(configuredTimeout) ? Math.max(1_000, configuredTimeout) : 20_000;
+      await waitForAgentReady(handle, route.environmentSelector, timeoutMs);
     } else {
       const baseTitle = options.title || `${graph.name} · ${node.label || node.id}`;
       sessionTitle = options.sessionPool && route.project.name ? `${baseTitle} · ${route.project.name}` : baseTitle;
-      const created = await runOrca([
-        "terminal", "create",
-        "--worktree", `id:${route.project.worktreeId}`,
-        "--title", sessionTitle,
-        "--command", commandForModel(route.model, route.routing.reasoning),
-      ], 30_000, root, route.environmentSelector);
+      const created = await createOrRecoverOrcaTerminal({
+        worktreeId: route.project.worktreeId,
+        title: sessionTitle,
+        command: commandForModel(route.model, route.routing.reasoning),
+        environmentSelector: route.environmentSelector,
+      });
       handle = findTerminalHandle(created);
       if (!handle) throw new Error("Orca did not return a terminal handle");
-      await runOrca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "90000"], 100_000, root, route.environmentSelector);
+      const initial = await runOrca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "90000"], 100_000, root, route.environmentSelector);
+      if (initial.wait?.satisfied !== true && initial.wait?.blockedReason !== "codex-interactive-prompt") {
+        throw new Error(`new agent terminal did not become interactive: ${handle}${initial.wait?.blockedReason ? ` (${initial.wait.blockedReason})` : ""}`);
+      }
+      try { before = await terminalAgentSnapshot(handle, route.environmentSelector); }
+      catch { before = { state: "idle", message: "" }; }
       options.sessionPool?.set(sessionKey, { handle, title: sessionTitle });
     }
   }
+  before ??= await waitForAgentReady(handle, route.environmentSelector);
   await runOrca(["terminal", "send", "--terminal", handle, "--text", prompt, "--enter"], 30_000, root, route.environmentSelector);
+  const turn = await waitForAgentTurnStart(handle, before.message, route.environmentSelector);
   const timeoutMs = Math.max(5_000, Number(node.engineering?.timeoutSeconds || 900) * 1000);
-  await runOrca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", String(timeoutMs)], timeoutMs + 10_000, root, route.environmentSelector);
-  let resultSummary = "";
-  try {
-    resultSummary = String(await terminalAgentMessage(handle, route.environmentSelector) || "").trim().slice(0, 20_000);
-  } catch {
-    // 실행 성공의 정본은 idle 도달이다. 공개 Orca surface가 결과 메시지를 주지 않는
-    // 구버전에서도 일반 task를 실패시키지 않고, 자동 조건 판정만 명시적으로 막는다.
-  }
+  const completed = await waitForAgentCompletion(handle, before.message, route.environmentSelector, timeoutMs, turn);
+  const resultSummary = completed.message.trim().slice(0, 20_000);
   return {
     sessionId: handle,
     ...(sessionTitle ? { sessionTitle } : {}),
@@ -1756,7 +1932,9 @@ async function evaluateCondition(graph, node, targets, runId, nodeOutputs, workI
 }
 
 async function persistRunProgress(store, message, executionId = undefined, graphId = undefined) {
-  await saveStore(store, message);
+  // Open panels poll the response bridge for runtime state. Rebuilding panel.html here
+  // reloads every Orca WebView and destroys in-flight click targets on every node update.
+  await saveStore(store, message, { rebuildPanel: false });
   if (executionId && graphId) {
     await syncGraphRuntimeExecution(executionId, store.graphs.find((item) => item.id === graphId));
   }
@@ -2279,6 +2457,26 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
    브리지가 통신 오류로 제자리를 도는 경우를 끊는 마지막 방어선이다. */
 const REMOTE_EXECUTION_MAX_STEPS = 500;
 
+function syncRemoteFrontierStore(store, graphId, frontier) {
+  const localGraph = store.graphs.find((graph) => graph.id === graphId);
+  if (!localGraph) return;
+  if (frontier.graph) {
+    localGraph.version = frontier.graph.version ?? localGraph.version;
+    localGraph.status = frontier.graph.status ?? localGraph.status;
+  }
+  for (const remoteNode of frontier.nodes ?? []) {
+    const localNode = localGraph.nodes.find((node) => node.id === remoteNode.id);
+    if (!localNode) continue;
+    if (remoteNode.status) localNode.status = remoteNode.status;
+    if (typeof remoteNode.branchTaken === "string" && remoteNode.branchTaken.trim()) localNode.branchTaken = remoteNode.branchTaken;
+  }
+  if (frontier.run?.id) {
+    const index = localGraph.runs.findIndex((run) => run.id === frontier.run.id);
+    if (index >= 0) localGraph.runs[index] = { ...localGraph.runs[index], ...frontier.run };
+    else localGraph.runs.push(frontier.run);
+  }
+}
+
 async function structuredExecutionContract() {
   const cache = await readJson(sourceCachePath, defaultSourceCachePath);
   if (cache.mode !== "structured" || cache.status !== "ready") {
@@ -2299,6 +2497,7 @@ async function structuredExecutionContract() {
 async function executeGraphRemotely({ config, store, targets, graph, executionId = undefined }) {
   const capability = await structuredExecutionContract();
   let frontier = await fetchStructuredExecution(config, graph.id);
+  syncRemoteFrontierStore(store, graph.id, frontier);
   const processRun = graph.processEnabled
     ? graph.runs.find((run) => run.id === frontier.run?.id) ?? [...graph.runs].reverse().find((run) => run.status === "running")
     : null;
@@ -2318,6 +2517,16 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
   };
   const nodeOutputs = new Map();
   const sessionPool = new Map();
+  const persistRemoteFailure = async (runnable, claim, message) => {
+    const failed = await completeStructuredNode(config, graph.id, runnable.id, {
+      expectedVersion: claim.graph.version, result: "failed", note: message.slice(0, 2000),
+    });
+    frontier = Array.isArray(failed.nodes)
+      ? { ...frontier, graph: failed.graph, run: failed.run, nodes: failed.nodes }
+      : await fetchStructuredExecution(config, graph.id);
+    syncRemoteFrontierStore(store, graph.id, frontier);
+    await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} 실패 · 원격 run`, executionId, graph.id);
+  };
   let completed = 0;
   let skipped = 0;
   for (let step = 0; step < REMOTE_EXECUTION_MAX_STEPS; step += 1) {
@@ -2335,6 +2544,11 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
       frontier = await fetchStructuredExecution(config, graph.id);
       continue;
     }
+    if (!closable) {
+      const localRuntimeNode = store.graphs.find((item) => item.id === graph.id)?.nodes.find((item) => item.id === runnable.id);
+      if (localRuntimeNode) localRuntimeNode.status = "running";
+      await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} 실행 중 · 원격 run`, executionId, graph.id);
+    }
     let outcome;
     if (closable) {
       outcome = { result: "skipped", note: "branch closed" };
@@ -2350,9 +2564,7 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
           branch = decision.branch;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          await completeStructuredNode(config, graph.id, runnable.id, {
-            expectedVersion: claim.graph.version, result: "failed", note: message.slice(0, 2000),
-          });
+          await persistRemoteFailure(runnable, claim, message);
           throw error;
         }
       }
@@ -2369,13 +2581,9 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
       // frontier에는 없으므로 없으면 임의로 보내지 않고 이 노드를 실패로 닫는다.
       const design = localNode(runnable.id);
       if (!design) {
-        await completeStructuredNode(config, graph.id, runnable.id, {
-          expectedVersion: claim.graph.version, result: "failed",
-          note: "node is missing from the panel snapshot; refresh the data source",
-        });
+        await persistRemoteFailure(runnable, claim, "node is missing from the panel snapshot; refresh the data source");
         throw new Error(`${runnable.label || runnable.id}: node is missing from the panel snapshot; refresh the data source`);
       }
-      await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} 실행 중 · 원격 run`, executionId, graph.id);
       try {
         const dispatched = await dispatchTask(graph, design, targets, frontier.run?.id ?? graph.id, {
           sessionPool,
@@ -2385,6 +2593,8 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
         if (executionId) {
           await assignRuntimeExecutionSession(executionId, dispatched, taskTargetForExecutionNode(design)?.locator);
         }
+        const dispatchedFailure = dispatchedResultFailure(dispatched.resultSummary);
+        if (dispatchedFailure) throw new Error(dispatchedFailure);
         if (dispatched.resultSummary) nodeOutputs.set(runnable.id, dispatched.resultSummary);
         outcome = {
           result: "done",
@@ -2393,9 +2603,7 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        await completeStructuredNode(config, graph.id, runnable.id, {
-          expectedVersion: claim.graph.version, result: "failed", note: message.slice(0, 2000),
-        });
+        await persistRemoteFailure(runnable, claim, message);
         throw error;
       }
     }
@@ -2403,15 +2611,25 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
       expectedVersion: claim.graph.version, ...outcome,
     });
     if (outcome.result === "done" && !closable) completed += 1;
-    await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} ${closable ? "건너뜀" : "완료"} · 원격 run`, executionId, graph.id);
     frontier = Array.isArray(done.nodes)
       ? { ...frontier, graph: done.graph, run: done.run, nodes: done.nodes }
       : await fetchStructuredExecution(config, graph.id);
+    syncRemoteFrontierStore(store, graph.id, frontier);
+    await persistRunProgress(store, `${graph.name} · ${runnable.label || runnable.id} ${closable ? "건너뜀" : "완료"} · 원격 run`, executionId, graph.id);
+  }
+  const failedNodes = frontier.nodes.filter((node) => node.status === "failed");
+  if (failedNodes.length) {
+    throw new Error(`원격 그래프 실행이 실패 노드 ${failedNodes.length}개와 함께 중단되었습니다: ${failedNodes.map((node) => node.label || node.id).join(", ")}`);
+  }
+  const unfinishedNodes = frontier.nodes.filter((node) => !["done", "skipped"].includes(node.status));
+  const runStatus = String(frontier.run?.status || "");
+  if (unfinishedNodes.length || !["done", "completed"].includes(runStatus)) {
+    throw new Error(`원격 그래프 실행이 완료 전에 정지했습니다 (${frontier.nodes.length - unfinishedNodes.length}/${frontier.nodes.length}, run=${runStatus || "unknown"})`);
   }
   await persistRunProgress(store, `${graph.name} · 원격 run · 완료 ${completed} · 건너뜀 ${skipped}`, executionId, graph.id);
   // 캔버스가 실행 전 스냅샷을 계속 들고 있으면 방금 돈 run이 화면에 없는 것과 같다.
   // 원천을 다시 읽어 노드 상태와 run 이력을 정본에서 가져온다.
-  const refreshed = await refreshConfiguredDataSource(config, graph.id);
+  const refreshed = await refreshConfiguredDataSource(config, graph.id, { rebuildPanel: false });
   return {
     mode: "structured", graphId: graph.id, completed, skipped,
     run: frontier.run ?? null, store: refreshed.store,
@@ -2425,33 +2643,69 @@ async function runGraph(graphId, dryRun, inputPrompt, startNewRun = true, execut
     const targets = await readTargets();
     let graph = store.graphs.find((item) => item.id === graphId);
     if (!graph) throw new Error(`graph not found: ${graphId}`);
-    const activeRun = [...graph.runs].reverse().find((run) => run.status === "running");
+    // A panel can hold an older projection while claim/complete updates advance the
+    // authoritative run. Read the compact frontier before deciding resume vs rerun.
+    // This prevents a failed active run from being "resumed" and rejected instantly.
+    const liveFrontier = await fetchStructuredExecution(dataSourceConfig, graph.id);
+    syncRemoteFrontierStore(store, graph.id, liveFrontier);
+    graph = store.graphs.find((item) => item.id === graphId);
+    if (!graph) throw new Error(`graph vanished while reading its execution frontier: ${graphId}`);
+    let activeRun = [...graph.runs].reverse().find((run) => run.status === "running");
+    const failedRun = Boolean(activeRun && graph.nodes.some((node) => node.status === "failed"));
     if (graph.processEnabled) {
-      if (startNewRun || !activeRun) {
-        if (typeof inputPrompt !== "string" || !inputPrompt.trim()) {
+      if (startNewRun || !activeRun || failedRun) {
+        const effectiveInputPrompt = typeof inputPrompt === "string" && inputPrompt.trim()
+          ? inputPrompt
+          : failedRun ? activeRun?.inputPrompt : undefined;
+        if (typeof effectiveInputPrompt !== "string" || !effectiveInputPrompt.trim()) {
           throw new Error("업무프로세스의 새 run에는 업무 입력이 필요합니다.");
         }
         if (!dryRun) {
           const client = requireWorkTasks();
+          const startRun = (expectedVersion) => client.post(`/graphs/${encodeURIComponent(graph.id)}/runs`, {
+            expected_version: expectedVersion,
+            trigger_kind: "manual",
+            // Do not normalize this value: it is immutable run history at the source.
+            input_prompt: effectiveInputPrompt,
+          });
           try {
-            await client.post(`/graphs/${encodeURIComponent(graph.id)}/runs`, {
-              expected_version: graph.version,
-              trigger_kind: "manual",
-              // Do not normalize this value: it is immutable run history at the source.
-              input_prompt: inputPrompt,
-            });
+            await startRun(graph.version);
           } catch (error) {
-            if (error?.status === 409) await client.get(`/graphs/${encodeURIComponent(graph.id)}`);
-            throw error;
+            if (error?.status !== 409) throw error;
+            // The panel snapshot may lag a claim/lease transition. Re-read the full
+            // source projection and retry with that exact CAS version once.
+            const latest = await refreshConfiguredDataSource(dataSourceConfig, graph.id, { rebuildPanel: false });
+            const latestGraph = latest.store.graphs.find((item) => item.id === graph.id);
+            if (!latestGraph) throw error;
+            graph = latestGraph;
+            await startRun(latestGraph.version);
           }
-          const refreshed = await refreshConfiguredDataSource(dataSourceConfig, graph.id);
+          const refreshed = await refreshConfiguredDataSource(dataSourceConfig, graph.id, { rebuildPanel: false });
           store = refreshed.store;
           graph = store.graphs.find((item) => item.id === graphId);
           if (!graph) throw new Error(`graph vanished after starting its run: ${graphId}`);
+          activeRun = [...graph.runs].reverse().find((run) => run.status === "running");
         }
       } else if (!activeRun.inputPrompt?.trim()) {
         throw new Error("재개할 업무프로세스 run의 저장된 업무 입력을 읽을 수 없습니다.");
       }
+    } else if (!dryRun && (startNewRun || !activeRun || graph.nodes.some((node) => ["done", "skipped", "failed"].includes(node.status)))) {
+      const client = requireWorkTasks();
+      const resetGraph = (expectedVersion) => client.post(`/graphs/${encodeURIComponent(graph.id)}/reset`, { expected_version: expectedVersion });
+      try {
+        await resetGraph(graph.version);
+      } catch (error) {
+        if (error?.status !== 409) throw error;
+        const latest = await refreshConfiguredDataSource(dataSourceConfig, graph.id, { rebuildPanel: false });
+        const latestGraph = latest.store.graphs.find((item) => item.id === graph.id);
+        if (!latestGraph) throw error;
+        graph = latestGraph;
+        await resetGraph(latestGraph.version);
+      }
+      const refreshed = await refreshConfiguredDataSource(dataSourceConfig, graph.id, { rebuildPanel: false });
+      store = refreshed.store;
+      graph = store.graphs.find((item) => item.id === graphId);
+      if (!graph) throw new Error(`graph vanished after preparing its rerun: ${graphId}`);
     }
     // 설계·라우팅 검증은 원격에 한 글자도 쓰기 전에, 로컬과 같은 규칙으로 한다.
     const plan = compileExecutionPlan(store, graph, targets, dryRun);
@@ -2510,7 +2764,7 @@ async function registerRuntimeExecution(record) {
     if (active) return active;
     records.unshift(record);
     return record;
-  }, { rebuildPanel: true });
+  }, { writeWhenUnchanged: false });
 }
 
 async function updateRuntimeExecution(executionId, mutate, { rebuildPanel = false } = {}) {
@@ -2559,8 +2813,9 @@ async function syncGraphRuntimeExecution(executionId, graph) {
   await updateRuntimeExecution(executionId, (record) => {
     const latest = [...(graph.runs ?? [])].reverse().find((run) => run.status === "running") ?? graph.runs?.at(-1);
     const nodeResults = latest?.nodeResults ?? [];
-    const completed = nodeResults.filter((item) => item.status === "done" || item.status === "skipped").length;
-    const failed = nodeResults.filter((item) => item.status === "failed").length;
+    const statusSource = nodeResults.length ? nodeResults : graph.nodes ?? [];
+    const completed = statusSource.filter((item) => item.status === "done" || item.status === "skipped").length;
+    const failed = statusSource.filter((item) => item.status === "failed").length;
     record.progress = { completed, failed, total: Math.max(record.progress.total, graph.nodes?.length ?? 0) };
     const sessionIds = nodeResults.map((item) => item.sessionId).filter(Boolean);
     const firstWithSession = nodeResults.find((item) => item.sessionId);
@@ -2584,6 +2839,18 @@ function scheduleRuntimeExecution(record, job) {
     });
     try {
       const result = await job();
+      if (record.itemKind === "graph") {
+        const resultGraph = result?.store?.graphs?.find((graph) => graph.id === record.itemId);
+        if (resultGraph) await syncGraphRuntimeExecution(record.id, resultGraph);
+        const current = (await readExecutions()).find((item) => item.id === record.id);
+        if (!current) throw new Error("graph execution tracking record disappeared before completion");
+        if (current.progress.failed > 0) {
+          throw new Error(`graph execution stopped with ${current.progress.failed} failed node(s)`);
+        }
+        if (current.progress.completed < current.progress.total) {
+          throw new Error(`graph execution stopped before completion (${current.progress.completed}/${current.progress.total})`);
+        }
+      }
       const endedAt = new Date().toISOString();
       await updateRuntimeExecution(record.id, (current) => {
         current.status = "completed";
@@ -2593,9 +2860,9 @@ function scheduleRuntimeExecution(record, job) {
           if (target.status === "queued" || target.status === "running") target.status = "completed";
           target.endedAt ||= endedAt;
         }
-        current.progress.completed = current.progress.total;
+        if (current.itemKind !== "graph") current.progress.completed = current.progress.total;
         current.progress.failed = 0;
-      }, { rebuildPanel: true });
+      });
       console.log(`[bridge] execution completed ${record.id}`);
       return result;
     } catch (error) {
@@ -2613,7 +2880,7 @@ function scheduleRuntimeExecution(record, job) {
           }
         }
         current.progress.failed = Math.max(1, current.targets.filter((item) => item.status === "failed").length);
-      }, { rebuildPanel: true });
+      });
       console.error(`[bridge] ${record.itemKind} ${record.itemId} execution failed: ${message}`);
       return undefined;
     }
@@ -2676,12 +2943,12 @@ async function startWorkItemExecution(message, itemKind) {
 async function startGraphExecution(message) {
   const graphId = String(message.graphId || "");
   const config = await readDataSourceConfig();
-  const requestedRouting = standaloneRouting(message.routing);
-  const targetsPromise = !requestedRouting.projectId && !requestedRouting.sessionId
-    && !(Array.isArray(message.projectSessions) && message.projectSessions.length)
-    ? refreshTargets()
-    : readTargets();
-  const [store, targets] = await Promise.all([readWorkingStore(config), targetsPromise]);
+  // Graph nodes are independently routed from their Task project relations. A full
+  // target refresh here launches many concurrent Orca CLI readers immediately before
+  // terminal creation and can make the desktop runtime reject the mutation. Use the
+  // published target snapshot; executeGraphRemotely re-attests every selected worktree
+  // and session against live Orca state before dispatch.
+  const [store, targets] = await Promise.all([readWorkingStore(config), readTargets()]);
   const graph = store.graphs.find((item) => item.id === graphId);
   if (!graph) throw new Error(`graph not found: ${graphId}`);
   const executionMode = message.executionMode === "per_project" ? "per_project" : "single_session";
@@ -2717,9 +2984,55 @@ async function startGraphExecution(message) {
   return record;
 }
 
+async function reconcileGraphExecutionRecords(store) {
+  const graphs = new Map((store.graphs ?? []).map((graph) => [graph.id, graph]));
+  return mutateExecutionRegistry((records) => {
+    for (const record of records) {
+      if (record.itemKind !== "graph" || record.status !== "completed") continue;
+      const graph = graphs.get(record.itemId);
+      const activeRun = [...(graph?.runs ?? [])].reverse().find((run) => run.status === "running");
+      if (!graph || !activeRun || String(activeRun.startedAt || "") > String(record.startedAt || record.createdAt || "")) continue;
+      const completed = graph.nodes.filter((node) => node.status === "done" || node.status === "skipped").length;
+      const failed = graph.nodes.filter((node) => node.status === "failed").length;
+      if (!failed && completed >= graph.nodes.length) continue;
+      const endedAt = new Date().toISOString();
+      record.status = "failed";
+      record.updatedAt = endedAt;
+      record.endedAt = endedAt;
+      record.progress = { completed, failed: Math.max(1, failed), total: graph.nodes.length };
+      record.error = failed
+        ? `그래프 정본에 실패 노드 ${failed}개가 있어 잘못 기록된 완료 상태를 정정했습니다.`
+        : `그래프 정본이 ${completed}/${graph.nodes.length}에서 정지해 잘못 기록된 완료 상태를 정정했습니다.`;
+      for (const target of record.targets ?? []) {
+        target.status = "failed";
+        target.endedAt = endedAt;
+        target.error = record.error;
+      }
+    }
+    return records;
+  }, { writeWhenUnchanged: false });
+}
+
 async function runtimeExecutionStatus() {
   const config = await readDataSourceConfig();
-  const [executions, store] = await Promise.all([readExecutions(), readWorkingStore(config)]);
+  const store = await readWorkingStore(config);
+  if (config.mode === "structured") {
+    const tracked = await readExecutions();
+    const graphIds = new Set([
+      ...tracked.filter((item) => item.itemKind === "graph" && ["queued", "running"].includes(item.status)).map((item) => item.itemId),
+      ...store.graphs.filter((graph) => graph.runs?.some((run) => run.status === "running")).map((graph) => graph.id),
+    ]);
+    // Poll only the compact execution frontier. This keeps node dots and run cards live
+    // without rebuilding panel.html or reloading the complete Work Tasks catalogue.
+    const live = await Promise.allSettled([...graphIds].map(async (graphId) => ({
+      graphId,
+      frontier: await fetchStructuredExecution(config, graphId),
+    })));
+    for (const result of live) {
+      if (result.status === "fulfilled") syncRemoteFrontierStore(store, result.value.graphId, result.value.frontier);
+    }
+  }
+  const executions = await reconcileGraphExecutionRecords(store);
   return { executions, store };
 }
 
@@ -2909,25 +3222,28 @@ async function handleMessage(message) {
       return runtimeExecutionStatus();
     case "start-task-execution":
       {
+        if (message.openWide === true) await openWideView("executions");
         const result = await startWorkItemExecution(message, "task");
         console.log(`[bridge] execution queued ${result.id}`);
         return result;
       }
     case "start-todo-execution":
       {
+        if (message.openWide === true) await openWideView("executions");
         const result = await startWorkItemExecution(message, "todo");
         console.log(`[bridge] execution queued ${result.id}`);
         return result;
       }
     case "start-graph-execution":
       {
+        if (message.openWide === true) await openWideView("executions");
         const result = await startGraphExecution(message);
         console.log(`[bridge] execution queued ${result.id}`);
         return result;
       }
     case "save":
       {
-        const result = await savePanelStore(message.store);
+        const result = await savePanelStore(message.store, { rebuildPanel: message.rebuildPanel !== false });
         console.log("[bridge] graph store saved");
         return result;
       }
@@ -3029,7 +3345,7 @@ async function handleMessage(message) {
       return result;
     }
     case "open-wide": {
-      const result = await openWideView();
+      const result = await openWideView(message.view === "executions" ? "executions" : "");
       console.log(`[bridge] wide view opened at ${result.url}`);
       return result;
     }
@@ -3096,7 +3412,6 @@ setInterval(() => {
   for (const [id, assembly] of assemblies) if (assembly.createdAt < cutoff) assemblies.delete(id);
 }, 30_000).unref();
 
-await mkdir(runtimeDir, { recursive: true });
 await settleInterruptedExecutions();
 if (process.env.ORCA_GRAPH_SKIP_REBUILD !== "1") {
   try {

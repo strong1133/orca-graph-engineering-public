@@ -34,6 +34,7 @@ async function sendToBridge(
   payload: unknown,
   expected: string,
   environment: Record<string, string> = {},
+  trailingPayloads: unknown[] = [],
 ): Promise<string> {
   const root = process.cwd();
   const child = spawn(process.execPath, [path.join(root, "bridge/index.mjs")], {
@@ -54,6 +55,7 @@ async function sendToBridge(
   try {
     await waitForOutput(child, () => output, "bridge ready");
     child.stdin.write(frame(payload));
+    for (const trailing of trailingPayloads) child.stdin.write(frame(trailing));
     await waitForOutput(child, () => output, expected);
     child.stdin.end();
     await new Promise<void>((resolve) => child.once("close", () => resolve()));
@@ -67,11 +69,13 @@ async function installFakeOrca(runtimeDirectory: string): Promise<{ command: str
   const command = path.join(runtimeDirectory, "fake-orca.mjs");
   const callLog = path.join(runtimeDirectory, "orca-calls.jsonl");
   await writeFile(command, `#!/usr/bin/env node
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const mode = process.env.ORCA_GRAPH_FAKE_MODE || "idle-agent";
 const remote = args.includes("--environment");
 appendFileSync(process.env.ORCA_GRAPH_FAKE_CALL_LOG, JSON.stringify(args) + "\\n");
+const fakeCallLog = readFileSync(process.env.ORCA_GRAPH_FAKE_CALL_LOG, "utf8");
+const promptSendCount = fakeCallLog.split("\\n").filter((line) => line.includes('["terminal","send"')).length;
 let result = {};
 if (args[0] === "environment" && args[1] === "list") {
   result = { environments: process.env.ORCA_GRAPH_FAKE_REMOTE === "1" ? [{ id: "env-jsj2", name: "jsj2" }] : [] };
@@ -90,7 +94,11 @@ if (args[0] === "environment" && args[1] === "list") {
       paneKey,
       state: mode === "busy" ? "working" : "done",
       agentType: "codex",
-      lastAssistantMessage: process.env.ORCA_GRAPH_FAKE_ASSISTANT || '{"branch":"y","reason":"fake result selects y"}',
+      lastAssistantMessage: promptSendCount
+        ? process.env.ORCA_GRAPH_FAKE_ASSISTANT
+          ? process.env.ORCA_GRAPH_FAKE_ASSISTANT + "\\nturn " + promptSendCount
+          : JSON.stringify({ branch: "y", reason: "fake result selects y " + promptSendCount })
+        : "fake agent ready",
     }],
   };
   const branchWorktree = {
@@ -290,6 +298,8 @@ describe("bridge graph calls", () => {
     const send = calls.find((args) => args[0] === "terminal" && args[1] === "send");
     expect(create).toEqual(expect.arrayContaining(["--worktree", "id:fake-worktree", "--title", "Task · 단건 Task"]));
     expect(create?.join(" ")).toContain("codex --model");
+    expect(create?.filter((argument) => argument === "--model")).toHaveLength(0);
+    expect(create?.[create.indexOf("--command") + 1]).toContain("codex --model 'gpt-5.6-sol'");
     expect(send?.join("\n")).toContain("Task: 단건 Task (TASK-standalone)");
     expect(send?.join("\n")).toContain("단건 실행 프롬프트");
     expect(send?.join("\n")).toContain("target · folder: /portable/fake-project · branch main");
@@ -393,6 +403,49 @@ describe("bridge graph calls", () => {
       status: "done",
       nodeResults: [{ nodeId: "tracked-node", status: "done", sessionId: "fake-session" }],
     });
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    const send = calls.find((args) => args[0] === "terminal" && args[1] === "send");
+    const prompt = send?.[send.indexOf("--text") + 1] ?? "";
+    expect(prompt).toContain("bridge already claimed this node");
+    expect(prompt).toContain("Do not claim, complete, reset, start, or change the status of this Graph run or node");
+    expect(prompt).toContain("RESULT: failed");
+  });
+
+  it("repairs a false completed Graph execution from authoritative failed node state", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-false-complete",
+      [taskNode("failed-node"), taskNode("pending-node")],
+      [{ id: "failed-pending", from: "failed-node", to: "pending-node", kind: "sequence" }],
+      { projectId: "fake-project", model: "gpt-5.6-sol" },
+    );
+    graph.status = "running";
+    graph.nodes[0]!.status = "failed";
+    graph.nodes[1]!.status = "pending";
+    (graph as any).runs = [{
+      id: "run-active", runNo: 1, status: "running", startedAt: "2026-08-11T00:00:00.000Z",
+      trigger: "manual", stats: { completed: 0, failed: 1, attempts: 1 }, nodeResults: [],
+    }];
+    await writeGraphStore(runtimeDirectory, [graph]);
+    await installFakeOrca(runtimeDirectory);
+    await writeFile(path.join(runtimeDirectory, "executions.json"), `${JSON.stringify([{
+      id: "exec-false-complete", itemKind: "graph", itemId: graph.id, title: graph.name, status: "completed",
+      executionMode: "single_session", createdAt: "2026-08-11T00:01:00.000Z", updatedAt: "2026-08-11T00:01:01.000Z",
+      startedAt: "2026-08-11T00:01:00.000Z", endedAt: "2026-08-11T00:01:01.000Z",
+      progress: { completed: 2, failed: 0, total: 2 },
+      targets: [{ id: "target-1", label: "Fake project", status: "completed", environmentId: "local", projectId: "fake-project" }],
+    }])}\n`, "utf8");
+
+    await sendToBridge(runtimeDirectory, { type: "execution-status" }, "[bridge] pong", {}, [{ type: "ping" }]);
+
+    const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
+    expect(records[0]).toMatchObject({
+      status: "failed",
+      progress: { completed: 0, failed: 1, total: 2 },
+      targets: [{ status: "failed" }],
+    });
+    expect(records[0].error).toContain("잘못 기록된 완료 상태를 정정");
   });
 
   it("reuses one newly created session for sequential Graph nodes on the same route", async () => {
@@ -1019,8 +1072,9 @@ describe("bridge graph calls", () => {
     expect(results.find((result: { nodeId: string }) => result.nodeId === "merge-any")).toMatchObject({ status: "done" });
     expect(results.find((result: { nodeId: string }) => result.nodeId === "merge-all")).toMatchObject({ status: "skipped" });
     const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
-    // One plan-level idle attestation, then a send-time attestation and completion wait per selected task.
-    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "wait")).toHaveLength(5);
+    // One plan-level idle attestation plus one completion wait per selected task.
+    // Send-time readiness and turn start are attested from the live agent pane state.
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "wait")).toHaveLength(3);
     expect(calls.filter((args) => args[0] === "terminal" && args[1] === "send")).toHaveLength(2);
   });
 
@@ -1252,9 +1306,9 @@ describe("bridge graph calls", () => {
     const sendIndexes = calls
       .map((args, index) => args[0] === "terminal" && args[1] === "send" ? index : -1)
       .filter((index) => index >= 0);
-    expect(idleWaitIndexes).toHaveLength(3);
+    expect(idleWaitIndexes).toHaveLength(2);
     expect(sendIndexes).toHaveLength(1);
-    expect(idleWaitIndexes[1]!).toBeLessThan(sendIndexes[0]!);
+    expect(idleWaitIndexes[0]!).toBeLessThan(sendIndexes[0]!);
   });
 
   it("rejects cached sessions with missing agent identity before any Orca call", async () => {

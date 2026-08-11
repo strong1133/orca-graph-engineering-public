@@ -2,12 +2,12 @@
 
 Graph Engineering supports four source modes.
 
-- `local`: GraphStore remains in `runtime/store.json`.
+- `local`: GraphStore remains in Orca app data at `plugin-runtime/orca-graph-engineering/store.json`.
 - `folder`: a user-selected local folder or checked-out Git repository stores the complete GraphStore.
 - `structured`: a remote workspace is the source of truth for Graph, Domain, Milestone, Task, Todo, prompt lineage, and CAS versions.
 - `unstructured`: arbitrary JSON is a read-only catalog; graphs continue to use the local store.
 
-The bridge stores `runtime/data-source.json` and a replaceable `runtime/source-cache.json`. Both are excluded from packages and Git. Authentication is configured as an environment-variable **name** such as `GRAPH_SOURCE_TOKEN`; the token value is read only by the bridge process and is never placed in the config, graph, cache, panel bootstrap, or logs. When the dedicated Orca/Hermes variable `ORCA_GRAPH_SOURCE_TOKEN` is missing after a restart, the bridge may reacquire the advertised session token from the configured source's same origin. It retains the value only in the current process. Arbitrary authentication variables never use this bootstrap path.
+The bridge stores `data-source.json` and a replaceable `source-cache.json` outside the plugin directory in Orca app data. `ORCA_GRAPH_RUNTIME_DIR` can override that directory. A legacy repository-local `runtime/` is copied once when the new location is empty, and remains excluded from packages and Git. Authentication is configured as an environment-variable **name** such as `GRAPH_SOURCE_TOKEN`; the token value is read only by the bridge process and is never placed in the config, graph, cache, panel bootstrap, or logs. When the dedicated Orca/Hermes variable `ORCA_GRAPH_SOURCE_TOKEN` is missing after a restart, the bridge may reacquire the advertised session token from the configured source's same origin. It retains the value only in the current process. Arbitrary authentication variables never use this bootstrap path.
 
 ## Folder and local Git storage
 

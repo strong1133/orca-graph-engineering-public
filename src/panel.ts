@@ -76,7 +76,9 @@ type RunModalState = {
   suggestedProjectId?: string;
   inferredProjectNodeIds?: string[];
   busy?: boolean;
+  saving?: boolean;
   error?: string;
+  errorAction?: "save" | "run";
 };
 
 type TaskRunModalState = {
@@ -89,8 +91,21 @@ type TaskRunModalState = {
   projectRoutings: Record<string, RoutingTarget>;
   suggestedProjectId?: string;
   busy?: boolean;
+  saving?: boolean;
   error?: string;
+  errorAction?: "save" | "run";
 };
+
+type SavedTaskRunSettings = {
+  schemaVersion: 1;
+  routing: RoutingTarget;
+  executionMode: ExecutionMode;
+  selectedProjectIds: string[];
+  projectRoutings: Record<string, RoutingTarget>;
+  savedAt: string;
+};
+
+const taskRunSettingsMetadataKey = "orcaGraphRunSettings";
 
 type RegistryProject = {
   name: string;
@@ -216,6 +231,7 @@ if (!bootstrapElement?.textContent) throw new Error("Graph Engineering bootstrap
 const bootstrap = structuredClone(JSON.parse(bootstrapElement.textContent) as Bootstrap);
 const injectedWideApi = (window as Window & { __ORCA_GRAPH_WIDE_API__?: string }).__ORCA_GRAPH_WIDE_API__;
 const isWideMode = typeof injectedWideApi === "string" && injectedWideApi.startsWith("/");
+const hasSandboxedLoopbackBridge = !isWideMode && /^http:\/\/127\.0\.0\.1:\d+\//u.test(bootstrap.bridgeApiUrl ?? "");
 const workspaceProductName = `${["under", "joy"].join("")}-workspace`;
 
 function trustedBridgeApi(value: string | undefined): string | undefined {
@@ -229,7 +245,12 @@ function trustedBridgeApi(value: string | undefined): string | undefined {
   }
 }
 
-let responseBridgeApi = trustedBridgeApi(injectedWideApi) ?? trustedBridgeApi(bootstrap.bridgeApiUrl);
+// Orca panel documents are intentionally wrapped in an opaque sandbox with
+// `connect-src 'none'`. Only the bridge-served wide view may use HTTP. The
+// sidebar always uses the public terminal.sendText host action.
+const responseBridgeApi = trustedBridgeApi(injectedWideApi)
+  ?? (bootstrap.bridgeApiUrl?.startsWith("/") ? trustedBridgeApi(bootstrap.bridgeApiUrl) : undefined);
+type BridgeEnvelope<T> = { ok?: boolean; error?: string; value?: T };
 const pendingBridgeSyncKey = "orca-graph-engineering:pending-terminal-bridge-sync";
 let store: GraphStore = normalizeGraphStore(bootstrap.store);
 let targets = bootstrap.targets;
@@ -263,7 +284,7 @@ if (!store.graphs.length) {
   store.activeGraphId = id;
 }
 const view: ViewState = {
-  mode: "canvas",
+  mode: isWideMode && window.location.hash === "#executions" ? "executions" : "canvas",
   graphQuery: "",
   graphStatusFilter: "all",
   graphRunFilter: "all",
@@ -753,13 +774,24 @@ function touch(graph = activeGraph()): void {
 
 function toast(message: string): void {
   view.toast = message;
-  render();
+  patchToast();
   window.setTimeout(() => {
     if (view.toast === message) {
       view.toast = "";
-      render();
+      patchToast();
     }
   }, 2600);
+}
+
+function toastMarkup(): string {
+  return view.toast ? `<div class="toast" role="status" aria-live="polite" aria-atomic="true">${esc(view.toast)}</div>` : "";
+}
+
+function patchToast(): void {
+  app.querySelector(".toast")?.remove();
+  if (!view.toast) return;
+  const shell = app.querySelector(".app-shell");
+  if (shell) shell.insertAdjacentHTML("beforeend", toastMarkup());
 }
 
 function focusableElements(root: ParentNode): HTMLElement[] {
@@ -1060,6 +1092,7 @@ function createRunModal(live: boolean): RunModalState {
   const activeRun = dataSource.config.mode === "structured"
     ? [...graph.runs].reverse().find((run) => run.status === "running")
     : undefined;
+  const failedActiveRun = Boolean(activeRun && graph.nodes.some((node) => node.status === "failed"));
   const inferredProjectNodeIds: string[] = [];
   const nodeRouting = Object.fromEntries(graph.nodes.map((node) => {
     const inferred = inferredTaskNodeRouting(graph, node);
@@ -1087,7 +1120,8 @@ function createRunModal(live: boolean): RunModalState {
   if (!selectedProjectIds.length && defaults.projectId && candidates.some((candidate) => candidate.project.id === defaults.projectId)) {
     selectedProjectIds.push(defaults.projectId);
   }
-  const executionMode: ExecutionMode = selectedProjectIds.length > 1 && previousExecution?.executionMode === "per_project"
+  const savedExecutionMode = graph.engineering?.executionMode ?? previousExecution?.executionMode;
+  const executionMode: ExecutionMode = selectedProjectIds.length > 1 && savedExecutionMode === "per_project"
     ? "per_project"
     : "single_session";
   if (executionMode === "per_project") {
@@ -1108,15 +1142,34 @@ function createRunModal(live: boolean): RunModalState {
     conditionBranches: Object.fromEntries(graph.nodes
       .filter((node) => node.kind === "condition")
       .map((node) => [node.id, node.branchTaken?.trim() ?? ""])),
-    inputPrompt: "",
-    startNewRun: !activeRun,
+    inputPrompt: failedActiveRun ? activeRun?.inputPrompt ?? "" : "",
+    startNewRun: !activeRun || failedActiveRun,
     ...(suggestedProjectId ? { suggestedProjectId } : {}),
     ...(inferredProjectNodeIds.length ? { inferredProjectNodeIds } : {}),
   };
 }
 
+function savedTaskRunSettings(task: LocalTask | undefined): SavedTaskRunSettings | undefined {
+  const value = task?.metadata?.[taskRunSettingsMetadataKey];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const candidate = value as Partial<SavedTaskRunSettings>;
+  if (candidate.schemaVersion !== 1 || !candidate.routing || typeof candidate.routing !== "object"
+    || !Array.isArray(candidate.selectedProjectIds) || !candidate.projectRoutings || typeof candidate.projectRoutings !== "object") return undefined;
+  return {
+    schemaVersion: 1,
+    routing: routingValue(candidate.routing),
+    executionMode: candidate.executionMode === "per_project" ? "per_project" : "single_session",
+    selectedProjectIds: candidate.selectedProjectIds.filter((id): id is string => typeof id === "string"),
+    projectRoutings: Object.fromEntries(Object.entries(candidate.projectRoutings)
+      .filter((entry): entry is [string, RoutingTarget] => Boolean(entry[0]) && Boolean(entry[1]) && typeof entry[1] === "object")
+      .map(([locator, route]) => [locator, routingValue(route)])),
+    savedAt: typeof candidate.savedAt === "string" ? candidate.savedAt : "",
+  };
+}
+
 function createWorkItemRunModal(itemKind: "task" | "todo", item: LocalTask | LocalTodo): TaskRunModalState {
   const task = itemKind === "task" ? item as LocalTask : undefined;
+  const savedSettings = savedTaskRunSettings(task);
   const targetFolders = task && taskProjectContextState?.taskId === task.id
     ? taskProjectContextState.projects.filter((project) => project.role === "target" && project.locatorKind === "folder")
     : task?.projects?.filter((project) => project.role === "target" && project.locatorKind === "folder") ?? [];
@@ -1203,16 +1256,25 @@ function createWorkItemRunModal(itemKind: "task" | "todo", item: LocalTask | Loc
   if (!selectedProjectIds.length && routing.projectId && candidates.some((candidate) => candidate.project.id === routing.projectId)) {
     selectedProjectIds.push(routing.projectId);
   }
-  const executionMode: ExecutionMode = itemKind === "task" && selectedProjectIds.length > 1 && previousExecution?.executionMode === "per_project"
+  if (savedSettings) {
+    Object.assign(routing, savedSettings.routing);
+    for (const [locator, savedRouting] of Object.entries(savedSettings.projectRoutings)) {
+      if (projectRoutings[locator]) projectRoutings[locator] = routingValue(savedRouting);
+    }
+    const candidateIds = new Set(candidates.map((candidate) => candidate.project.id));
+    selectedProjectIds.splice(0, selectedProjectIds.length, ...savedSettings.selectedProjectIds.filter((id) => candidateIds.has(id)));
+  }
+  const savedMode = savedSettings?.executionMode ?? previousExecution?.executionMode;
+  const executionMode: ExecutionMode = itemKind === "task" && selectedProjectIds.length > 1 && savedMode === "per_project"
     ? "per_project"
     : "single_session";
-  if (executionMode === "per_project") {
+  if (executionMode === "per_project" && !savedSettings) {
     for (const previousTarget of previousExecution?.targets ?? []) {
       if (!previousTarget.locator || !projectRoutings[previousTarget.locator]) continue;
       const restored = savedExecutionRouting(previousTarget);
       if (restored) projectRoutings[previousTarget.locator] = restored;
     }
-  } else if (previousPrimaryRouting) {
+  } else if (!savedSettings && previousPrimaryRouting) {
     const targetMatches = !targetFolder || (previousPrimaryRouting.projectId && targets.projects.some((project) =>
       project.id === previousPrimaryRouting.projectId
       && routeEnvironmentId(project.environmentId) === routeEnvironmentId(previousPrimaryRouting.environmentId)
@@ -1323,6 +1385,8 @@ function runDraftGraph(graph: GraphDefinition, modal: RunModalState): GraphDefin
 function applyRunDraft(graph: GraphDefinition, modal: RunModalState): void {
   const before = graphSnapshot(graph);
   graph.defaults = routingValue(modal.defaults);
+  graph.engineering ??= {};
+  graph.engineering.executionMode = modal.executionMode;
   for (const node of graph.nodes) {
     const target = taskTargetForGraphNode(node);
     const targetRouting = target ? modal.projectRoutings[target.locator] : undefined;
@@ -1346,6 +1410,21 @@ function applyRunDraft(graph: GraphDefinition, modal: RunModalState): void {
     recordGraphHistory(before, "실행 대상 설정", graph);
     view.dirty = true;
   }
+}
+
+function applyTaskRunSettings(task: LocalTask, modal: TaskRunModalState): void {
+  const settings: SavedTaskRunSettings = {
+    schemaVersion: 1,
+    routing: routingValue(modal.routing),
+    executionMode: modal.executionMode,
+    selectedProjectIds: [...modal.selectedProjectIds],
+    projectRoutings: Object.fromEntries(Object.entries(modal.projectRoutings)
+      .map(([locator, route]) => [locator, routingValue(route)])),
+    savedAt: new Date().toISOString(),
+  };
+  task.metadata = { ...(task.metadata ?? {}), [taskRunSettingsMetadataKey]: settings };
+  task.updatedAt = settings.savedAt;
+  view.dirty = true;
 }
 
 function graphOptions(selected: string): string {
@@ -1956,6 +2035,7 @@ function renderCanvas(graph: GraphDefinition): string {
 
   const nodes = graph.nodes
     .map((node) => {
+      const executionStatus = visualNodeStatus(graph, node, runtime);
       const routing = effectiveRouting(graph, node);
       const targetKind = routing.sessionId ? "세션" : routing.projectId ? "새 세션" : "실행 대상";
       const target = routing.sessionId ? sessionName(routing.sessionId) : routing.projectId ? projectName(routing.projectId) : "미지정";
@@ -1966,17 +2046,16 @@ function renderCanvas(graph: GraphDefinition): string {
       const role = node.engineering?.role ?? (node.kind === "condition" ? "router" : "worker");
       const title = nodeDisplayTitle(node);
       const editorLabel = node.kind === "condition" ? "조건 편집" : node.kind === "graph_call" ? "그래프 호출 편집" : "Task 편집";
-      const accessibleLabel = `${node.kind === "condition" ? "조건" : node.kind === "graph_call" ? "그래프 호출" : "작업"} 노드 ${title}, 상태 ${node.status}. 클릭하면 ${editorLabel}을 엽니다.`;
+      const accessibleLabel = `${node.kind === "condition" ? "조건" : node.kind === "graph_call" ? "그래프 호출" : "작업"} 노드 ${title}, 실행 상태 ${visualNodeStatusLabel[executionStatus]}. 클릭하면 ${editorLabel}을 엽니다.`;
       const ports = connectedPorts.get(node.id) ?? new Set<NodeSide>();
       const connectingClass = view.connectingFrom === node.id ? "connecting-source" : view.connectingFrom ? "connecting-target" : "";
       const nodeFindings = analysis.findings.filter((finding) => finding.nodeId === node.id);
       const selected = view.selectedNodeIds.includes(node.id);
-      const runResult = latestRun(graph)?.nodeResults?.find((result) => result.nodeId === node.id);
       const query = view.nodeQuery.trim().toLocaleLowerCase("ko-KR");
       const searchMatch = !query || `${node.id} ${title} ${nodeSubtitle(node)}`.toLocaleLowerCase("ko-KR").includes(query);
-      return `<article class="node ${node.kind} status-${node.status} ${critical.has(node.id) ? "critical" : ""} ${loopNodes.has(node.id) ? "in-loop" : ""} ${ready(node) ? "ready" : ""} ${branchClosed(node) ? "branch-closed" : ""} ${selected ? "selected" : ""} ${routeMissing ? "route-missing" : ""} ${node.engineering?.layoutPinned ? "layout-pinned" : ""} ${query ? searchMatch ? "search-match" : "search-dim" : ""} ${connectingClass}" data-node-id="${esc(node.id)}" data-drag-node="${esc(node.id)}" data-action="select-node" data-id="${esc(node.id)}" role="button" tabindex="0" aria-label="${esc(accessibleLabel)}" aria-pressed="${selected}" style="left:${node.x}px;top:${node.y}px">
+      return `<article class="node ${node.kind} status-${node.status} execution-${executionStatus} ${critical.has(node.id) ? "critical" : ""} ${loopNodes.has(node.id) ? "in-loop" : ""} ${ready(node) ? "ready" : ""} ${branchClosed(node) ? "branch-closed" : ""} ${selected ? "selected" : ""} ${routeMissing ? "route-missing" : ""} ${node.engineering?.layoutPinned ? "layout-pinned" : ""} ${query ? searchMatch ? "search-match" : "search-dim" : ""} ${connectingClass}" data-node-id="${esc(node.id)}" data-drag-node="${esc(node.id)}" data-action="select-node" data-id="${esc(node.id)}" role="button" tabindex="0" aria-label="${esc(accessibleLabel)}" aria-pressed="${selected}" style="left:${node.x}px;top:${node.y}px">
         ${nodeVector(node)}
-        <span class="node-status-strip ${node.status}"></span>
+        <span class="node-status-strip ${executionStatus}"></span>
         ${(["top", "right", "bottom", "left"] as NodeSide[]).map((side) => `<button class="connect-port port-${side} ${ports.has(side) ? "connected" : ""}" data-connect-port data-node-id="${esc(node.id)}" data-side="${side}" aria-label="${esc(title)} ${side} 연결점" title="드래그하여 연결"></button>`).join("")}
         <div class="node-head">
           <span class="node-kind">${nodeIcon(node)}</span>
@@ -1984,7 +2063,7 @@ function renderCanvas(graph: GraphDefinition): string {
           ${node.engineering?.layoutPinned ? '<span class="node-pin" title="자동 정렬 위치 고정">◆</span>' : ""}
           ${nodeFindings.length ? `<button class="node-problem ${nodeFindings.some((finding) => finding.severity === "error") ? "error" : "warning"}" data-action="focus-problem" data-id="${esc(node.id)}" title="${nodeFindings.length}개 문제">${nodeFindings.length}</button>` : ""}
           <button class="node-edit" data-action="edit-node" data-id="${esc(node.id)}" title="${editorLabel}" aria-label="${esc(title)} ${editorLabel}">편집</button>
-          <span class="node-status ${node.status}" title="${esc(node.status)}"></span>
+          ${nodeExecutionChipMarkup(executionStatus)}
         </div>
         <div class="node-body">
           <div class="node-subtitle" title="${esc(nodeSubtitle(node))}">${esc(nodeSubtitle(node))}</div>
@@ -1996,7 +2075,8 @@ function renderCanvas(graph: GraphDefinition): string {
               </div>
               <div class="node-chips node-policy-chips"><span class="chip role-${role}">${esc(role)}</span>${node.joinMode === "any" ? '<span class="chip">OR join</span>' : ""}${loopNodes.has(node.id) ? '<span class="chip loop-chip">↻ loop</span>' : ""}</div>`}
         </div>
-        ${view.editorMode === "run" ? `<div class="node-run-meta"><span>attempt ${runResult?.attempt ?? 0}</span>${runResult?.durationMs ? `<span>${Math.round(runResult.durationMs / 100) / 10}s</span>` : ""}${runResult?.message ? `<strong title="${esc(runResult.message)}">${esc(runResult.message)}</strong>` : ""}</div>${role === "human_gate" ? `<div class="gate-actions"><button data-action="gate-decision" data-id="approved">승인</button><button class="danger" data-action="gate-decision" data-id="rejected">거절</button></div>` : ""}` : ""}
+        ${nodeRunMetaMarkup(graph, node, executionStatus, runtime)}
+        ${view.editorMode === "run" && role === "human_gate" ? `<div class="gate-actions"><button data-action="gate-decision" data-id="approved">승인</button><button class="danger" data-action="gate-decision" data-id="rejected">거절</button></div>` : ""}
         ${selected && view.editorMode === "design" ? `<div class="node-quickbar"><button class="edit" data-action="edit-node" data-id="${esc(node.id)}">${editorLabel}</button><button data-action="duplicate-selection" title="복제">⧉</button><button data-action="connect-node" title="연결">→</button><button data-action="toggle-node-pin" title="위치 고정">${node.engineering?.layoutPinned ? "◇" : "◆"}</button><button class="danger" data-action="remove-node" title="삭제">×</button></div>` : ""}
       </article>`;
     })
@@ -2529,6 +2609,7 @@ function renderModal(): string {
   }
   if (view.modal.kind === "task-run") {
     const modal = view.modal;
+    const pending = Boolean(modal.busy || modal.saving);
     const item = modal.itemKind === "task"
       ? store.tasks.find((candidate) => candidate.id === modal.itemId)
       : store.todos.find((candidate) => candidate.id === modal.itemId);
@@ -2575,8 +2656,8 @@ function renderModal(): string {
       ...(perProject ? projectProblems : routingProblemMessages(item.title, route)),
     ];
     const assignmentLabel = perProject ? "프로젝트별 세션·모델" : "통합 세션·모델";
-    return `<div class="modal-backdrop"><section class="modal wide run-modal ${modal.busy ? "is-busy" : ""}" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="modal-title" aria-busy="${modal.busy ? "true" : "false"}">
-      <div class="modal-head"><strong id="modal-title">${itemLabel} 실행</strong><button class="icon ghost" data-action="close-modal" data-modal-initial-focus aria-label="닫기" ${modal.busy ? "disabled" : ""}>×</button></div>
+    return `<div class="modal-backdrop"><section class="modal wide run-modal ${pending ? "is-busy" : ""}" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="modal-title" aria-busy="${pending ? "true" : "false"}">
+      <div class="modal-head"><strong id="modal-title">${itemLabel} 실행</strong><button class="icon ghost" data-action="close-modal" data-modal-initial-focus aria-label="닫기" ${pending ? "disabled" : ""}>×</button></div>
       <div class="modal-body">
         <section class="run-launch-summary"><span class="run-step">1</span><div><strong>${esc(item.title)}</strong><small>${esc(item.id)} · ${esc(assignmentLabel)}</small></div><span class="badge">${esc(item.status)}</span></section>
         <section class="section run-choice-section">
@@ -2593,10 +2674,10 @@ function renderModal(): string {
           </div>`}
           <div class="run-route-effective"><strong>${esc(environmentName(route.environmentId))} · ${esc(target)}${route.branch ? ` · ${esc(shortBranch(route.branch))}` : ""}</strong><span>AI · ${esc(modelName(route.model))}</span></div>
         </section>
-        ${modal.error ? `<div class="run-submit-error" role="alert"><strong>실행을 시작하지 못했습니다.</strong><span>${esc(modal.error)}</span></div>` : ""}
-        ${problems.length ? `<div class="run-configuration-errors" role="alert"><strong>실행 전에 ${problems.length}개 설정을 확인하십시오.</strong><ul>${problems.map((message) => `<li>${esc(message)}</li>`).join("")}</ul></div>` : `<p class="status-pill good">${modal.busy ? "프로젝트 연결과 실행 세션을 준비하는 중입니다…" : `${esc(assignmentLabel)} 준비 완료`}</p>`}
+        ${modal.error ? `<div class="run-submit-error" role="alert"><strong>${modal.errorAction === "save" ? "실행 설정을 저장하지 못했습니다." : "실행을 시작하지 못했습니다."}</strong><span>${esc(modal.error)}</span></div>` : ""}
+        ${problems.length ? `<div class="run-configuration-errors" role="alert"><strong>실행 전에 ${problems.length}개 설정을 확인하십시오.</strong><ul>${problems.map((message) => `<li>${esc(message)}</li>`).join("")}</ul></div>` : `<p class="status-pill good">${modal.saving ? "실행 설정을 저장하는 중입니다…" : modal.busy ? "프로젝트 연결과 실행 세션을 준비하는 중입니다…" : `${esc(assignmentLabel)} 준비 완료`}</p>`}
       </div>
-      <div class="modal-actions"><button data-action="close-modal" ${modal.busy ? "disabled" : ""}>취소</button><button class="primary" data-action="confirm-task-run" ${problems.length || modal.busy ? "disabled" : ""}>${modal.busy ? "실행 요청 중…" : "▶ 실행 시작"}</button></div>
+      <div class="modal-actions"><button data-action="close-modal" ${pending ? "disabled" : ""}>취소</button>${modal.itemKind === "task" ? `<button data-action="save-task-run-settings" ${pending ? "disabled" : ""}>${modal.saving ? "저장 중…" : "저장"}</button>` : ""}<button class="primary" data-action="confirm-task-run" ${problems.length || pending ? "disabled" : ""}>${modal.busy ? "실행 요청 중…" : "▶ 실행 시작"}</button></div>
     </section></div>`;
   }
   if (view.modal.kind === "task-delete") {
@@ -2621,6 +2702,7 @@ function renderModal(): string {
   }
   if (view.modal.kind === "run") {
     const modal = view.modal;
+    const pending = Boolean(modal.busy || modal.saving);
     const sourceGraph = activeGraph();
     const graph = runDraftGraph(sourceGraph, view.modal);
     const analysis = analyzeGraph(graph, { targets });
@@ -2659,6 +2741,7 @@ function renderModal(): string {
     const activeProcessRun = dataSource.config.mode === "structured"
       ? [...sourceGraph.runs].reverse().find((run) => run.status === "running")
       : undefined;
+    const activeProcessRunFailed = Boolean(activeProcessRun && sourceGraph.nodes.some((node) => node.status === "failed"));
     const processInputMissing = graph.processEnabled && view.modal.startNewRun && !view.modal.inputPrompt.trim();
     const problems = [...blockers, ...projectProblems, ...routingProblems.map((problem) => problem.message)];
     const blocked = problems.length > 0 || processInputMissing;
@@ -2666,12 +2749,12 @@ function renderModal(): string {
       ? `기존 세션 · ${sessionName(graph.defaults.sessionId, graph.defaults.environmentId)}`
       : graph.defaults.projectId ? `새 세션 · ${projectName(graph.defaults.projectId, graph.defaults.environmentId)}` : "현재 Orca 컨텍스트";
     const assignmentLabel = perProject ? "프로젝트별 세션·모델" : "통합 세션·모델";
-    return `<div class="modal-backdrop"><section class="modal wide run-modal ${modal.busy ? "is-busy" : ""}" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="modal-title" aria-busy="${modal.busy ? "true" : "false"}">
-      <div class="modal-head"><strong id="modal-title">${view.modal.live ? "그래프 실행" : "실행 계획 생성"}</strong><button class="icon ghost" data-action="close-modal" data-modal-initial-focus aria-label="닫기" ${modal.busy ? "disabled" : ""}>×</button></div>
+    return `<div class="modal-backdrop"><section class="modal wide run-modal ${pending ? "is-busy" : ""}" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="modal-title" aria-busy="${pending ? "true" : "false"}">
+      <div class="modal-head"><strong id="modal-title">${view.modal.live ? "그래프 실행" : "실행 계획 생성"}</strong><button class="icon ghost" data-action="close-modal" data-modal-initial-focus aria-label="닫기" ${pending ? "disabled" : ""}>×</button></div>
       <div class="modal-body">
         <section class="run-launch-summary"><span class="run-step">1</span><div><strong>${graph.processEnabled ? "🧭 " : ""}${esc(graph.name)}</strong><small>노드 ${graph.nodes.length}개 · ${esc(assignmentLabel)}</small></div><span class="badge">${view.modal.live ? "실행" : "계획"}</span></section>
         ${graph.processEnabled ? `<section class="section process-run-input">
-          <div class="section-title">이번 업무 ${activeProcessRun ? `<select data-scope="run-process" data-field="startNewRun" aria-label="Run 방식">${option("resume", `Run #${activeProcessRun.runNo} 재개`, view.modal.startNewRun ? "new" : "resume")}${option("new", "새 Run", view.modal.startNewRun ? "new" : "resume")}</select>` : '<span class="badge">새 Run</span>'}</div>
+          <div class="section-title">이번 업무 ${activeProcessRun && !activeProcessRunFailed ? `<select data-scope="run-process" data-field="startNewRun" aria-label="Run 방식">${option("resume", `Run #${activeProcessRun.runNo} 재개`, view.modal.startNewRun ? "new" : "resume")}${option("new", "새 Run", view.modal.startNewRun ? "new" : "resume")}</select>` : `<span class="badge">${activeProcessRunFailed ? `실패 Run #${activeProcessRun?.runNo} 재실행` : "새 Run"}</span>`}</div>
           <label class="field"><span>${view.modal.startNewRun ? "업무 입력 · 필수" : "저장된 업무 입력"}</span><textarea data-scope="run-process" data-field="inputPrompt" ${view.modal.startNewRun ? 'placeholder="이번 실행에서 처리할 업무를 입력하십시오."' : "readonly"}>${esc(view.modal.startNewRun ? view.modal.inputPrompt : activeProcessRun?.inputPrompt ?? "")}</textarea></label>
           ${processInputMissing ? '<p class="warning-list">업무 입력을 입력하십시오.</p>' : ""}
         </section>` : ""}
@@ -2685,10 +2768,10 @@ function renderModal(): string {
           ${perProject ? "" : `<div class="run-routing-grid"><label class="field"><span>통합 실행 위치</span><select data-scope="run-routing" data-field="targetMode">${option("worktree", selectedProjects.length ? "첫 선택 프로젝트에서 새 Orca 세션" : "현재 Orca 컨텍스트에서 새 세션", routingTargetMode(graph.defaults))}${option("session", "기존 Orca 세션", routingTargetMode(graph.defaults))}</select></label>${graph.defaults.sessionId ? `<label class="field"><span>Orca 세션</span><select data-scope="run-routing" data-field="sessionId">${sessionOptions(view.modal.defaults.sessionId, false, view.modal.defaults.environmentId, view.modal.defaults.projectId)}</select></label>` : ""}<label class="field"><span>통합 AI 모델</span><select data-scope="run-routing" data-field="model">${modelOptions(view.modal.defaults.model)}</select></label></div>`}
           <div class="run-route-effective"><strong>${esc(environmentName(graph.defaults.environmentId))} · ${esc(defaultRoute)}${graph.defaults.branch ? ` · ${esc(shortBranch(graph.defaults.branch))}` : ""}</strong><span>AI · ${esc(modelName(graph.defaults.model))}</span></div>
         </section>
-        ${modal.error ? `<div class="run-submit-error" role="alert"><strong>실행을 시작하지 못했습니다.</strong><span>${esc(modal.error)}</span></div>` : ""}
-        ${problems.length ? `<div class="run-configuration-errors" role="alert"><strong>실행 전에 ${problems.length}개 설정을 확인하십시오.</strong><ul>${problems.slice(0, 5).map((message) => `<li>${esc(message)}</li>`).join("")}</ul>${problems.length > 5 ? `<small>외 ${problems.length - 5}개</small>` : ""}</div>` : `<p class="status-pill good">${modal.busy ? "그래프를 저장하고 실행 세션을 준비하는 중입니다…" : `${esc(assignmentLabel)} 준비 완료 · 조건 분기는 실행 중 자동 판정`}</p>`}
+        ${modal.error ? `<div class="run-submit-error" role="alert"><strong>${modal.errorAction === "save" ? "실행 설정을 저장하지 못했습니다." : "실행을 시작하지 못했습니다."}</strong><span>${esc(modal.error)}</span></div>` : ""}
+        ${problems.length ? `<div class="run-configuration-errors" role="alert"><strong>실행 전에 ${problems.length}개 설정을 확인하십시오.</strong><ul>${problems.slice(0, 5).map((message) => `<li>${esc(message)}</li>`).join("")}</ul>${problems.length > 5 ? `<small>외 ${problems.length - 5}개</small>` : ""}</div>` : `<p class="status-pill good">${modal.saving ? "그래프 실행 설정을 저장하는 중입니다…" : modal.busy ? "그래프를 저장하고 실행 세션을 준비하는 중입니다…" : `${esc(assignmentLabel)} 준비 완료 · 조건 분기는 실행 중 자동 판정`}</p>`}
       </div>
-      <div class="modal-actions"><button data-action="close-modal" ${modal.busy ? "disabled" : ""}>취소</button><button class="primary" data-action="confirm-run" ${blocked || modal.busy ? "disabled" : ""}>${modal.busy ? "실행 요청 중…" : view.modal.live ? "▶ 실행 시작" : "실행 계획 만들기"}</button></div>
+      <div class="modal-actions"><button data-action="close-modal" ${pending ? "disabled" : ""}>취소</button><button data-action="save-run-settings" ${pending ? "disabled" : ""}>${modal.saving ? "저장 중…" : "저장"}</button><button class="primary" data-action="confirm-run" ${blocked || pending ? "disabled" : ""}>${modal.busy ? "실행 요청 중…" : view.modal.live ? "▶ 실행 시작" : "실행 계획 만들기"}</button></div>
     </section></div>`;
   }
   if (view.modal.kind === "history") {
@@ -3299,6 +3382,40 @@ function executionActive(execution: RuntimeExecution): boolean {
   return execution.status === "queued" || execution.status === "running";
 }
 
+type VisualNodeStatus = GraphNode["status"] | "queued" | "blocked";
+
+const visualNodeStatusLabel: Record<VisualNodeStatus, string> = {
+  pending: "대기",
+  queued: "실행 대기",
+  running: "실행 중",
+  waiting: "승인 대기",
+  done: "완료",
+  skipped: "건너뜀",
+  failed: "실패",
+  blocked: "시작 실패",
+};
+
+function visualNodeStatus(graph: GraphDefinition, node: GraphNode, execution = latestExecution("graph", graph.id)): VisualNodeStatus {
+  if (node.status !== "pending") return node.status;
+  const result = latestRun(graph)?.nodeResults?.find((item) => item.nodeId === node.id);
+  if (result?.status === "failed") return "failed";
+  if (result?.status === "done" || result?.status === "skipped") return result.status;
+  if (execution?.status === "queued" || execution?.status === "running") return "queued";
+  if (execution?.status === "failed") return "blocked";
+  if (execution?.status === "completed") return "skipped";
+  return "pending";
+}
+
+function nodeExecutionChipMarkup(status: VisualNodeStatus): string {
+  return `<span class="node-execution-chip ${status}" title="${esc(visualNodeStatusLabel[status])}"><span class="execution-pulse"></span>${esc(visualNodeStatusLabel[status])}</span>`;
+}
+
+function nodeRunMetaMarkup(graph: GraphDefinition, node: GraphNode, status: VisualNodeStatus, execution: RuntimeExecution | undefined): string {
+  if (!execution) return "";
+  const result = latestRun(graph)?.nodeResults?.find((item) => item.nodeId === node.id);
+  return `<div class="node-run-meta status-${status}"><strong>${esc(visualNodeStatusLabel[status])}</strong>${result?.attempt ? `<span>attempt ${result.attempt}</span>` : ""}${result?.durationMs ? `<span>${Math.round(result.durationMs / 100) / 10}s</span>` : ""}${result?.message ? `<span title="${esc(result.message)}">${esc(result.message)}</span>` : ""}</div>`;
+}
+
 function latestExecution(itemKind: RuntimeExecution["itemKind"], itemId: string): RuntimeExecution | undefined {
   return executions
     .filter((execution) => execution.itemKind === itemKind && execution.itemId === itemId)
@@ -3328,16 +3445,43 @@ function executionTargetSession(target: RuntimeExecutionTarget): string {
   return target.status === "queued" ? "세션 생성 대기" : "새 Orca 세션";
 }
 
-function renderExecutionCard(execution: RuntimeExecution): string {
+function renderExecutionCard(execution: RuntimeExecution, grouped = false, groupIndex = 0): string {
   const percent = executionPercent(execution);
   const kindLabel = execution.itemKind === "graph" ? "Graph" : execution.itemKind === "task" ? "Task" : "Todo";
+  const cardTitle = grouped ? groupIndex === 0 ? "최근 실행" : `이전 실행 ${groupIndex}` : execution.title;
+  const cardMeta = grouped
+    ? `${new Date(execution.createdAt).toLocaleString("ko-KR")} · ${execution.executionMode === "per_project" ? "프로젝트별 배정" : "통합 배정"}`
+    : `${execution.itemId} · ${execution.executionMode === "per_project" ? "프로젝트별 배정" : "통합 배정"}`;
   return `<article class="execution-card status-${execution.status}">
-    <header><span class="execution-kind">${kindLabel}</span><div><strong>${esc(execution.title)}</strong><small>${esc(execution.itemId)} · ${execution.executionMode === "per_project" ? "프로젝트별 배정" : "통합 배정"}</small></div>${executionInline(execution)}</header>
+    <header><span class="execution-kind">${grouped ? "RUN" : kindLabel}</span><div><strong>${esc(cardTitle)}</strong><small>${esc(cardMeta)}</small></div>${executionInline(execution)}</header>
     <div class="execution-progress-copy"><span>${execution.progress.completed}/${execution.progress.total} 완료${execution.progress.failed ? ` · ${execution.progress.failed} 실패` : ""}</span><time>${new Date(execution.updatedAt).toLocaleString("ko-KR")}</time></div>
     <div class="execution-progress" role="progressbar" aria-label="${esc(execution.title)} 실행 진행률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span style="width:${percent}%"></span></div>
     <div class="execution-targets">${execution.targets.map((target) => `<div class="execution-target status-${target.status}"><span class="execution-pulse"></span><strong>${esc(target.projectName || target.label)}</strong><span>${esc(target.branch || "기본 브랜치")}</span><span title="${esc(target.sessionId ?? "")}">${esc(executionTargetSession(target))}</span><span>${esc(modelName(target.model))}</span>${target.error ? `<small class="execution-target-error">${esc(target.error)}</small>` : ""}</div>`).join("")}</div>
     ${execution.error ? `<p class="execution-error" role="alert">${esc(execution.error)}</p>` : ""}
-    <footer><button data-action="open-execution-item" data-kind="${execution.itemKind}" data-id="${esc(execution.itemId)}">${kindLabel} 열기</button></footer>
+    ${grouped ? "" : `<footer><button data-action="open-execution-item" data-kind="${execution.itemKind}" data-id="${esc(execution.itemId)}">${kindLabel} 열기</button></footer>`}
+  </article>`;
+}
+
+function executionGroups(records: RuntimeExecution[]): RuntimeExecution[][] {
+  const groups = new Map<string, RuntimeExecution[]>();
+  for (const execution of records) {
+    const key = `${execution.itemKind}:${execution.itemId}`;
+    const group = groups.get(key) ?? [];
+    group.push(execution);
+    groups.set(key, group);
+  }
+  return [...groups.values()]
+    .map((group) => group.sort((left, right) => right.createdAt.localeCompare(left.createdAt)))
+    .sort((left, right) => right[0]!.createdAt.localeCompare(left[0]!.createdAt));
+}
+
+function renderExecutionGroup(records: RuntimeExecution[]): string {
+  const latest = records[0]!;
+  const kindLabel = latest.itemKind === "graph" ? "Graph" : latest.itemKind === "task" ? "Task" : "Todo";
+  const active = records.filter(executionActive).length;
+  return `<article class="execution-group" data-execution-kind="${latest.itemKind}" data-execution-item-id="${esc(latest.itemId)}">
+    <header class="execution-group-header"><span class="execution-kind">${kindLabel}</span><div><strong>${esc(latest.title)}</strong><small>${esc(latest.itemId)} · 실행 ${records.length}회${active ? ` · 진행 중 ${active}` : ""}</small></div>${executionInline(latest)}<button data-action="open-execution-item" data-kind="${latest.itemKind}" data-id="${esc(latest.itemId)}">${kindLabel} 열기</button></header>
+    <div class="execution-group-runs">${records.map((execution, index) => renderExecutionCard(execution, true, index)).join("")}</div>
   </article>`;
 }
 
@@ -3345,11 +3489,16 @@ function renderExecutionManager(): string {
   const ordered = [...executions].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   const active = ordered.filter(executionActive);
   const recent = ordered.filter((item) => !executionActive(item)).slice(0, 30);
+  const visible = [...active, ...recent].filter((execution, index, all) => all.findIndex((candidate) => candidate.id === execution.id) === index);
+  const grouped = executionGroups(visible);
+  const graphGroups = grouped.filter((group) => group[0]?.itemKind === "graph");
+  const workGroups = grouped.filter((group) => group[0]?.itemKind !== "graph");
   return `<section class="execution-manager" aria-label="실행 현황">
-    <header class="execution-manager-header"><div><strong>실행 현황</strong><span>실행 중 ${active.length} · 최근 ${recent.length}</span></div><button data-action="refresh-executions" aria-label="실행 현황 새로고침">↻ 새로고침</button></header>
+    <header class="execution-manager-header"><div><strong>실행 현황</strong><span>Graph ${graphGroups.length} · 단건 ${workGroups.length} · 실행 중 ${active.length}</span></div><button data-action="refresh-executions" aria-label="실행 현황 새로고침">↻ 새로고침</button></header>
     <div class="execution-manager-body">
-      <section class="execution-section"><header><strong>실행 중</strong><span>${active.length}</span></header>${active.length ? `<div class="execution-grid">${active.map(renderExecutionCard).join("")}</div>` : '<div class="execution-empty"><strong>현재 실행 중인 작업이 없습니다.</strong><span>Task 또는 그래프의 실행 버튼에서 바로 시작할 수 있습니다.</span></div>'}</section>
-      ${recent.length ? `<section class="execution-section recent"><header><strong>최근 실행</strong><span>${recent.length}</span></header><div class="execution-grid">${recent.map(renderExecutionCard).join("")}</div></section>` : ""}
+      ${graphGroups.length ? `<section class="execution-section"><header><strong>Graph 실행</strong><span>${graphGroups.length}개 Graph · ${graphGroups.reduce((count, group) => count + group.length, 0)}회</span></header><div class="execution-groups">${graphGroups.map(renderExecutionGroup).join("")}</div></section>` : ""}
+      ${workGroups.length ? `<section class="execution-section"><header><strong>Task·Todo 단건 실행</strong><span>${workGroups.length}개 항목 · ${workGroups.reduce((count, group) => count + group.length, 0)}회</span></header><div class="execution-groups">${workGroups.map(renderExecutionGroup).join("")}</div></section>` : ""}
+      ${grouped.length ? "" : '<div class="execution-empty"><strong>실행 이력이 없습니다.</strong><span>Task 또는 Graph의 실행 버튼에서 바로 시작할 수 있습니다.</span></div>'}
     </div>
   </section>`;
 }
@@ -3452,7 +3601,7 @@ function render(): void {
     </footer>
     ${renderModal()}
     ${isWideMode && view.mode !== "canvas" ? '<button class="graph-fab" data-action="set-view" data-id="canvas" title="그래프 보기"><strong>그래프 보기</strong></button>' : ""}
-    ${view.toast ? `<div class="toast" role="status" aria-live="polite" aria-atomic="true">${esc(view.toast)}</div>` : ""}
+    ${toastMarkup()}
   </div>`;
   const dialog = app.querySelector<HTMLElement>('[role="dialog"]');
   if (dialog) {
@@ -3797,25 +3946,26 @@ async function startBridge(): Promise<void> {
   toast("브리지 시작 명령을 보냈습니다. 1초 뒤 저장해 보십시오.");
 }
 
+async function requestBridge<T>(payload: unknown): Promise<T> {
+  if (!responseBridgeApi) throw new Error("브리지 응답 연결이 준비되지 않았습니다.");
+  const response = await fetch(responseBridgeApi, {
+    method: "POST",
+    headers: { "content-type": "text/plain;charset=UTF-8" },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json() as BridgeEnvelope<T>;
+  if (!response.ok || !result.ok) throw new Error(result.error ?? `브리지 요청 실패 (${response.status})`);
+  return result.value as T;
+}
+
 async function sendBridge<T = unknown>(payload: unknown): Promise<T | undefined> {
   if (responseBridgeApi) {
-    let response: Response | undefined;
     try {
-      response = await fetch(responseBridgeApi, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      return await requestBridge<T>(payload);
     } catch (error) {
       if (isWideMode || !store.bridgeTerminalId) throw error;
       // A restarted bridge has a new loopback port/token. Fall through once to
       // the terminal channel; the bootstrap reload below discovers the new API.
-      responseBridgeApi = undefined;
-    }
-    if (response) {
-      const result = await response.json() as { ok?: boolean; error?: string; value?: T };
-      if (!response.ok || !result.ok) throw new Error(result.error ?? `브리지 요청 실패 (${response.status})`);
-      return result.value;
     }
   }
   if (!store.bridgeTerminalId) throw new Error("먼저 브리지 터미널을 선택하십시오.");
@@ -3838,6 +3988,126 @@ async function sendBridge<T = unknown>(payload: unknown): Promise<T | undefined>
 let executionPollTimer: number | undefined;
 let executionPollPending = false;
 
+function elementFromMarkup(markup: string): HTMLElement | null {
+  const template = document.createElement("template");
+  template.innerHTML = markup.trim();
+  return template.content.firstElementChild as HTMLElement | null;
+}
+
+function morphElement(current: Element, fresh: Element): void {
+  for (const name of current.getAttributeNames()) if (!fresh.hasAttribute(name)) current.removeAttribute(name);
+  for (const name of fresh.getAttributeNames()) {
+    const value = fresh.getAttribute(name) ?? "";
+    if (current.getAttribute(name) !== value) current.setAttribute(name, value);
+  }
+  const currentChildren = [...current.childNodes];
+  const freshChildren = [...fresh.childNodes];
+  for (let index = 0; index < Math.max(currentChildren.length, freshChildren.length); index += 1) {
+    const currentChild = currentChildren[index];
+    const freshChild = freshChildren[index];
+    if (!freshChild) {
+      currentChild?.remove();
+      continue;
+    }
+    if (!currentChild) {
+      current.append(freshChild.cloneNode(true));
+      continue;
+    }
+    if (currentChild.nodeType === Node.TEXT_NODE && freshChild.nodeType === Node.TEXT_NODE) {
+      if (currentChild.nodeValue !== freshChild.nodeValue) currentChild.nodeValue = freshChild.nodeValue;
+      continue;
+    }
+    if (currentChild instanceof Element && freshChild instanceof Element && currentChild.tagName === freshChild.tagName) {
+      morphElement(currentChild, freshChild);
+      continue;
+    }
+    currentChild.replaceWith(freshChild.cloneNode(true));
+  }
+}
+
+function patchExecutionBanner(container: ParentNode, execution: RuntimeExecution | undefined): void {
+  const current = container.querySelector<HTMLElement>(":scope > .execution-banner");
+  if (!execution) {
+    current?.remove();
+    return;
+  }
+  const fresh = elementFromMarkup(executionBanner(execution));
+  if (!fresh) return;
+  if (!current) {
+    (container as HTMLElement).insertAdjacentElement("afterbegin", fresh);
+    return;
+  }
+  current.className = fresh.className;
+  const currentSummary = current.querySelector<HTMLElement>(":scope > div:first-child");
+  const freshSummary = fresh.querySelector<HTMLElement>(":scope > div:first-child");
+  if (currentSummary && freshSummary) currentSummary.innerHTML = freshSummary.innerHTML;
+  const currentProgress = current.querySelector<HTMLElement>(".execution-progress > span");
+  const freshProgress = fresh.querySelector<HTMLElement>(".execution-progress > span");
+  if (currentProgress && freshProgress) currentProgress.style.width = freshProgress.style.width;
+}
+
+function patchCanvasExecution(graph: GraphDefinition): void {
+  const canvas = app.querySelector<HTMLElement>("[data-canvas]");
+  if (!canvas) return;
+  const execution = latestExecution("graph", graph.id);
+  patchExecutionBanner(canvas, execution);
+  for (const node of graph.nodes) {
+    const element = canvas.querySelector<HTMLElement>(`.node[data-node-id="${selectorEscape(node.id)}"]`);
+    if (!element) continue;
+    const status = visualNodeStatus(graph, node, execution);
+    for (const name of [...element.classList]) {
+      if (name.startsWith("execution-") || name.startsWith("status-")) element.classList.remove(name);
+    }
+    element.classList.add(`status-${node.status}`, `execution-${status}`);
+    const strip = element.querySelector<HTMLElement>(".node-status-strip");
+    if (strip) strip.className = `node-status-strip ${status}`;
+    const chip = element.querySelector<HTMLElement>(".node-execution-chip");
+    const freshChip = elementFromMarkup(nodeExecutionChipMarkup(status));
+    if (chip && freshChip) chip.replaceWith(freshChip);
+    element.querySelector(".node-run-meta")?.remove();
+    const meta = elementFromMarkup(nodeRunMetaMarkup(graph, node, status, execution));
+    if (meta) element.append(meta);
+    const title = nodeDisplayTitle(node);
+    const editorLabel = node.kind === "condition" ? "조건 편집" : node.kind === "graph_call" ? "그래프 호출 편집" : "Task 편집";
+    element.setAttribute("aria-label", `${node.kind === "condition" ? "조건" : node.kind === "graph_call" ? "그래프 호출" : "작업"} 노드 ${title}, 실행 상태 ${visualNodeStatusLabel[status]}. 클릭하면 ${editorLabel}을 엽니다.`);
+  }
+  for (const edge of graph.edges) {
+    const source = graph.nodes.find((node) => node.id === edge.from);
+    const path = canvas.querySelector<SVGPathElement>(`g[data-edge-id="${selectorEscape(edge.id)}"] .edge`);
+    path?.classList.toggle("completed", source?.status === "done");
+    path?.classList.toggle("active-flow", source?.status === "running");
+  }
+  const progress = graphProgress(graph);
+  const failed = graph.nodes.filter((node) => node.status === "failed").length;
+  const hud = canvas.querySelector<HTMLElement>(".progress-hud");
+  if (hud) hud.innerHTML = `<strong>${progress.percent}%</strong><span>${progress.complete}/${progress.total} 완료${failed ? ` · ${failed} 실패` : ""}</span><i><b style="width:${progress.percent}%"></b></i>`;
+  const runButton = app.querySelector<HTMLButtonElement>(".topbar-run");
+  if (runButton) {
+    runButton.disabled = Boolean(execution && executionActive(execution));
+    runButton.textContent = execution && executionActive(execution) ? "● 실행 중" : "▶ 실행";
+  }
+}
+
+function patchExecutionSurfaces(): void {
+  const running = executions.filter(executionActive).length;
+  const navButton = app.querySelector<HTMLButtonElement>('.section-tabs [data-action="set-view"][data-id="executions"]');
+  if (navButton) navButton.innerHTML = `실행 현황${running ? ` <span class="nav-count">${running}</span>` : ""}`;
+  if (view.mode === "executions") {
+    const manager = app.querySelector<HTMLElement>(".execution-manager");
+    const fresh = elementFromMarkup(renderExecutionManager());
+    if (manager && fresh) {
+      const currentHeaderCopy = manager.querySelector<HTMLElement>(".execution-manager-header > div");
+      const freshHeaderCopy = fresh.querySelector<HTMLElement>(".execution-manager-header > div");
+      if (currentHeaderCopy && freshHeaderCopy) morphElement(currentHeaderCopy, freshHeaderCopy);
+      const currentBody = manager.querySelector<HTMLElement>(".execution-manager-body");
+      const freshBody = fresh.querySelector<HTMLElement>(".execution-manager-body");
+      if (currentBody && freshBody) morphElement(currentBody, freshBody);
+    }
+  } else if (view.mode === "canvas") {
+    patchCanvasExecution(activeGraph());
+  }
+}
+
 async function refreshExecutionStatus(notify = false): Promise<void> {
   if (!responseBridgeApi || executionPollPending) {
     if (notify && !responseBridgeApi) toast("브리지 응답 연결이 준비되지 않았습니다.");
@@ -3845,19 +4115,15 @@ async function refreshExecutionStatus(notify = false): Promise<void> {
   }
   executionPollPending = true;
   try {
-    const response = await fetch(responseBridgeApi, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ type: "execution-status" }),
-    });
-    const payload = await response.json() as { ok?: boolean; error?: string; value?: { executions?: RuntimeExecution[]; store?: GraphStore } };
-    if (!response.ok || !payload.ok) throw new Error(payload.error ?? `실행 현황 조회 실패 (${response.status})`);
-    const nextExecutions = Array.isArray(payload.value?.executions) ? payload.value.executions : [];
-    const changed = JSON.stringify(nextExecutions) !== JSON.stringify(executions);
+    const value = await requestBridge<{ executions?: RuntimeExecution[]; store?: GraphStore }>({ type: "execution-status" });
+    const nextExecutions = Array.isArray(value?.executions) ? value.executions : [];
+    const executionChanged = JSON.stringify(nextExecutions) !== JSON.stringify(executions);
+    const nextStore = value?.store && !view.dirty ? normalizeGraphStore(value.store) : undefined;
+    const graphStateChanged = Boolean(nextStore && JSON.stringify(nextStore.graphs) !== JSON.stringify(store.graphs));
     executions = nextExecutions;
-    if (payload.value?.store && !view.dirty) store = normalizeGraphStore(payload.value.store);
-    if (changed && !view.modal) render();
-    else scheduleExecutionPolling();
+    if (nextStore) store = nextStore;
+    if ((executionChanged || graphStateChanged) && !view.modal) patchExecutionSurfaces();
+    scheduleExecutionPolling();
     if (notify) toast("실행 현황을 갱신했습니다.");
   } catch (error) {
     if (notify) toast(error instanceof Error ? error.message : String(error));
@@ -3881,13 +4147,7 @@ function resumePendingTerminalBridgeSync(): void {
   let pending = "";
   try { pending = window.sessionStorage.getItem(pendingBridgeSyncKey) ?? ""; } catch { return; }
   if (!pending || !responseBridgeApi) return;
-  void fetch(responseBridgeApi, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ type: "ping" }),
-  }).then(async (response) => {
-    const result = await response.json() as { ok?: boolean };
-    if (!response.ok || !result.ok) throw new Error("bridge sync failed");
+  void requestBridge({ type: "ping" }).then(() => {
     try { window.sessionStorage.removeItem(pendingBridgeSyncKey); } catch { /* optional WebView storage */ }
     window.location.reload();
   }).catch(() => {
@@ -4104,8 +4364,8 @@ async function chooseTodoWorktreeGraph(todoId: string): Promise<void> {
   }
 }
 
-async function saveStore(showNotice = true): Promise<void> {
-  const result = await sendBridge<{ mode?: string; graph?: GraphDefinition; store?: GraphStore }>({ type: "save", store });
+async function saveStore(showNotice = true, rebuildPanel = true): Promise<void> {
+  const result = await sendBridge<{ mode?: string; graph?: GraphDefinition; store?: GraphStore }>({ type: "save", store, rebuildPanel });
   if (result?.store) store = normalizeGraphStore(result.store);
   else if (dataSource.config.mode === "structured") activeGraph().version += 1;
   view.dirty = false;
@@ -4311,6 +4571,13 @@ app.addEventListener("click", (event) => {
     case "set-view": {
       const mode = target.dataset.id as ViewState["mode"] | undefined;
       if (!mode || !["canvas", "list", "executions", "domains", "milestones", "tasks", "todos"].includes(mode)) return;
+      if (mode === "executions" && hasSandboxedLoopbackBridge) {
+        toast("실시간 실행 현황을 Orca 탭에서 엽니다.");
+        void sendBridge({ type: "open-wide", view: "executions" }).catch((error) => {
+          toast(error instanceof Error ? error.message : String(error));
+        });
+        return;
+      }
       const enteringTasks = mode === "tasks" && view.mode !== "tasks";
       view.mode = mode;
       if (enteringTasks) view.taskDetailOpen = false;
@@ -5190,12 +5457,54 @@ app.addEventListener("click", (event) => {
       } else openModal(createTaskRunModal(task));
       break;
     }
+    case "save-task-run-settings": {
+      if (view.modal?.kind !== "task-run" || view.modal.itemKind !== "task") return;
+      const modal = view.modal;
+      if (modal.busy || modal.saving) return;
+      const task = store.tasks.find((item) => item.id === modal.itemId);
+      if (!task) return;
+      const expectedVersion = Number(task.version ?? 0);
+      modal.saving = true;
+      delete modal.error;
+      delete modal.errorAction;
+      applyTaskRunSettings(task, modal);
+      render();
+      const persist = dataSource.config.mode === "structured"
+        ? (Number.isInteger(expectedVersion) && expectedVersion > 0
+          ? sendBridge<Partial<DataSourceState> & { store?: GraphStore }>({
+              type: "mutate-source",
+              mutation: {
+                kind: "task", expectedVersion, relatedVersions: sourceRelatedVersions("task", task), item: structuredClone(task),
+              },
+              graphId: store.activeGraphId,
+            })
+          : Promise.reject(new Error("Task의 최신 CAS version을 읽지 못했습니다. Task를 새로고침한 뒤 다시 시도하십시오.")))
+        : saveStore(false, false);
+      void persist.then((result) => {
+        if (result && "store" in result && result.store) store = normalizeGraphStore(result.store);
+        if (result && "catalog" in result) {
+          dataSource = { ...dataSource, ...result, config: dataSource.config, catalog: result.catalog ?? dataSource.catalog };
+        }
+        if (view.modal === modal) closeModal();
+        render();
+        toast("Task 실행 설정을 저장했습니다.");
+      }).catch((error) => {
+        if (view.modal === modal) {
+          modal.saving = false;
+          modal.error = error instanceof Error ? error.message : String(error);
+          modal.errorAction = "save";
+          render();
+        }
+      });
+      break;
+    }
     case "confirm-task-run": {
       if (view.modal?.kind !== "task-run") return;
       const modal = view.modal;
-      if (modal.busy) return;
+      if (modal.busy || modal.saving) return;
       modal.busy = true;
       delete modal.error;
+      delete modal.errorAction;
       render();
       const { itemKind, itemId } = modal;
       const routing = routingValue(modal.routing);
@@ -5224,7 +5533,7 @@ app.addEventListener("click", (event) => {
             if (linked?.store) store = normalizeGraphStore(linked.store);
             if (linked?.context) taskProjectContextState = linked.context;
           })
-        : dataSource.config.mode === "structured" ? Promise.resolve() : saveStore(false);
+        : dataSource.config.mode === "structured" ? Promise.resolve() : saveStore(false, false);
       void prepare
         .then(() => sendBridge<RuntimeExecution>({
           type: itemKind === "task" ? "start-task-execution" : "start-todo-execution",
@@ -5233,6 +5542,7 @@ app.addEventListener("click", (event) => {
             ? { idempotencyKey: todoTaskCreationIdempotencyKey(store.todos.find((item) => item.id === itemId)!) }
             : {}),
           routing,
+          ...(!isWideMode ? { openWide: true } : {}),
           ...(itemKind === "task" ? { executionMode: perProject ? "per_project" : "single_session" } : {}),
           ...(itemKind === "task" && selectedProjects.length ? { projectSessions: selectedProjects.map((project) => ({
             locator: project.locator,
@@ -5252,6 +5562,7 @@ app.addEventListener("click", (event) => {
           if (view.modal === modal) {
             modal.busy = false;
             modal.error = message;
+            modal.errorAction = "run";
             render();
           }
           toast(message);
@@ -5259,22 +5570,49 @@ app.addEventListener("click", (event) => {
       break;
     }
     case "open-run": openModal(createRunModal(true)); break;
+    case "save-run-settings": {
+      if (view.modal?.kind !== "run") return;
+      const modal = view.modal;
+      if (modal.busy || modal.saving) return;
+      modal.saving = true;
+      delete modal.error;
+      delete modal.errorAction;
+      applyRunDraft(graph, modal);
+      render();
+      void saveStore(false, false).then(() => {
+        if (view.modal === modal) closeModal();
+        render();
+        toast("그래프 실행 설정을 저장했습니다.");
+      }).catch((error) => {
+        if (view.modal === modal) {
+          modal.saving = false;
+          modal.error = error instanceof Error ? error.message : String(error);
+          modal.errorAction = "save";
+          render();
+        }
+      });
+      break;
+    }
     case "confirm-run": {
       if (view.modal?.kind !== "run") return;
       const modal = view.modal;
-      if (modal.busy) return;
+      if (modal.busy || modal.saving) return;
       modal.busy = true;
       delete modal.error;
+      delete modal.errorAction;
       render();
       const live = modal.live;
       const selectedProjects = selectedRunProjectCandidates(modal, graphProjectTargets(graph));
-      applyRunDraft(graph, modal);
-      void saveStore(false)
+      const structuredRun = dataSource.config.mode === "structured";
+      if (!structuredRun) applyRunDraft(graph, modal);
+      const prepare = structuredRun ? Promise.resolve() : saveStore(false, false);
+      void prepare
         .then(() => sendBridge<RuntimeExecution>({
           type: live ? "start-graph-execution" : "run", graphId: graph.id, dryRun: !live,
           ...(graph.processEnabled && modal.startNewRun ? { inputPrompt: modal.inputPrompt } : {}),
           startNewRun: modal.startNewRun,
           ...(live ? {
+            ...(!isWideMode ? { openWide: true } : {}),
             executionMode: modal.executionMode,
             routing: routingValue(modal.defaults),
             ...(modal.executionMode === "per_project" ? { projectSessions: selectedProjects.map((project) => ({
@@ -5285,9 +5623,15 @@ app.addEventListener("click", (event) => {
           } : {}),
         }))
         .then((result) => {
-          if (live && result) {
-            executions = [result, ...executions.filter((item) => item.id !== result.id)];
+          if (live) {
+            if (result) executions = [result, ...executions.filter((item) => item.id !== result.id)];
             view.mode = "executions";
+            scheduleExecutionPolling();
+            // Always reconcile once from the response channel. The terminal-frame
+            // fallback intentionally has no return value, and a stale bootstrap can
+            // also lack the just-created record. Waiting for an already-active local
+            // record in either case leaves the UI frozen on the previous run.
+            void refreshExecutionStatus();
           }
           if (view.modal === modal) closeModal();
           render();
@@ -5298,6 +5642,7 @@ app.addEventListener("click", (event) => {
           if (view.modal === modal) {
             modal.busy = false;
             modal.error = message;
+            modal.errorAction = "run";
             render();
           }
           toast(message);
@@ -5316,7 +5661,7 @@ app.addEventListener("click", (event) => {
       break;
     }
     case "close-modal":
-      if ((view.modal?.kind === "run" || view.modal?.kind === "task-run") && view.modal.busy) return;
+      if ((view.modal?.kind === "run" || view.modal?.kind === "task-run") && (view.modal.busy || view.modal.saving)) return;
       closeModal();
       break;
   }
@@ -5340,7 +5685,7 @@ app.addEventListener("change", (event) => {
   const scope = input.dataset.scope;
   const field = input.dataset.field;
   if (!field) return;
-  if ((view.modal?.kind === "run" || view.modal?.kind === "task-run") && view.modal.busy) return;
+  if ((view.modal?.kind === "run" || view.modal?.kind === "task-run") && (view.modal.busy || view.modal.saving)) return;
   if (view.editorMode === "run" && ["graph", "graph-routing", "guard", "graph-engineering", "graph-editor", "node", "task", "node-routing", "node-engineering", "node-permission", "multi-node-routing", "multi-node-engineering", "edge", "edge-endpoint"].includes(scope ?? "")) {
     toast("실행 보기의 Inspector는 읽기 전용입니다.");
     render();
@@ -6017,7 +6362,7 @@ app.addEventListener("pointerdown", (event) => {
     event.preventDefault(); return;
   }
   const canvas = target.closest<HTMLElement>("[data-canvas]");
-  if (canvas && !target.closest(".node, .canvas-hud, .minimap, .problems-panel, .layout-preview-bar, .quick-create")) {
+  if (canvas && !target.closest("button, input, textarea, select, a, [role='button'], .node, .canvas-hud, .minimap, .problems-panel, .layout-preview-bar, .quick-create, .execution-banner")) {
     const point = pointInCanvas(event.clientX, event.clientY);
     if (!point) return;
     if (event.shiftKey) {
@@ -6155,7 +6500,7 @@ window.addEventListener("keydown", (event) => {
     const dialog = app.querySelector<HTMLElement>('[role="dialog"]');
     if (event.key === "Escape") {
       event.preventDefault();
-      if ((view.modal.kind === "run" || view.modal.kind === "task-run") && view.modal.busy) return;
+      if ((view.modal.kind === "run" || view.modal.kind === "task-run") && (view.modal.busy || view.modal.saving)) return;
       closeModal();
       return;
     }
@@ -6226,6 +6571,7 @@ window.addEventListener("keydown", (event) => {
 
 render();
 resumePendingTerminalBridgeSync();
+if (responseBridgeApi) void refreshExecutionStatus();
 const initialCanvas = app.querySelector<HTMLElement>("[data-canvas]");
 if (initialCanvas) {
   const initialFitObserver = new ResizeObserver(() => {
