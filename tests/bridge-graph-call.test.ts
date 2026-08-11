@@ -146,11 +146,23 @@ if (args[0] === "environment" && args[1] === "list") {
     process.stdout.write(JSON.stringify({ ok: false, error: { message: "second project launch failed" } }));
     process.exit(0);
   }
+  const unavailableBudget = Number(process.env.ORCA_GRAPH_FAKE_CREATE_UNAVAILABLE || 0);
+  const createCount = fakeCallLog.split("\\n").filter((line) => line.includes('["terminal","create"')).length;
+  if (unavailableBudget > 0 && createCount <= unavailableBudget) {
+    process.stdout.write(JSON.stringify({ ok: false, error: { code: "runtime_unavailable", message: "runtime_unavailable" } }));
+    process.exit(0);
+  }
   result = { terminal: { handle: remote ? "remote-session" : "fake-session" } };
 } else if (args[0] === "terminal" && args[1] === "show") {
   result = { terminal: { handle: remote ? "remote-session" : "fake-session", worktreeId: remote ? "remote-worktree" : "fake-worktree", tabId: "fake-tab", leafId: "fake-leaf" } };
 } else if (args[0] === "terminal" && args[1] === "send") {
   result = { terminal: { handle: remote ? "remote-session" : "fake-session" } };
+} else if (args[0] === "status") {
+  result = {
+    app: { running: true, desktopWindowStatus: "available" },
+    runtime: { state: "ready", reachable: true, runtimeId: "fake-runtime" },
+    graph: { state: process.env.ORCA_GRAPH_FAKE_GRAPH_STATE || "ready" },
+  };
 }
 process.stdout.write(JSON.stringify({ ok: true, result }));
 `, { mode: 0o755 });
@@ -482,6 +494,110 @@ describe("bridge graph calls", () => {
     ]);
     const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
     expect(records[0].targets[0]).toMatchObject({ sessionId: "fake-session", sessionTitle: "GRAPH-unified-session · Run #1 · Fake project" });
+  });
+
+  it("recovers a Graph node from a transient Orca runtime_unavailable during terminal create", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-transient-runtime",
+      [taskNode("only")],
+      [],
+      { projectId: "fake-project", model: "gpt-5.6-sol" },
+    );
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: graph.id,
+        executionMode: "single_session",
+        routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" },
+      },
+      "execution completed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_CREATE_UNAVAILABLE: "2",
+      },
+    );
+
+    const calls = (await readCallLog(fake.callLog)).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    expect(calls.filter((args) => args[0] === "terminal" && args[1] === "create")).toHaveLength(3);
+    expect(calls.some((args) => args[0] === "status")).toBe(true);
+    const after = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
+    expect(after.graphs[0].runs.at(-1).nodeResults).toMatchObject([{ nodeId: "only", status: "done" }]);
+  });
+
+  it("reports why a node stopped when the Orca renderer graph never becomes ready", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-renderer-stuck",
+      [taskNode("only")],
+      [],
+      { projectId: "fake-project", model: "gpt-5.6-sol" },
+    );
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: graph.id,
+        executionMode: "single_session",
+        routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" },
+      },
+      "execution failed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_CREATE_UNAVAILABLE: "99",
+        ORCA_GRAPH_FAKE_GRAPH_STATE: "reloading",
+        ORCA_GRAPH_TERMINAL_CREATE_TIMEOUT_MS: "1200",
+      },
+    );
+
+    const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
+    expect(records[0].status).toBe("failed");
+    expect(records[0].error).toContain("runtime_unavailable");
+    expect(records[0].error).toContain("graph=reloading");
+  });
+
+  it("treats a decorated RESULT: failed line as a node failure", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-engineering-"));
+    temporaryDirectories.push(runtimeDirectory);
+    const graph = executionGraph(
+      "GRAPH-decorated-result",
+      [taskNode("only")],
+      [],
+      { projectId: "fake-project", model: "gpt-5.6-sol" },
+    );
+    await writeGraphStore(runtimeDirectory, [graph]);
+    const fake = await installFakeOrca(runtimeDirectory);
+
+    await sendToBridge(
+      runtimeDirectory,
+      {
+        type: "start-graph-execution",
+        graphId: graph.id,
+        executionMode: "single_session",
+        routing: { environmentId: "local", projectId: "fake-project", model: "gpt-5.6-sol" },
+      },
+      "execution failed",
+      {
+        ORCA_CLI_COMMAND: fake.command,
+        ORCA_GRAPH_FAKE_CALL_LOG: fake.callLog,
+        ORCA_GRAPH_FAKE_ASSISTANT: "**RESULT: failed — 알림톡 템플릿 계약값 누락**",
+      },
+    );
+
+    const records = JSON.parse(await readFile(path.join(runtimeDirectory, "executions.json"), "utf8"));
+    expect(records[0].status).toBe("failed");
+    expect(records[0].error).toContain("알림톡 템플릿 계약값 누락");
   });
 
   it("creates and tracks one Graph session per distinct project route", async () => {

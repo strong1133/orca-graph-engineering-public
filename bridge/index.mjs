@@ -203,12 +203,6 @@ async function publishLocalOrcaProjects({ force = false } = {}) {
     response = await client.put(`/orca-projects/${encodeURIComponent(localWorkTasksEnvironment)}`, { projects });
     publishedProjectSignature = signature;
   } catch (error) {
-    try {
-      const payload = JSON.parse(String(error?.stdout || ""));
-      if (payload?.ok === true && payload.result) return payload.result;
-    } catch {
-      // Fall through to the enriched process diagnostic below.
-    }
     const detail = JSON.stringify(error?.detail ?? "");
     const olderRegistry = error?.status === 422 && detail.includes("extra_forbidden") && detail.includes("worktrees");
     if (!olderRegistry) throw error;
@@ -843,6 +837,51 @@ function runOrca(args, timeout = 30_000, cwd = root, environmentSelector = null)
   return task;
 }
 
+// Orca가 명령을 받을 수 없는 상태들. 이것들은 설계 오류가 아니라 지나가는 상태다.
+// 특히 대화형 에이전트 명령(codex/claude TUI)으로 만드는 터미널은 Orca가 렌더러
+// 경로로 처리하고 그 입구에서 렌더러 터미널 그래프가 ready인지 검사한다. 메인 창이
+// 다시 로드되는 동안에는 확정적으로 runtime_unavailable이 돌아온다.
+const TRANSIENT_ORCA_FAILURE = /runtime_unavailable|runtime_timeout|terminal_handle_stale|graph_not_ready|closed the connection|could not connect to the running orca app/iu;
+
+function transientOrcaFailure(error) {
+  return TRANSIENT_ORCA_FAILURE.test(error instanceof Error ? error.message : String(error));
+}
+
+function terminalCreateBudgetMs() {
+  const configured = Number(process.env.ORCA_GRAPH_TERMINAL_CREATE_TIMEOUT_MS || 90_000);
+  return Number.isFinite(configured) ? Math.max(1_000, configured) : 90_000;
+}
+
+// `orca status`는 렌더러 터미널 그래프의 준비 상태를 공개 계약으로 노출한다.
+// ready가 아닌 동안 terminal create를 쏘는 것은 실패를 예약하는 것과 같으므로
+// 먼저 기다린다. 상태를 보고하지 않는 런타임(원격·구버전)은 막지 않는다.
+async function waitForOrcaGraphReady(environmentSelector, deadline) {
+  let state = "unknown";
+  while (Date.now() < deadline) {
+    try {
+      const status = await runOrca(["status"], 10_000, root, environmentSelector);
+      const reported = status?.graph?.state;
+      if (reported === undefined || reported === "ready") return { ready: true, state: reported ?? "unreported" };
+      state = String(reported);
+    } catch (error) {
+      if (!transientOrcaFailure(error)) return { ready: false, state: "unqueryable" };
+      state = "unreachable";
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return { ready: false, state };
+}
+
+function terminalCreateFailure({ error, firstError, attempts, graphState }) {
+  const message = error instanceof Error ? error.message : String(error);
+  const first = firstError instanceof Error ? firstError.message : String(firstError);
+  const hint = transientOrcaFailure(error)
+    ? `\nOrca 데스크톱 런타임이 ${attempts}회 시도 동안 이 명령을 받지 못했습니다 (graph=${graphState}). 대화형 에이전트 터미널은 Orca 메인 창이 열려 있고 렌더러가 ready일 때만 만들 수 있습니다. 창을 연 뒤 다시 실행하거나 ORCA_GRAPH_TERMINAL_CREATE_TIMEOUT_MS로 대기 예산을 늘리십시오.`
+    : "";
+  const trail = attempts > 1 && message !== first ? `\n첫 시도: ${first}` : "";
+  return new Error(`${message}${trail}${hint}`, { cause: error });
+}
+
 async function createOrRecoverOrcaTerminal({ worktreeId, title, command, environmentSelector = null }) {
   const create = () => runOrca([
     "terminal", "create",
@@ -850,34 +889,44 @@ async function createOrRecoverOrcaTerminal({ worktreeId, title, command, environ
     "--title", title,
     "--command", command,
   ], 30_000, root, environmentSelector);
-  try {
-    return await create();
-  } catch (firstError) {
-    // Orca can finish creating the tab while its CLI transport is being reconnected.
-    // Recover that tab by identity before retrying so a transient response failure does
-    // not either abort the graph or create a duplicate agent session.
+  // Orca can finish creating the tab while its CLI transport is being reconnected.
+  // Recover that tab by identity before retrying so a transient response failure does
+  // not either abort the graph or create a duplicate agent session.
+  const recover = async () => {
     try {
       const listed = await runOrca([
         "terminal", "list", "--worktree", `id:${worktreeId}`, "--limit", "100",
       ], 30_000, root, environmentSelector);
-      const recovered = (listed.terminals ?? []).find((terminal) => terminal.title === title
-        && terminal.connected !== false && terminal.writable !== false);
-      if (recovered) return { terminal: recovered };
+      return (listed.terminals ?? []).find((terminal) => terminal.title === title
+        && terminal.connected !== false && terminal.writable !== false) ?? null;
     } catch {
       // The original create error remains the useful diagnostic if recovery also fails.
+      return null;
     }
-    // A fresh Work Tasks claim and the preceding routing snapshot can overlap the
-    // desktop runtime's mutation hand-off. Give Orca one full UI turn before the
-    // single retry; an immediate retry only repeats runtime_unavailable.
-    await new Promise((resolve) => setTimeout(resolve, 2_000));
+  };
+  const deadline = Date.now() + terminalCreateBudgetMs();
+  let attempts = 0;
+  let firstError = null;
+  let lastError = null;
+  let graphState = "unknown";
+  while (true) {
+    attempts += 1;
+    graphState = (await waitForOrcaGraphReady(environmentSelector, deadline)).state;
     try {
       return await create();
-    } catch (retryError) {
-      const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
-      const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
-      throw new Error(retryMessage === firstMessage ? retryMessage : `${retryMessage}\n첫 시도: ${firstMessage}`, { cause: retryError });
+    } catch (error) {
+      firstError ??= error;
+      lastError = error;
     }
+    const recovered = await recover();
+    if (recovered) return { terminal: recovered };
+    // 일시적 상태가 아니면 기다려도 달라지지 않는다. 즉시 보고한다.
+    if (!transientOrcaFailure(lastError)) break;
+    const wait = retryDelay(attempts);
+    if (Date.now() + wait >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, wait));
   }
+  throw terminalCreateFailure({ error: lastError, firstError, attempts, graphState });
 }
 
 async function readRequestJson(request) {
@@ -1305,7 +1354,14 @@ async function terminalAgentMessage(handle, environmentSelector = null) {
   return agent.message;
 }
 
-async function waitForAgentReady(handle, environmentSelector = null, timeoutMs = 20_000) {
+// 새로 띄운 codex/claude 세션은 MCP 서버 로딩까지 끝나야 agent 상태를 보고한다.
+// 20초는 서버가 여러 개 붙은 실제 환경에서 자주 모자란다.
+function agentReadyTimeoutMs() {
+  const configured = Number(process.env.ORCA_GRAPH_AGENT_READY_TIMEOUT_MS || 60_000);
+  return Number.isFinite(configured) ? Math.max(1_000, configured) : 60_000;
+}
+
+async function waitForAgentReady(handle, environmentSelector = null, timeoutMs = agentReadyTimeoutMs()) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
   while (Date.now() < deadline) {
@@ -1338,16 +1394,31 @@ async function waitForAgentTurnStart(handle, previousMessage, environmentSelecto
   throw new Error(`agent did not start after Orca accepted the prompt${lastError instanceof Error ? `: ${lastError.message}` : ""}`);
 }
 
+const AGENT_IDLE_CONFIRM_MS = 5_000;
+
 async function waitForAgentCompletion(handle, previousMessage, environmentSelector = null, timeoutMs = 900_000, initialTurn = null) {
   if (initialTurn?.completed && initialTurn.snapshot?.message && initialTurn.snapshot.message !== previousMessage) {
     return initialTurn.snapshot;
   }
+  // 새 답변이 이전 답변과 글자까지 같을 수 있다 — 계약이 요구하는 결과 한 줄이
+  // 그대로 반복되는 경우다. 문자열 비교만 믿으면 그 노드는 완료를 영원히 놓친다.
+  // 턴이 시작되는 것을 직접 봤다면, 충분히 오래 다시 idle인 상태도 완료로 받는다.
+  const observedTurn = Boolean(initialTurn?.started && !initialTurn.completed);
   const deadline = Date.now() + timeoutMs;
+  let idleSince = null;
   let lastError;
   while (Date.now() < deadline) {
     try {
       const snapshot = await terminalAgentSnapshot(handle, environmentSelector);
-      if (["done", "idle"].includes(snapshot.state) && snapshot.message && snapshot.message !== previousMessage) return snapshot;
+      if (["done", "idle"].includes(snapshot.state) && snapshot.message) {
+        if (snapshot.message !== previousMessage) return snapshot;
+        if (observedTurn) {
+          idleSince ??= Date.now();
+          if (Date.now() - idleSince >= AGENT_IDLE_CONFIRM_MS) return snapshot;
+        }
+      } else {
+        idleSince = null;
+      }
     } catch (error) {
       lastError = error;
     }
@@ -1503,10 +1574,23 @@ function buildPrompt(graph, node, runId, workInput) {
   ].filter(Boolean).join("\n");
 }
 
+// 실패 보고를 놓치면 실패한 노드가 done으로 굳는다. 에이전트가 계약된 결과 줄을
+// 굵게 쓰거나 목록/인용 기호를 앞에 붙여도 같은 판정이 나오도록 장식을 걷어내고,
+// 서두 몇 줄 안에서 찾는다. done을 먼저 만나면 거기서 멈춘다.
+const DISPATCH_RESULT_SCAN_LINES = 5;
+
 function dispatchedResultFailure(summary) {
-  const firstLine = String(summary || "").trim().split(/\r?\n/, 1)[0] || "";
-  const match = firstLine.match(/^RESULT:\s*failed\b\s*(?:[—:-]\s*)?(.*)$/i);
-  return match ? (match[1]?.trim() || "agent reported failed or blocked work") : "";
+  const lines = String(summary || "").split(/\r?\n/u)
+    .map((line) => line.replace(/^[\s>*\-#]+/u, "").replace(/[*`_]/gu, "").trim())
+    .filter(Boolean)
+    .slice(0, DISPATCH_RESULT_SCAN_LINES);
+  for (const line of lines) {
+    const match = line.match(/^RESULT:\s*(done|failed)\b\s*(?:[—:-]\s*)?(.*)$/iu);
+    if (!match) continue;
+    if (match[1].toLowerCase() === "done") return "";
+    return match[2]?.trim() || "agent reported failed or blocked work";
+  }
+  return "";
 }
 
 function standaloneRouting(value) {
@@ -2392,6 +2476,10 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
           sessionTitle = dispatched.sessionTitle || "";
           dispatchedRoute = dispatched;
           resultSummary = dispatched.resultSummary;
+          // 에이전트가 계약대로 실패를 보고했다면 그것은 성공한 dispatch가 아니다.
+          // 원격 실행기와 같은 판정을 로컬 실행에도 적용해야 노드가 잘못 done으로 굳지 않는다.
+          const dispatchedFailure = dispatchedResultFailure(resultSummary);
+          if (dispatchedFailure) throw new Error(`${node.label || node.id}: ${dispatchedFailure}`);
           lastError = null;
           break;
         } catch (error) {
@@ -2406,7 +2494,19 @@ async function executeGraph({ store, targets, graph, dryRun, context }) {
       if (lastError) {
         node.status = "failed";
         run.stats.failed += 1;
-        run.nodeResults.push({ nodeId, status: "failed", attempt: Math.min(attempt, maxAttempts), durationMs, message: lastError instanceof Error ? lastError.message : String(lastError) });
+        run.nodeResults.push({
+          nodeId,
+          status: "failed",
+          ...(sessionId ? { sessionId } : {}),
+          ...(sessionTitle ? { sessionTitle } : {}),
+          attempt: Math.min(attempt, maxAttempts),
+          durationMs,
+          message: lastError instanceof Error ? lastError.message : String(lastError),
+        });
+        // 실패한 노드도 어느 Orca session에서 돌았는지 보여야 사용자가 열어볼 수 있다.
+        if (runtimeExecutionId && dispatchedRoute) {
+          await assignRuntimeExecutionSession(runtimeExecutionId, dispatchedRoute, taskTargetForExecutionNode(executionNode)?.locator);
+        }
         run.terminationReason = "node_failed";
         throw lastError;
       }
@@ -2517,9 +2617,24 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
   };
   const nodeOutputs = new Map();
   const sessionPool = new Map();
+  // claim과 complete 사이에 원천 graph version이 움직일 수 있다 — 대시보드 편집,
+  // 만료된 임대 회수, 다른 실행자. 거기서 complete를 포기하면 노드는 running으로
+  // 잠긴 채 남고 임대가 끝날 때까지 그래프를 다시 돌릴 수 없다. 최신 version으로
+  // 한 번 다시 맞추고, 그 사이 이미 종결된 노드는 그 상태를 그대로 받아들인다.
+  const settleNode = async (nodeId, expectedVersion, outcome) => {
+    try {
+      return await completeStructuredNode(config, graph.id, nodeId, { expectedVersion, ...outcome });
+    } catch (error) {
+      if (error?.status !== 409) throw error;
+      const latest = await fetchStructuredExecution(config, graph.id);
+      const settled = latest.nodes?.find((node) => node.id === nodeId);
+      if (settled && !["pending", "running"].includes(settled.status)) return latest;
+      return await completeStructuredNode(config, graph.id, nodeId, { expectedVersion: latest.graph.version, ...outcome });
+    }
+  };
   const persistRemoteFailure = async (runnable, claim, message) => {
-    const failed = await completeStructuredNode(config, graph.id, runnable.id, {
-      expectedVersion: claim.graph.version, result: "failed", note: message.slice(0, 2000),
+    const failed = await settleNode(runnable.id, claim.graph.version, {
+      result: "failed", note: message.slice(0, 2000),
     });
     frontier = Array.isArray(failed.nodes)
       ? { ...frontier, graph: failed.graph, run: failed.run, nodes: failed.nodes }
@@ -2607,9 +2722,7 @@ async function executeGraphRemotely({ config, store, targets, graph, executionId
         throw error;
       }
     }
-    const done = await completeStructuredNode(config, graph.id, runnable.id, {
-      expectedVersion: claim.graph.version, ...outcome,
-    });
+    const done = await settleNode(runnable.id, claim.graph.version, outcome);
     if (outcome.result === "done" && !closable) completed += 1;
     frontier = Array.isArray(done.nodes)
       ? { ...frontier, graph: done.graph, run: done.run, nodes: done.nodes }

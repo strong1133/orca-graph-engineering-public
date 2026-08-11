@@ -59,6 +59,14 @@ Task·Graph 실행에서 project 선택은 필수가 아닙니다. 실행 머신
 
 새 session의 reasoning은 model catalog에 선언된 capability만 선택할 수 있습니다. Claude CLI는 `low`, `medium`, `high`, `xhigh`, `max`를 `--effort`로 받습니다. Codex는 Sol/Terra에서 `low`부터 `ultra`까지, Luna에서 `low`부터 `max`까지를 `model_reasoning_effort`로 받습니다. catalog에 없거나 model이 지원하지 않는 값은 terminal 생성 전에 fail-closed합니다.
 
+대화형 에이전트 terminal은 Orca가 렌더러 경로로 만들며, 그 입구에서 메인 창의 터미널 그래프가 `ready`인지 검사합니다. 창이 다시 로드되는 동안에는 `runtime_unavailable`이 확정적으로 돌아오므로, 브리지는 `orca status`의 graph 상태를 먼저 확인하고 일시적 실패에 한해 지수 백오프로 다시 시도합니다. 대기 예산 기본값은 90초이고 `ORCA_GRAPH_TERMINAL_CREATE_TIMEOUT_MS`로 바꿀 수 있습니다. 예산을 넘기면 마지막 원문 오류와 관측된 graph 상태를 함께 보고하며, 일시적이지 않은 실패는 기다리지 않고 즉시 보고합니다.
+
+새로 만든 에이전트 세션은 MCP 서버 로딩까지 끝나야 상태를 보고하므로 준비 대기 기본값은 60초이며 `ORCA_GRAPH_AGENT_READY_TIMEOUT_MS`로 바꿀 수 있습니다.
+
+노드에 배정된 에이전트는 마지막 응답 첫 줄에 `RESULT: done` 또는 `RESULT: failed — <이유>`를 남깁니다. 로컬 실행과 원격 실행 모두 같은 판정을 적용하며, 굵게 쓰거나 목록 기호가 앞에 붙어도 같게 읽습니다. 실패 보고는 노드 실패로 기록하고 후속 노드를 진행하지 않습니다.
+
+구조화 원천 실행에서 claim과 complete 사이에 graph version이 움직이면 최신 version으로 한 번 다시 맞춥니다. 그 사이 다른 실행자나 임대 회수로 이미 종결된 노드는 덮어쓰지 않고 그 상태를 받아들입니다. 이 재조정이 없으면 노드가 running으로 잠긴 채 임대가 끝날 때까지 그래프를 다시 돌릴 수 없습니다.
+
 ## 그래프 → 그래프
 
 `graph_call` 노드는 보관되지 않은 다른 그래프를 자식으로 선택합니다. 호출 순환, 누락된 대상, 보관된 대상은 계획과 실행 전에 차단합니다. 기본 재귀 깊이는 8이며 루트 그래프의 `탐색 hop 제한`으로 바꿀 수 있습니다.
