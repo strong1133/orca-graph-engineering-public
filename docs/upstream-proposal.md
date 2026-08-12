@@ -28,8 +28,11 @@ Orca의 기여 지침에 따라 UI PR에는 화면 자료, 회귀 테스트, mac
 
 현재 plugin API v1 panel은 `connect-src 'none'`이고 panel에서 worker로 메시지를 보낼 수 없습니다. 이 때문에 플러그인이 로컬 상태를 저장하고 Orca 리소스를 조회하려면 `terminal.sendText`로 CLI 명령을 보내는 우회로가 필요합니다.
 
+가장 아픈 한 가지는 **panel이 터미널을 만들 수 없다**는 것입니다. host가 sandbox panel에 여는 액션은 `workspace.readContext`·`terminal.sendText`·`notifications.show` 셋뿐이고 나머지는 `panel: false`입니다. 그래서 활성 worktree에 터미널이 하나도 없는 순간에는 플러그인이 아무것도 할 수 없습니다 — 저장할 방법도, 자기 전용 터미널을 만들 방법도 없습니다. 이 플러그인은 명령을 들고 있다가 터미널이 생기면 이어서 보내는 것으로 버티지만, 사용자가 터미널 탭을 한 번 열어 주어야 합니다.
+
 최소 API 후보:
 
+- `terminal.create`의 panel 노출 (제목 지정, 활성 worktree 한정). 이것 하나면 위 공백이 사라집니다
 - `storage.get/set`의 panel 노출
 - `projects.list`, `worktrees.list`, `sessions.list`, `models.list`
 - `sessions.create`, `sessions.send`, `sessions.wait`

@@ -30,7 +30,17 @@ async function runCli(runtimeDirectory: string, args: string[]): Promise<string>
     ...args,
   ], {
     cwd: process.cwd(),
-    env: { ...process.env, ORCA_GRAPH_RUNTIME_DIR: runtimeDirectory, ORCA_GRAPH_SKIP_REBUILD: "1" },
+    // 저장 경로를 보는 테스트다. 두 가지를 함께 격리해야 한다. Orca CLI에 닿으면
+    // 이 장치에 무엇이 열려 있는지에 따라 결과가 달라지고, 패널 경로를 그대로 두면
+    // 이 저장소가 곧 설치된 플러그인일 때(개발 중에는 흔하다) 테스트 픽스처가
+    // 사용자의 패널을 덮어써 만들어 둔 Graph·Task가 사라진 것처럼 보인다.
+    env: {
+      ...process.env,
+      ORCA_GRAPH_RUNTIME_DIR: runtimeDirectory,
+      ORCA_GRAPH_SKIP_REBUILD: "1",
+      ORCA_CLI_COMMAND: path.join(runtimeDirectory, "orca-is-not-available-in-tests"),
+      ORCA_GRAPH_PANEL_PATH: path.join(runtimeDirectory, "panel.html"),
+    },
     timeout: 20_000,
   });
   return `${stdout}${stderr}`;
@@ -229,5 +239,86 @@ describe("save CLI · folder source", () => {
     ]);
     expect(saved.tasks).toHaveLength(1);
     expect(saved.lastSaveMessage).toContain("그래프 1");
+  });
+});
+
+describe("save CLI · 삭제", () => {
+  it("removes a deleted Task from the local store and unlinks its Todo", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-delete-"));
+    cleanup.push(() => rm(runtimeDirectory, { recursive: true, force: true }));
+    await writeFile(path.join(runtimeDirectory, "store.json"), JSON.stringify({
+      schemaVersion: 1, activeGraphId: "graph-remote", graphs: [graph(1)], domains: [], milestones: [],
+      tasks: [task(1), { ...task(1), id: "task-keep", title: "남는 Task" }],
+      todos: [{ id: "todo-a", title: "연결된 Todo", taskId: "task-remote", draft: "", promptRevisions: [], status: "open", priority: "medium", tags: [], notes: "", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }],
+      dispatchLog: [],
+    }));
+    await writeFile(path.join(runtimeDirectory, "data-source.json"), JSON.stringify({ schemaVersion: 1, mode: "local" }));
+
+    const output = await runCli(runtimeDirectory, ["save", payload({ deletions: { tasks: ["task-remote"] } })]);
+    expect(output).toContain("저장 완료 (local)");
+
+    const saved = JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8"));
+    // 진짜로 사라져야 한다. 보관 상태로 남으면 목록에 계속 보인다.
+    expect(saved.tasks.map((item: any) => item.id)).toEqual(["task-keep"]);
+    // 없는 Task를 가리키는 Todo를 남기면 그 Todo는 열 수 없는 링크를 계속 들고 있다.
+    expect(saved.todos[0].taskId).toBeUndefined();
+    expect(saved.lastSaveMessage).toContain("tasks 삭제 1");
+  });
+});
+
+describe("실행 결과 관측", () => {
+  it("reads the result line the prompt asked for, and ignores the instruction that names it", async () => {
+    const { parseResultLine } = await import("../lib/store.mjs");
+    // 에이전트가 남긴 결과 줄
+    expect(parseResultLine("⏺ RESULT: done")).toEqual({ status: "done" });
+    expect(parseResultLine("RESULT: failed — 템플릿 값 누락"))
+      .toEqual({ status: "failed", message: "템플릿 값 누락" });
+    // 프롬프트 본문에도 같은 문자열이 있다. 그것을 결과로 세면 보내자마자 끝난 것이 된다.
+    expect(parseResultLine("마지막 응답의 첫 줄을 `RESULT: done` 또는 `RESULT: failed — <사유>`로 시작하십시오.")).toBeNull();
+    expect(parseResultLine("아직 작업 중입니다")).toBeNull();
+    // 마지막 결과가 이긴다 — 재시도한 세션은 마지막 줄이 정본이다.
+    expect(parseResultLine("RESULT: failed — 1차\n다시 시도합니다\nRESULT: done")).toEqual({ status: "done" });
+  });
+});
+
+describe("노드별 진행 관측", () => {
+  it("reads the node lines the graph prompt asked for, and ignores its own format example", async () => {
+    const { parseNodeStates } = await import("../lib/store.mjs");
+    expect(parseNodeStates("⏺ NODE node-design done 설계 정리함")).toEqual({
+      "node-design": { status: "done", message: "설계 정리함" },
+    });
+    expect(parseNodeStates("NODE node-implement failed — 템플릿 값 누락")).toEqual({
+      "node-implement": { status: "failed", message: "템플릿 값 누락" },
+    });
+    // 프롬프트가 형식을 설명하는 줄까지 세면, 보내자마자 노드가 끝난 것이 된다.
+    expect(parseNodeStates("  NODE <노드 id> <done|failed|skipped> <한 줄 요약>")).toEqual({});
+    // 같은 노드를 다시 보고하면 마지막이 이긴다 — 재시도한 노드가 그렇다.
+    // 시작도 보고한다 — 지금 도는 노드를 캔버스가 표시할 수 있다.
+    expect(parseNodeStates("NODE node-a running")).toEqual({ "node-a": { status: "running" } });
+    expect(parseNodeStates("NODE node-a failed 1차\nNODE node-a done 2차")).toEqual({
+      "node-a": { status: "done", message: "2차" },
+    });
+  });
+});
+
+describe("save CLI · 패널 스냅샷", () => {
+  it("writes the snapshot only where it was pointed, and saves even when no panel was built", async () => {
+    const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "orca-graph-panel-"));
+    cleanup.push(() => rm(runtimeDirectory, { recursive: true, force: true }));
+    const panelPath = path.join(runtimeDirectory, "panel.html");
+
+    // 아직 빌드하지 않았다. 스냅샷을 싣지 못했다고 저장까지 실패로 접으면 방금 한
+    // 편집이 사라진 것처럼 보인다.
+    const skipped = await runCli(runtimeDirectory, ["save", payload({ activeGraphId: "graph-orca-demo" })]);
+    expect(skipped).toContain("저장 완료 (local)");
+    expect(skipped).toContain("패널을 아직 빌드하지 않아");
+    expect(JSON.parse(await readFile(path.join(runtimeDirectory, "store.json"), "utf8")).activeGraphId).toBe("graph-orca-demo");
+
+    await writeFile(panelPath, '<!doctype html><script id="orca-graph-bootstrap" type="application/json">{"store":{},"targets":{}}</script>', "utf8");
+    const written = await runCli(runtimeDirectory, ["save", payload({ graphs: [{ ...graph(1), name: "패널에 실린 이름" }] })]);
+    expect(written).toContain("패널을 다시 열면 반영됩니다.");
+    // 가리킨 파일에만 싣는다. 이 격리가 없으면 테스트가 설치된 플러그인의 패널을
+    // 덮어써 사용자가 만들어 둔 Graph·Task가 패널에서 사라진다.
+    expect(await readFile(panelPath, "utf8")).toContain("패널에 실린 이름");
   });
 });

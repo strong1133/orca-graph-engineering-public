@@ -341,11 +341,21 @@ export interface BranchTarget {
   repoId?: string;
   worktreeId: string;
   path?: string;
+  /** Orca 사이드바가 이 워크트리를 부르는 이름. 보통 브랜치의 짧은 이름이다. */
+  displayName?: string;
+  main?: boolean;
+  active?: boolean;
+  pinned?: boolean;
+  liveTerminals?: number;
+  sortOrder?: number;
 }
 
 export interface SessionTarget {
   id: string;
   title: string;
+  /** 마지막으로 이 세션 화면에 남은 한 줄. 갱신 시각 기준의 관측값이다. */
+  preview?: string;
+  lastOutputAt?: string;
   environmentId?: string;
   worktreeId: string;
   projectId?: string;
@@ -403,12 +413,38 @@ export interface DispatchRecord {
   executionMode: ExecutionMode;
   /** 프롬프트를 실제로 받은 대상들. 여러 프로젝트로 보내면 여러 건이다. */
   targets: DispatchTarget[];
+  /** 그때 실제로 보낸 프롬프트. 길면 잘라서 담고 잘렸다는 사실을 남긴다. */
+  prompt?: string;
+  promptTruncated?: boolean;
   /** 세션에 닿지 못한 경우의 사유. 닿았다면 없다. */
   error?: string;
 }
 
+/**
+ * 이 대상 세션에서 관측한 결과.
+ *
+ * 패널에는 세션에서 돌아오는 채널이 없다. 대신 프롬프트가 요구한 결과 줄
+ * (`RESULT: done` / `RESULT: failed — 사유`)을 갱신할 때 세션 화면에서 읽는다.
+ * 추정한 진행률이 아니라 화면에 실제로 찍힌 것만 담는다.
+ */
+export interface DispatchOutcome {
+  status: "running" | "done" | "failed" | "closed";
+  message?: string;
+  observedAt: string;
+}
+
+export interface NodeObservation {
+  status: "running" | "done" | "failed" | "skipped";
+  message?: string;
+}
+
 export interface DispatchTarget {
   label: string;
+  outcome?: DispatchOutcome;
+  /** 세션이 남긴 노드별 진행. 그래프 실행에서만 채워진다. */
+  nodeStates?: Record<string, NodeObservation>;
+  /** 준비 신호(tui-idle) 없이 보냈는가. 빠져 있으면 확인하고 보낸 것이다. */
+  readyConfirmed?: boolean;
   environmentId?: string;
   projectId?: string;
   projectName?: string;
@@ -422,11 +458,34 @@ export interface DispatchTarget {
   opened: "existing-session" | "new-session";
 }
 
+export interface PanelView {
+  mode: "canvas" | "list" | "executions" | "domains" | "milestones" | "tasks" | "todos";
+  selectedTaskId?: string;
+  taskDetailOpen?: boolean;
+  selectedTodoId?: string;
+}
+
+const PANEL_VIEW_MODES = ["canvas", "list", "executions", "domains", "milestones", "tasks", "todos"] as const;
+
+export function normalizePanelView(input: unknown): PanelView | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const candidate = input as Partial<PanelView>;
+  if (!PANEL_VIEW_MODES.includes(candidate.mode as PanelView["mode"])) return undefined;
+  return {
+    mode: candidate.mode as PanelView["mode"],
+    ...(typeof candidate.selectedTaskId === "string" && candidate.selectedTaskId ? { selectedTaskId: candidate.selectedTaskId } : {}),
+    ...(candidate.taskDetailOpen ? { taskDetailOpen: true } : {}),
+    ...(typeof candidate.selectedTodoId === "string" && candidate.selectedTodoId ? { selectedTodoId: candidate.selectedTodoId } : {}),
+  };
+}
+
 export interface GraphStore {
   schemaVersion: 1;
   activeGraphId: string;
   /** 저장 명령을 보낼 Orca 터미널. 패널이 파일을 쓸 수 없어 한 번 고른다. */
   saveTerminalId?: string;
+  /** 패널을 닫았다 열었을 때 돌아갈 화면. 패널에는 저장소가 없어 여기에 남긴다. */
+  panelView?: PanelView;
   lastSaveMessage?: string;
   lastSavedAt?: string;
   domains: LocalDomain[];
@@ -837,6 +896,7 @@ export function normalizeGraphStore(
     schemaVersion: 1,
     activeGraphId,
     ...(input.saveTerminalId ? { saveTerminalId: input.saveTerminalId } : {}),
+    ...(normalizePanelView(input.panelView) ? { panelView: normalizePanelView(input.panelView)! } : {}),
     ...(input.lastSaveMessage ? { lastSaveMessage: input.lastSaveMessage } : {}),
     ...(input.lastSavedAt ? { lastSavedAt: input.lastSavedAt } : {}),
     domains: [...domainMap.values()],
@@ -850,6 +910,29 @@ export function normalizeGraphStore(
 
 export const DISPATCH_LOG_LIMIT = 200;
 
+function normalizeOutcome(input: DispatchOutcome | undefined): DispatchOutcome | undefined {
+  if (!input || typeof input !== "object" || !input.observedAt) return undefined;
+  if (!(["running", "done", "failed", "closed"] as const).includes(input.status)) return undefined;
+  return {
+    status: input.status,
+    ...(input.message ? { message: String(input.message).slice(0, 400) } : {}),
+    observedAt: input.observedAt,
+  };
+}
+
+function normalizeNodeStates(input: Record<string, NodeObservation> | undefined): Record<string, NodeObservation> | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const states: Record<string, NodeObservation> = {};
+  for (const [nodeId, value] of Object.entries(input)) {
+    if (!nodeId || !value || !(["running", "done", "failed", "skipped"] as const).includes(value.status)) continue;
+    states[nodeId] = {
+      status: value.status,
+      ...(value.message ? { message: String(value.message).slice(0, 300) } : {}),
+    };
+  }
+  return Object.keys(states).length ? states : undefined;
+}
+
 function normalizeDispatchLog(input: DispatchRecord[] | undefined): DispatchRecord[] {
   const records: DispatchRecord[] = [];
   for (const record of input ?? []) {
@@ -861,6 +944,8 @@ function normalizeDispatchLog(input: DispatchRecord[] | undefined): DispatchReco
       title: record.title ?? record.itemId ?? "",
       dispatchedAt: record.dispatchedAt,
       executionMode: record.executionMode === "per_project" ? "per_project" : "single_session",
+      ...(typeof record.prompt === "string" && record.prompt ? { prompt: record.prompt } : {}),
+      ...(record.promptTruncated ? { promptTruncated: true } : {}),
       targets: (record.targets ?? []).map((target) => ({
         label: target.label ?? "",
         ...(target.environmentId ? { environmentId: target.environmentId } : {}),
@@ -871,6 +956,9 @@ function normalizeDispatchLog(input: DispatchRecord[] | undefined): DispatchReco
         ...(target.sessionId ? { sessionId: target.sessionId } : {}),
         ...(target.sessionTitle ? { sessionTitle: target.sessionTitle } : {}),
         ...(target.model ? { model: target.model } : {}),
+        ...(target.readyConfirmed === false ? { readyConfirmed: false } : {}),
+        ...(normalizeOutcome(target.outcome) ? { outcome: normalizeOutcome(target.outcome)! } : {}),
+        ...(normalizeNodeStates(target.nodeStates) ? { nodeStates: normalizeNodeStates(target.nodeStates)! } : {}),
         opened: target.opened === "new-session" ? "new-session" : "existing-session",
       })),
       ...(record.error ? { error: record.error } : {}),

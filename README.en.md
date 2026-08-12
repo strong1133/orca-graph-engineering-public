@@ -35,16 +35,20 @@ For a distributable archive run `corepack npm run package:plugin` and verify it 
 
 The panel runs inside the Orca plugin API v1 sandbox. That sandbox has no network, no filesystem, and no browser storage. The only way out is `terminal.sendText`, so **saving and running send one command line to a terminal**.
 
-All you need is one open Orca terminal tab. The first time you save, you pick which terminal to use; after that it never asks again.
+The plugin uses **its own terminal**, a tab named `Graph Engineering` that `corepack npm run build` opens for you at install time. There is nothing to pick and nothing to keep track of.
+
+Close it whenever you like — the next command run opens it again. In a worktree that has no dedicated terminal yet, the panel sends once through a terminal that is not running an agent, and that command opens the dedicated one there. **It never sends into a pane running Codex or Claude** — those terminals are the ones that receive work.
+
+With no terminal open at all the panel has nowhere to send. It cannot open one either: the actions Orca exposes to a sandboxed panel are `workspace.readContext`, `terminal.sendText`, and `notifications.show`, and nothing else. So the panel holds the command instead of dropping it and **sends it the moment a terminal tab appears** (it raises an Orca notification too). Opening one tab is all you have to do.
 
 There is no resident process. Nothing to keep running, no connection state. Pressing save runs one command once.
 
+Commands that follow one another go out **as a single line**. Typing a second line while the first is still running puts that input in the tty's canonical-mode buffer, which is small enough that a long payload is silently truncated — and a truncated line is a shell syntax error, so the run never happens. Saving and running are therefore chained with `&&` in one line, and a failed save stops the run.
+
 ```bash
-# the shape of what the panel sends — you never type this yourself
+# the shape of what runs in the dedicated terminal — you never type this yourself
 node ./scripts/graph-store.mjs save <payload>
 ```
-
-Do not pick a terminal that is running Codex or Claude. Those terminals are the ones that receive work.
 
 
 ### Choose where your data lives
@@ -115,7 +119,13 @@ Reasoning for a new session is limited to values the model catalog declares. The
 
 ## 7. Execution
 
-`▶ Run` **hands the work to an Orca session in the target project**. Pick an existing session and the prompt goes there; pick only a project and branch and a fresh claude/codex session is started in that worktree and given the prompt.
+`▶ Run` **hands the work to an Orca session in the target project**. Pick an existing session and the prompt goes there; pick a worktree and a fresh claude/codex session is started in that checkout and given the prompt.
+
+**Choosing a target** — the run dialog groups targets the way the Orca sidebar does: machine → project → worktree. You pick a worktree, and pinned/active/live-terminal marks appear in the same order Orca uses. Picking a worktree on another machine moves the run there — one run happens on one machine.
+
+**Single vs per-project** — select more than one worktree and you choose how they are assigned. Single runs once in the first worktree with one session and model; per-project gives each worktree its own session, model, and reasoning, and dispatches to each.
+
+**Run without approvals** — sessions the plugin opens skip permission prompts by default (claude `--permission-mode bypassPermissions`, codex `-a never --dangerously-bypass-approvals-and-sandbox`). An unattended session that stops at an approval prompt cannot be driven remotely. Turn it off in the run dialog and that session asks as usual.
 
 From there the agent in that session owns the work — walking the graph node by node, deciding conditions, recording results. **There is no separate executor inside the plugin.**
 
@@ -124,6 +134,10 @@ The reason for this boundary is simple: the panel has no channel back from a ses
 **Pre-flight blocking** — only real graph structure and link errors block a run. A missing target or model is surfaced separately as a run-configuration problem.
 
 **Result contract** — the prompt asks the agent to make the first line of its final response exactly `RESULT: done` or `RESULT: failed — <reason>`.
+
+**No prompt without a live session** — agents start under `exec`, so a command that dies immediately takes the terminal with it instead of falling back to a shell; the prompt can never be typed into one. The dispatcher checks the session is still alive right before sending and, when it is not, reports the last line of that screen as the reason.
+
+**Execution status** — clicking a card opens the detail for that run: the exact prompt that was sent, each target's session state (working / idle / closed) with the last line on that screen, and earlier runs of the same item. Session state is what was observed at the last `Orca 대상 갱신`.
 
 **Reset** — `↺ Reset run state` rolls back node status while leaving nodes and edges alone. Past run history is preserved. Saving propagates it to the data source.
 
@@ -155,10 +169,7 @@ Node-level execution contracts (`role`, `maxAttempts`, `permissions`, `dataClass
 | Name | Default | Meaning |
 | --- | --- | --- |
 | `ORCA_GRAPH_RUNTIME_DIR` | Orca app data | Where saved state is stored |
-| `ORCA_GRAPH_TERMINAL_CREATE_TIMEOUT_MS` | `90000` | Terminal creation retry budget |
-| `ORCA_GRAPH_AGENT_READY_TIMEOUT_MS` | `60000` | Wait for a new agent session to report ready |
-| `ORCA_GRAPH_WORK_ITEM_TIMEOUT_SECONDS` | `900` | Standalone Task/Todo execution limit |
-| `ORCA_GRAPH_REQUIRE_RESULT_CONTRACT` | off | Treat an answer with no result line as a failure |
+| `ORCA_GRAPH_PANEL_PATH` | this package's `dist/panel.html` | Panel file the snapshot is written into |
 | `ORCA_GRAPH_LOCAL_ENVIRONMENT_NAME` | host name | Display name for this machine |
 | `ORCA_CLI_COMMAND` | platform default | Orca CLI executable |
 | `ORCA_GRAPH_WORKSPACE_BASE_URL` | none | Structured source base URL (HTTPS) |

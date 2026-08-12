@@ -11,6 +11,18 @@ const outputPath = process.env.ORCA_GRAPH_BUILD_OUTPUT
 const fixturesOnly = process.env.ORCA_GRAPH_BUILD_FIXTURES_ONLY === "1";
 const runtimeDir = resolveRuntimeDirectory();
 if (!fixturesOnly) await prepareRuntimeDirectory(root, runtimeDir, { migrate: !process.env.ORCA_GRAPH_RUNTIME_DIR });
+// 전용 터미널은 bootstrap을 짜기 전에 확보한다. 나중에 하면 방금 만든 터미널의
+// handle이 이번에 쓴 패널에 실리지 않아, 패널은 이미 닫힌 터미널을 계속 찾는다.
+if (!fixturesOnly && process.env.ORCA_GRAPH_SKIP_TERMINAL_SETUP !== "1") {
+  const { ensureSaveTerminal, SAVE_TERMINAL_TITLE } = await import("../lib/orca.mjs");
+  const { recordSaveTerminal } = await import("../lib/store.mjs");
+  const terminal = await ensureSaveTerminal();
+  if (terminal) {
+    await recordSaveTerminal(terminal);
+    console.log(`ready ${SAVE_TERMINAL_TITLE} terminal (${terminal})`);
+  }
+}
+
 const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH;
 const sourceTimestamp = sourceDateEpoch === undefined ? null : Number(sourceDateEpoch);
 if (sourceTimestamp !== null && !Number.isFinite(sourceTimestamp)) {
@@ -60,6 +72,7 @@ const {
 const store = ["structured", "folder"].includes(dataSourceConfig.mode) ? {
   ...sourceStore,
   ...(currentLocalStore.saveTerminalId ? { saveTerminalId: currentLocalStore.saveTerminalId } : {}),
+  ...(currentLocalStore.panelView ? { panelView: currentLocalStore.panelView } : {}),
   ...(currentLocalStore.lastSaveMessage ? { lastSaveMessage: currentLocalStore.lastSaveMessage } : {}),
   ...(currentLocalStore.lastSavedAt ? { lastSavedAt: currentLocalStore.lastSavedAt } : {}),
   dispatchLog: currentLocalStore.dispatchLog ?? [],

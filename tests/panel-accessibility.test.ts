@@ -41,14 +41,25 @@ function terminalHost(terminals: Array<{ id: string }> = [{ id: "shell" }], disp
   return { requests, commands, configure };
 }
 
-/** 저장 CLI 명령 한 줄을 하위 명령과 원래 payload로 되돌린다. */
+/**
+ * 저장 CLI 명령 한 줄을 하위 명령들과 원래 payload로 되돌린다.
+ *
+ * 한 줄에 `&&`로 여러 명령이 묶여 올 수 있다. 앞 명령이 도는 동안 다음 줄을
+ * 타이핑하면 tty 버퍼에서 잘리므로, 패널은 이어질 명령을 한 줄로 보낸다.
+ */
+function decodeCommands(line: string): Array<{ command: string; payload?: any }> {
+  return line.trim().split(" && ").map((part) => {
+    const match = /graph-store\.mjs" (save|dispatch|source|refresh)(?: ([A-Za-z0-9_-]+))?$/u.exec(part.trim());
+    if (!match) throw new Error(`not a graph-store command: ${part}`);
+    return {
+      command: match[1]!,
+      ...(match[2] ? { payload: JSON.parse(gunzipSync(Buffer.from(match[2], "base64url")).toString("utf8")) } : {}),
+    };
+  });
+}
+
 function decodeCommand(line: string): { command: string; payload?: any } {
-  const match = /graph-store\.mjs" (save|dispatch|source|refresh)(?: ([A-Za-z0-9_-]+))?$/u.exec(line.trim());
-  if (!match) throw new Error(`not a graph-store command: ${line}`);
-  return {
-    command: match[1]!,
-    ...(match[2] ? { payload: JSON.parse(gunzipSync(Buffer.from(match[2], "base64url")).toString("utf8")) } : {}),
-  };
+  return decodeCommands(line)[0]!;
 }
 
 /**
@@ -195,36 +206,113 @@ function focusables(dialog: Element): HTMLElement[] {
 }
 
 
-it("asks which terminal to save through only when the remembered one is gone", async () => {
-  // 패널은 파일을 쓸 수 없어 저장 명령을 터미널로 보낸다. Orca는 터미널 id만
-  // 알려 주므로 어느 것이 셸인지 사용자가 한 번 고르고, 그 뒤로는 묻지 않는다.
-  const host = terminalHost([{ id: "current-shell" }, { id: "agent-pane" }]);
-  const dom = await mountPanel(({ store }) => {
-    store.saveTerminalId = "terminal-from-previous-worktree";
+it("saves through the plugin's own terminal without asking, and never through an agent pane", async () => {
+  // 이 플러그인은 자기 전용 터미널을 쓴다. CLI가 확보해 두고 handle이 store에
+  // 남으므로, 패널은 어느 터미널로 보낼지 묻지 않는다.
+  const host = terminalHost([{ id: "term_agent" }, { id: "term_plugin" }]);
+  const dom = await mountPanel(({ store, targets }) => {
+    store.saveTerminalId = "term_plugin";
+    targets.sessions = [{
+      id: "term_agent", title: "◐ 다른 작업", environmentId: "local", worktreeId: "wt-current",
+      projectId: "project-current", paneKey: "tab:leaf", agentType: "claude",
+      agentState: "working", connected: true, writable: true,
+    }];
   }, host.configure);
   try {
     const { document } = dom.window;
     document.querySelector<HTMLButtonElement>('[data-action="add-task"]')?.click();
     document.querySelector<HTMLButtonElement>('[data-action="save"]')?.click();
     await settle(dom);
-      await waitForCommands(host, 1);
-
-    // 기억해 둔 터미널이 이 워크트리에 없으므로 선택을 다시 묻는다.
-    const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-    expect(dialog?.textContent).toContain("저장할 터미널");
-    expect([...dialog!.querySelectorAll('[data-action="choose-save-terminal"]')].map((button) => button.getAttribute("data-id")))
-      .toEqual(["current-shell", "agent-pane"]);
-    expect(host.commands).toEqual([]);
-
-    dialog?.querySelector<HTMLButtonElement>('[data-action="choose-save-terminal"][data-id="current-shell"]')?.click();
-    document.querySelector<HTMLButtonElement>('[data-action="save"]')?.click();
-    await settle(dom);
+    await waitForCommands(host, 1);
 
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(host.commands).toHaveLength(1);
     expect(decodeCommand(host.commands[0]!).command).toBe("save");
     expect(host.requests.filter((request) => request.action === "terminal.sendText")
-      .every((request) => request.params?.terminalId === "current-shell")).toBe(true);
+      .every((request) => request.params?.terminalId === "term_plugin")).toBe(true);
+  } finally {
+    dom.window.close();
+  }
+});
+
+it("falls back to a shell once where the plugin has no terminal yet", async () => {
+  // 전용 터미널이 아직 없는 워크트리다. 기억해 둔 handle은 여기 없으므로 에이전트가
+  // 아닌 터미널로 한 번 보낸다 — 그 명령이 이 워크트리의 전용 터미널을 만든다.
+  const host = terminalHost([{ id: "term_agent" }, { id: "term_shell" }]);
+  const dom = await mountPanel(({ store, targets }) => {
+    store.saveTerminalId = "term_from_another_worktree";
+    targets.sessions = [{
+      id: "term_agent", title: "◐ 다른 작업", environmentId: "local", worktreeId: "wt-current",
+      projectId: "project-current", paneKey: "tab:leaf", agentType: "claude",
+      agentState: "working", connected: true, writable: true,
+    }];
+  }, host.configure);
+  try {
+    const { document } = dom.window;
+    document.querySelector<HTMLButtonElement>('[data-action="add-task"]')?.click();
+    document.querySelector<HTMLButtonElement>('[data-action="save"]')?.click();
+    await settle(dom);
+    await waitForCommands(host, 1);
+
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(host.commands).toHaveLength(1);
+    expect(host.requests.filter((request) => request.action === "terminal.sendText")
+      .every((request) => request.params?.terminalId === "term_shell")).toBe(true);
+  } finally {
+    dom.window.close();
+  }
+});
+
+it("holds the command and sends it as soon as a terminal appears", async () => {
+  // 패널은 터미널을 만들 수 없다(호스트가 sandbox 패널에 여는 액션은 세 개뿐).
+  // 그렇다고 편집을 버리면 사용자는 저장을 다시 눌러야 한다는 것도 모른 채 잃는다.
+  const terminals: Array<{ id: string }> = [];
+  const host = terminalHost(terminals);
+  const dom = await mountPanel(undefined, host.configure);
+  try {
+    const { document } = dom.window;
+    document.querySelector<HTMLButtonElement>('[data-action="add-task"]')?.click();
+    document.querySelector<HTMLButtonElement>('[data-action="save"]')?.click();
+    await settle(dom);
+
+    expect(host.commands).toEqual([]);
+    expect(document.querySelector(".toast")?.textContent).toContain("자동으로 이어서 보냅니다");
+    // 패널이 안 보고 있어도 알 수 있게 Orca 알림도 띄운다.
+    expect(host.requests.some((request) => request.action === "notifications.show")).toBe(true);
+
+    // 사용자가 터미널 탭을 하나 열면 그 뒤는 저절로 간다.
+    terminals.push({ id: "term_opened" });
+    await new Promise((resolve) => setTimeout(resolve, 2_600));
+    await waitForCommands(host, 1);
+
+    expect(host.commands).toHaveLength(1);
+    expect(decodeCommand(host.commands[0]!).command).toBe("save");
+    expect(host.requests.filter((request) => request.action === "terminal.sendText")
+      .every((request) => request.params?.terminalId === "term_opened")).toBe(true);
+  } finally {
+    dom.window.close();
+  }
+});
+
+it("sends nothing when only agent panes are open", async () => {
+  // 에이전트가 도는 pane에 저장 명령을 넣으면 셸이 아니라 그 에이전트의 입력이
+  // 된다. 저장도 실행도 일어나지 않고, 사용자에게는 아무 일도 안 한 것으로 보인다.
+  const host = terminalHost([{ id: "term_agent" }]);
+  const dom = await mountPanel(({ targets }) => {
+    targets.sessions = [{
+      id: "term_agent", title: "◐ 다른 작업", environmentId: "local", worktreeId: "wt-current",
+      projectId: "project-current", paneKey: "tab:leaf", agentType: "claude",
+      agentState: "working", connected: true, writable: true,
+    }];
+  }, host.configure);
+  try {
+    const { document } = dom.window;
+    document.querySelector<HTMLButtonElement>('[data-action="add-task"]')?.click();
+    document.querySelector<HTMLButtonElement>('[data-action="save"]')?.click();
+    await settle(dom);
+
+    expect(host.commands).toEqual([]);
+    expect(document.querySelector(".toast")?.textContent).toContain("에이전트 세션만");
   } finally {
     dom.window.close();
   }
@@ -358,7 +446,7 @@ describe("panel accessibility", () => {
       const environment = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="environmentId"]');
       expect(environment?.value).toBe("local");
       expect([...(environment?.options ?? [])].map((option) => option.textContent)).toEqual(["device-a · 이 Orca", "device-b"]);
-      expect(dialog?.querySelector<HTMLInputElement>('[data-action="toggle-run-project"][data-project-id="repo:current-project"]')?.checked).toBe(true);
+      expect(dialog?.querySelector<HTMLInputElement>('[data-action="toggle-run-worktree"][data-project-id="repo:current-project"]')?.checked).toBe(true);
       expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="model"]')?.value).toBe("gpt-5.6-sol");
       expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
 
@@ -378,9 +466,10 @@ describe("panel accessibility", () => {
         rerenderedEnvironment.dispatchEvent(new Event("change", { bubbles: true }));
       }
       dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      expect([...dialog?.querySelectorAll<HTMLElement>('.run-project-option strong') ?? []]
+      // 머신을 바꾸면 그 머신 그룹의 프로젝트만 고를 수 있다.
+      expect([...dialog?.querySelectorAll<HTMLElement>('.run-target-environment.active .run-target-project > header > strong') ?? []]
         .map((option) => option.textContent)).toEqual(["remote-project"]);
-      dialog?.querySelector<HTMLInputElement>('[data-action="toggle-run-project"][data-project-id="repo:remote-project"]')?.click();
+      dialog?.querySelector<HTMLInputElement>('[data-action="toggle-run-worktree"][data-project-id="repo:remote-project"]')?.click();
       const targetMode = document.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="targetMode"]');
       if (targetMode) {
         targetMode.value = "session";
@@ -458,21 +547,21 @@ describe("panel accessibility", () => {
       document.querySelector<HTMLButtonElement>('[data-action="open-task-run"]')?.click();
 
       let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      expect(dialog?.querySelectorAll('[data-action="toggle-run-project"]:checked')).toHaveLength(0);
-      expect(dialog?.textContent).toContain("프로젝트 선택 안 함");
+      expect(dialog?.querySelectorAll('[data-action="toggle-run-worktree"]:checked')).toHaveLength(0);
+      expect(dialog?.textContent).toContain("선택 안 함");
       expect(dialog?.textContent).toContain("현재 Orca 컨텍스트");
       expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
 
       dialog?.querySelector<HTMLInputElement>('[data-project-id="project-api"]')?.click();
       document.querySelector<HTMLInputElement>('[data-project-id="project-web"]')?.click();
       dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      expect(dialog?.querySelectorAll('[data-action="toggle-run-project"]:checked')).toHaveLength(2);
+      expect(dialog?.querySelectorAll('[data-action="toggle-run-worktree"]:checked')).toHaveLength(2);
       expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-mode"]')).not.toBeNull();
 
       dialog?.querySelector<HTMLInputElement>('[data-project-id="project-api"]')?.click();
       document.querySelector<HTMLInputElement>('[data-project-id="project-web"]')?.click();
       dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      expect(dialog?.querySelectorAll('[data-action="toggle-run-project"]:checked')).toHaveLength(0);
+      expect(dialog?.querySelectorAll('[data-action="toggle-run-worktree"]:checked')).toHaveLength(0);
       expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
     } finally {
       dom.window.close();
@@ -517,8 +606,9 @@ describe("panel accessibility", () => {
 
       const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
       expect(dialog?.querySelector<HTMLSelectElement>('[data-field="environmentId"]')?.value).toBe("local");
-      expect([...dialog?.querySelectorAll<HTMLInputElement>('[data-action="toggle-run-project"]:checked') ?? []].map((input) => input.dataset.projectId)).toEqual(["repo-api", "repo-front"]);
-      expect([...dialog?.querySelectorAll<HTMLSelectElement>('[data-scope="task-run-project-routing"][data-field="branch"]') ?? []].map((select) => select.value)).toEqual(["feature/task", "feature/task"]);
+      expect([...dialog?.querySelectorAll<HTMLInputElement>('[data-action="toggle-run-worktree"]:checked') ?? []].map((input) => input.dataset.projectId)).toEqual(["repo-api", "repo-front"]);
+      // 저장된 Task 브랜치의 워크트리 행이 체크된다.
+      expect([...dialog?.querySelectorAll<HTMLInputElement>('[data-action="toggle-run-worktree"]:checked') ?? []].map((input) => input.dataset.branch)).toEqual(["feature/task", "feature/task"]);
       expect(dialog?.textContent).not.toContain("새 세션을 만들 프로젝트를 선택하십시오");
     } finally {
       dom.window.close();
@@ -664,8 +754,10 @@ describe("panel accessibility", () => {
       const manager = document.querySelector<HTMLElement>(".execution-manager");
       expect(manager?.textContent).toContain("요구사항 설계");
       expect(manager?.textContent).toContain("current-project");
-      expect(manager?.textContent).toContain("기존 세션");
+      expect(manager?.textContent).toContain("Codex");
       expect(manager?.textContent).toContain("전달 뒤의 진행은 각 세션에서 확인하십시오");
+      // 대상 목록에 없는 세션은 닫힌 것으로 본다 — 추정이 아니라 마지막 갱신의 관측이다.
+      expect(manager?.querySelector(".dispatch-state")?.textContent).toBe("닫힘");
       // 관측할 수 없는 것은 그리지 않는다.
       expect(manager?.querySelector(".execution-progress")).toBeNull();
       expect(manager?.textContent).not.toContain("실행 중");
@@ -715,7 +807,118 @@ describe("panel accessibility", () => {
     }
   });
 
-  it("exposes each node's last run outcome as a canvas tooltip and offers a run-history reset", async () => {
+  it("shows the run on the canvas from what the session reported, node by node", async () => {
+    // 로컬 저장소에는 원천이 채워 주는 run 기록이 없다. 그래프를 보낸 뒤 캔버스가
+    // 아무 말도 하지 않으면 도는 중인지 끝났는지 알 수 없다.
+    const dom = await mountPanel(({ store }) => {
+      store.dispatchLog = [{
+        id: "d-graph", itemKind: "graph", itemId: "graph-orca-demo", title: "Orca 그래프 엔지니어링",
+        dispatchedAt: "2026-08-12T05:00:00.000Z", executionMode: "single_session",
+        targets: [{
+          label: "API", projectName: "API", sessionId: "term_live", opened: "new-session",
+          outcome: { status: "running", observedAt: "2026-08-12T05:05:00.000Z" },
+          nodeStates: {
+            "node-design": { status: "done", message: "설계 정리함" },
+            "node-implement": { status: "failed", message: "템플릿 값 누락" },
+          },
+        }],
+      }];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="canvas"]')?.click();
+
+      const banner = document.querySelector<HTMLElement>(".canvas-run-banner");
+      expect(banner?.textContent).toContain("진행중");
+      expect(banner?.textContent).toContain("API");
+      // 세션이 보고한 노드 수만 센다. 나머지를 진행률로 지어내지 않는다.
+      expect(banner?.textContent).toContain("노드 2/4 보고");
+      expect(banner?.textContent).toContain("실패 1");
+      expect(banner?.querySelector('[data-action="focus-session"]')).not.toBeNull();
+
+      // 캔버스의 노드도 그 보고대로 칠해진다.
+      expect(document.querySelector('.node[data-node-id="node-design"]')?.className).toContain("execution-done");
+      expect(document.querySelector('.node[data-node-id="node-implement"]')?.className).toContain("execution-failed");
+      expect(document.querySelector('.node[data-node-id="node-quality-graph-call"]')?.className).toContain("execution-pending");
+      // 상태 점이 노드마다 붙는다 — 글자를 읽지 않아도 상태가 보인다.
+      expect(document.querySelector('.node[data-node-id="node-design"] .node-run-dot')?.className).toContain("done");
+      expect(document.querySelector('.node[data-node-id="node-implement"] .node-run-dot')?.className).toContain("failed");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("leaves refreshing to the user and shows the run it already observed", async () => {
+    const dom = await mountPanel(({ store }) => {
+      store.dispatchLog = [{
+        id: "d-graph", itemKind: "graph", itemId: "graph-orca-demo", title: "Orca 그래프 엔지니어링",
+        dispatchedAt: "2026-08-12T05:00:00.000Z", executionMode: "single_session",
+        targets: [{
+          label: "API", projectName: "API", sessionId: "term_live", opened: "new-session",
+          outcome: { status: "done", observedAt: "2026-08-12T05:05:00.000Z" },
+          nodeStates: { "node-design": { status: "done" } },
+        }],
+      }];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="canvas"]')?.click();
+      expect(document.querySelector(".canvas-run-banner")?.textContent).toContain("성공");
+      // 갱신은 사람이 누른다. 패널이 스스로 다시 열지 않는다.
+      expect(document.querySelector('[data-action="toggle-run-follow"]')).toBeNull();
+      expect(document.querySelector('.canvas-run-banner [data-action="refresh-data"]')).not.toBeNull();
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("keeps the running animations in the stylesheet the canvas depends on", async () => {
+    // jsdom은 animation shorthand를 계산하지 못한다. 규칙이 사라지지 않았는지만 지킨다.
+    const css = await readFile(path.join(root, "src/panel.css"), "utf8");
+    expect(css).toContain("@keyframes node-run-dash");
+    expect(css).toContain("@keyframes node-run-ping");
+    expect(css).toContain("@keyframes edge-flow");
+    expect(css).toMatch(/\.node\.execution-running \.node-shape \{[^}]*animation: node-run-dash/u);
+    expect(css).toMatch(/\.node-run-dot\.running::after \{[^}]*animation: node-run-ping/su);
+    expect(css).toMatch(/\.edge\.active-flow, \.edge\.into-running \{[^}]*animation: edge-flow/u);
+    // 실행 중에는 임계 경로 색이 실행 색을 흉내 내지 않아야 한다.
+    expect(css).toContain(".canvas-shell.has-run .node.execution-pending .node-shape");
+  });
+
+  it("marks the node the session says it is working on right now", async () => {
+    const dom = await mountPanel(({ store }) => {
+      store.dispatchLog = [{
+        id: "d-graph", itemKind: "graph", itemId: "graph-orca-demo", title: "Orca 그래프 엔지니어링",
+        dispatchedAt: "2026-08-12T05:00:00.000Z", executionMode: "single_session",
+        targets: [{
+          label: "API", projectName: "API", sessionId: "term_live", opened: "new-session",
+          outcome: { status: "running", observedAt: "2026-08-12T05:05:00.000Z" },
+          nodeStates: {
+            "node-design": { status: "done" },
+            "node-implement": { status: "running" },
+          },
+        }],
+      }];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="canvas"]')?.click();
+      // 지금 도는 노드는 테두리와 점으로 구분되고, 아직 보고가 없는 노드는 뒤로 물린다.
+      expect(document.querySelector('.node[data-node-id="node-implement"]')?.className).toContain("execution-running");
+      expect(document.querySelector('.node[data-node-id="node-implement"] .node-run-dot')?.className).toContain("running");
+      expect(document.querySelector("[data-canvas]")?.className).toContain("has-run");
+
+      // 끝난 노드에서 나가는 연결과 도는 노드로 들어가는 연결이 흐른다.
+      const edges = [...document.querySelectorAll<SVGPathElement>("path.edge")]
+        .map((edge) => edge.getAttribute("class") ?? "");
+      expect(edges.some((value) => value.includes("completed"))).toBe(true);
+      expect(edges.some((value) => value.includes("into-running"))).toBe(true);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("shows a node's instructions and last run outcome on hover, and offers a run-history reset", async () => {
     const dom = await mountPanel((bootstrap) => {
       bootstrap.store.graphs[0].runs = [{
         id: "run-1", runNo: 3, status: "failed", startedAt: "2026-08-11T03:00:00.000Z", trigger: "manual",
@@ -724,20 +927,213 @@ describe("panel accessibility", () => {
     });
     try {
       const { document } = dom.window;
+      // 노드에 올리면 그 노드가 무엇을 시키는지와 최근 실행 결과가 카드로 뜬다.
       const node = document.querySelector<HTMLElement>('.node[data-node-id="node-implement"]');
-      const tooltip = node?.getAttribute("title") ?? "";
-      expect(tooltip).toContain("Run #3");
-      expect(tooltip).toContain("실패 사유");
-      expect(tooltip).toContain("필수 템플릿 계약값 누락으로 blocked");
-      expect(tooltip).toContain("구현 세션");
-      const untouched = document.querySelector<HTMLElement>('.node[data-node-id="node-design"]')?.getAttribute("title") ?? "";
-      expect(untouched).toContain("실행 기록이 아직 없습니다");
+      node?.dispatchEvent(new dom.window.Event("pointerover", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      let card = document.querySelector<HTMLElement>(".node-hover-card");
+      expect(card?.textContent).toContain("구현 및 검증");
+      expect(card?.querySelector(".node-hover-body")?.textContent).toContain("승인된 설계를 구현하고");
+      expect(card?.textContent).toContain("Run #3");
+      expect(card?.textContent).toContain("필수 템플릿 계약값 누락으로 blocked");
+      expect(card?.textContent).toContain("구현 세션");
+
+      // 다른 노드로 옮기면 그 노드의 내용으로 바뀐다.
+      document.querySelector<HTMLElement>('.node[data-node-id="node-design"]')
+        ?.dispatchEvent(new dom.window.Event("pointerover", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      card = document.querySelector<HTMLElement>(".node-hover-card");
+      expect(card?.textContent).toContain("요구사항 설계");
+      expect(card?.textContent).toContain("실행 기록이 아직 없습니다");
+
+      // 끌기 시작하면 카드는 곧바로 사라진다 — 남으면 엉뚱한 자리를 가리킨다.
+      document.querySelector<HTMLElement>("[data-canvas]")
+        ?.dispatchEvent(new dom.window.Event("pointerdown", { bubbles: true }));
+      expect(document.querySelector(".node-hover-card")).toBeNull();
       expect(document.querySelectorAll('[data-action="reset-graph-history"]').length).toBeGreaterThan(0);
     } finally {
       dom.window.close();
     }
   });
 
+
+  it("shows each dispatched session's observed state, last line, and a way to open it", async () => {
+    // "보냈다"만 남으면 실행 현황은 읽을 게 없다. 세션이 살아 있는지, 화면에 마지막으로
+    // 무엇이 찍혔는지는 갱신 때 관측한 사실이므로 그대로 옮긴다.
+    const host = terminalHost([{ id: "shell" }]);
+    const dom = await mountPanel(({ store, targets }) => {
+      store.dispatchLog = [{
+        id: "dispatch-live", itemKind: "task", itemId: "task-design", title: "요구사항 설계",
+        dispatchedAt: "2026-08-12T01:00:00.000Z", executionMode: "single_session",
+        targets: [
+          { label: "API", projectName: "API", branch: "main", sessionId: "term_live", sessionTitle: "GE · API", model: "claude-opus-5", opened: "new-session" },
+          { label: "Web", projectName: "Web", branch: "release", sessionId: "term_closed", opened: "new-session" },
+        ],
+      }];
+      targets.sessions = [{
+        id: "term_live", title: "GE · API", environmentId: "local", worktreeId: "wt-api",
+        projectId: "project-api", branch: "refs/heads/main", paneKey: "a:1", agentType: "claude",
+        agentState: "working", connected: true, writable: true,
+        preview: "테스트를 실행하는 중입니다", lastOutputAt: new Date().toISOString(),
+      }];
+    }, host.configure);
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
+      const states = [...document.querySelectorAll<HTMLElement>(".dispatch-state")].map((item) => item.textContent);
+      expect(states).toEqual(["작업 중", "닫힘"]);
+      expect(document.querySelector(".dispatch-preview")?.textContent).toContain("테스트를 실행하는 중입니다");
+
+      // 패널은 Orca UI를 못 만진다. 세션으로 가는 것도 CLI 한 줄로 부탁한다.
+      document.querySelector<HTMLButtonElement>('[data-action="focus-session"][data-id="term_live"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 1);
+      expect(host.commands[0]).toContain('focus "term_live"');
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("groups runs into 진행중 · 성공 · 실패 from what the sessions reported", async () => {
+    // 패널은 진행률을 지어내지 않는다. 프롬프트가 요구한 결과 줄을 갱신 때 읽어 둔
+    // 것만으로 나눈다 — 결과 없이 세션이 사라졌으면 실패다.
+    const dom = await mountPanel(({ store }) => {
+      const at = "2026-08-12T04:00:00.000Z";
+      store.dispatchLog = [
+        {
+          id: "d-running", itemKind: "task", itemId: "task-a", title: "도는 중",
+          dispatchedAt: "2026-08-12T03:00:00.000Z", executionMode: "single_session",
+          targets: [{ label: "API", sessionId: "t1", opened: "new-session", outcome: { status: "running", observedAt: at } }],
+        },
+        {
+          id: "d-done", itemKind: "task", itemId: "task-b", title: "끝난 것",
+          dispatchedAt: "2026-08-12T02:00:00.000Z", executionMode: "single_session",
+          targets: [{ label: "API", sessionId: "t2", opened: "new-session", outcome: { status: "done", observedAt: at } }],
+        },
+        {
+          id: "d-failed", itemKind: "task", itemId: "task-c", title: "실패한 것",
+          dispatchedAt: "2026-08-12T01:00:00.000Z", executionMode: "single_session",
+          targets: [{ label: "API", sessionId: "t3", opened: "new-session", outcome: { status: "failed", message: "템플릿 값 누락", observedAt: at } }],
+        },
+        {
+          id: "d-closed", itemKind: "task", itemId: "task-d", title: "결과 없이 닫힘",
+          dispatchedAt: "2026-08-12T00:30:00.000Z", executionMode: "single_session",
+          targets: [{ label: "API", sessionId: "t4", opened: "new-session", outcome: { status: "closed", observedAt: at } }],
+        },
+      ];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
+      const manager = document.querySelector<HTMLElement>(".execution-manager");
+      expect(manager?.querySelector(".execution-manager-header")?.textContent).toContain("진행중 1 · 성공 1 · 실패 2");
+      expect([...manager?.querySelectorAll<HTMLElement>(".execution-section > header > strong") ?? []]
+        .map((item) => item.textContent)).toEqual(["진행중", "성공", "실패"]);
+      // 실패 이유는 화면에서 읽은 그대로 보여 준다.
+      expect(manager?.textContent).toContain("템플릿 값 누락");
+      expect(manager?.textContent).toContain("결과 없이 종료");
+
+      // 카드를 누르면 그 실행의 상세가 열린다.
+      manager?.querySelector<HTMLElement>('.execution-section.status-failed [data-action="open-dispatch-detail"]')?.click();
+      expect(document.querySelector('[role="dialog"]')?.textContent).toContain("실패한 것");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("lists a Task's whole run history newest first, and deletes it by run or by Task", async () => {
+    const host = terminalHost([{ id: "shell" }]);
+    const dom = await mountPanel(({ store }) => {
+      store.dispatchLog = [
+        { id: "run-3", itemKind: "task", itemId: "task-a", title: "반복 실행", dispatchedAt: "2026-08-12T03:00:00.000Z", executionMode: "single_session", targets: [{ label: "API", opened: "new-session" }] },
+        { id: "run-2", itemKind: "task", itemId: "task-a", title: "반복 실행", dispatchedAt: "2026-08-12T02:00:00.000Z", executionMode: "single_session", targets: [{ label: "API", opened: "new-session" }] },
+        { id: "run-1", itemKind: "task", itemId: "task-a", title: "반복 실행", dispatchedAt: "2026-08-12T01:00:00.000Z", executionMode: "single_session", targets: [{ label: "API", opened: "new-session" }] },
+        { id: "other", itemKind: "task", itemId: "task-b", title: "다른 Task", dispatchedAt: "2026-08-12T00:00:00.000Z", executionMode: "single_session", targets: [{ label: "API", opened: "new-session" }] },
+      ];
+    }, host.configure);
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
+      const card = document.querySelector<HTMLElement>(".dispatch-card");
+      expect(card?.textContent).toContain("실행 이력 3건");
+
+      // 접혀 있다가 펼치면 그 항목의 이력이 최신순으로 전부 보인다.
+      expect(card?.querySelector(".dispatch-runs")).toBeNull();
+      card?.querySelector<HTMLElement>("header[data-action='toggle-execution-history']")?.click();
+      let times = [...document.querySelectorAll<HTMLElement>(".dispatch-run time")].map((item) => item.textContent ?? "");
+      expect(times).toHaveLength(3);
+      expect([...times].sort().reverse()).toEqual(times);
+
+      // 한 건만 지운다.
+      document.querySelector<HTMLButtonElement>('[data-action="delete-dispatch-record"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 1);
+      times = [...document.querySelectorAll<HTMLElement>(".dispatch-run time")].map((item) => item.textContent ?? "");
+      expect(times).toHaveLength(2);
+      let saved = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "save")?.payload;
+      expect(saved.deletions.dispatchIds).toEqual(["run-3"]);
+
+      // 그 항목의 이력을 통째로 지운다. 다른 항목은 남는다.
+      host.commands.length = 0;
+      document.querySelector<HTMLButtonElement>('[data-action="delete-dispatch-item"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 1);
+      expect([...document.querySelectorAll<HTMLElement>(".dispatch-card")].map((item) => item.textContent))
+        .toEqual([expect.stringContaining("다른 Task")]);
+      saved = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "save")?.payload;
+      // run-3은 앞선 저장에서 이미 나갔다. 같은 삭제를 두 번 보내지 않는다.
+      expect(saved.deletions.dispatchIds.sort()).toEqual(["run-1", "run-2"]);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("opens an execution detail with the prompt that was actually sent", async () => {
+    const dom = await mountPanel(({ store, targets }) => {
+      store.dispatchLog = [
+        {
+          id: "dispatch-new", itemKind: "task", itemId: "task-design", title: "요구사항 설계",
+          dispatchedAt: "2026-08-12T02:00:00.000Z", executionMode: "per_project",
+          prompt: "Task: 요구사항 설계\n\n이 작업만 수행하십시오.",
+          targets: [{ label: "API", projectName: "API", branch: "main", sessionId: "term_live", opened: "new-session" }],
+        },
+        {
+          id: "dispatch-old", itemKind: "task", itemId: "task-design", title: "요구사항 설계",
+          dispatchedAt: "2026-08-12T01:00:00.000Z", executionMode: "single_session",
+          targets: [{ label: "API", projectName: "API", opened: "new-session" }],
+          error: "세션이 닫혔습니다",
+        },
+      ];
+      targets.sessions = [{
+        id: "term_live", title: "GE · API", environmentId: "local", worktreeId: "wt-api",
+        projectId: "project-api", paneKey: "a:1", agentType: "codex", agentState: "working",
+        connected: true, writable: true, preview: "테스트 실행 중",
+      }];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
+      // 최근 실행 상세 버튼으로 그 실행을 펼쳐 본다.
+      document.querySelector<HTMLElement>('.dispatch-card [data-action="open-dispatch-detail"]')?.click();
+
+      let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).toContain("요구사항 설계");
+      expect(dialog?.textContent).toContain("프로젝트별");
+      // 무엇을 보냈는지가 상세의 핵심이다.
+      expect(dialog?.querySelector(".dispatch-prompt")?.textContent).toContain("이 작업만 수행하십시오");
+      expect(dialog?.querySelector(".dispatch-state")?.textContent).toBe("작업 중");
+      expect(dialog?.querySelector(".dispatch-preview")?.textContent).toContain("테스트 실행 중");
+
+      // 같은 항목의 이전 실행으로 옮겨 갈 수 있다.
+      expect(dialog?.textContent).toContain("같은 항목의 이전 실행 1");
+      dialog?.querySelector<HTMLButtonElement>('.dispatch-history-list [data-action="open-dispatch-detail"]')?.click();
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).toContain("세션이 닫혔습니다");
+      expect(dialog?.textContent).toContain("프롬프트가 남아 있지 않습니다");
+    } finally {
+      dom.window.close();
+    }
+  });
 
   it("keeps the newest dispatch first and shows the graph run history beside it", async () => {
     const dom = await mountPanel(({ store }) => {
@@ -758,9 +1154,15 @@ describe("panel accessibility", () => {
       const { document } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="executions"]')?.click();
       const cards = [...document.querySelectorAll<HTMLElement>(".dispatch-card")];
-      expect(cards).toHaveLength(2);
-      // 최신이 먼저. 같은 Graph를 여러 번 보내도 run 이력 섹션은 하나만 만든다.
-      expect(cards[0]?.textContent).toContain("2026");
+      // 같은 항목의 실행은 카드 하나로 묶는다. 보낼 때마다 카드가 쌓이면 최신을 못 찾는다.
+      expect(cards).toHaveLength(1);
+      expect(cards[0]?.textContent).toContain("실행 이력 2건");
+      // 펼치면 그 항목의 이력이 최신순으로 전부 보인다.
+      expect(cards[0]?.querySelector(".dispatch-runs")).toBeNull();
+      cards[0]?.querySelector<HTMLButtonElement>('footer [data-action="toggle-execution-history"]')?.click();
+      const runs = [...document.querySelectorAll<HTMLElement>(".dispatch-run time")].map((item) => item.textContent);
+      expect(runs).toHaveLength(2);
+      expect(runs[0]! > runs[1]!).toBe(true);
       expect(document.querySelectorAll(".execution-group")).toHaveLength(1);
       expect(document.querySelector(".execution-group")?.textContent).toContain("graph-orca-demo");
     } finally {
@@ -830,7 +1232,7 @@ describe("panel accessibility", () => {
       await settle(dom);
       await waitForCommands(host, 1);
 
-      const decoded = host.commands.map(decodeCommand);
+      const decoded = host.commands.flatMap(decodeCommands);
       expect(decoded.map((entry) => entry.command)).toEqual(["save"]);
       expect(decoded[0]?.payload.graphs.find((graph: any) => graph.id === "graph-orca-demo")?.engineering?.executionMode)
         .toBe("single_session");
@@ -864,7 +1266,7 @@ describe("panel accessibility", () => {
       await settle(dom);
       await waitForCommands(host, 1);
 
-      const decoded = host.commands.map(decodeCommand);
+      const decoded = host.commands.flatMap(decodeCommands);
       // 저장만 한다. 설정을 남기려고 세션을 깨우지 않는다.
       expect(decoded.map((entry) => entry.command)).toEqual(["save"]);
       expect(document.querySelector('[role="dialog"]')).toBeNull();
@@ -892,10 +1294,14 @@ describe("panel accessibility", () => {
       await settle(dom);
       await waitForCommands(host, 2);
 
-      const decoded = host.commands.map(decodeCommand);
+      const decoded = host.commands.flatMap(decodeCommands);
       // 저장이 먼저다. 보낸 프롬프트가 저장되지 않은 그래프를 가리키면 세션이 읽는
       // 정본과 패널이 보여 주는 것이 갈린다.
       expect(decoded.map((entry) => entry.command)).toEqual(["save", "dispatch"]);
+      // 두 명령은 반드시 한 줄이어야 한다. 줄을 나눠 보내면 저장이 도는 동안 타이핑된
+      // 실행 줄이 tty 정규 모드 버퍼(macOS 1024B)에서 잘려 실행이 통째로 사라진다.
+      expect(host.commands).toHaveLength(1);
+      expect(host.commands[0]).toContain(" && ");
       const dispatch = decoded[1]!.payload;
       expect(dispatch.itemKind).toBe("graph");
       expect(dispatch.itemId).toBe("graph-orca-demo");
@@ -931,33 +1337,57 @@ describe("panel accessibility", () => {
     }
   });
 
-  it("offers a confirmed Task delete action that preserves recoverable history", async () => {
-    const dom = await mountPanel();
+  it("really deletes a Task from a local store instead of archiving it", async () => {
+    // "삭제"가 보관이면 목록에 계속 남는다. 로컬 저장소에서는 요청대로 지운다.
+    const host = terminalHost([{ id: "shell" }]);
+    const dom = await mountPanel(undefined, host.configure);
     try {
       const { document } = dom.window;
       document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
       document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
       const deleteButton = document.querySelector<HTMLButtonElement>('[data-action="open-task-delete"]');
       const deletedTaskId = deleteButton?.dataset.id;
-      expect(deleteButton?.textContent).toBe("Task 삭제");
       expect(deleteButton?.classList.contains("danger")).toBe(true);
       deleteButton?.click();
 
       const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-      expect(dialog?.textContent).toContain("영구 삭제하지 않고 보관 상태로 전환");
-      expect(dialog?.textContent).toContain("Prompt 이력");
+      expect(dialog?.textContent).toContain("되돌릴 수 없습니다");
+      expect(dialog?.querySelector('[data-action="confirm-task-delete"]')?.textContent).toBe("영구 삭제");
       dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-delete"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 1);
 
+      // 목록에서 사라진다. 보관 카드로 남지 않는다.
       expect(document.querySelector<HTMLElement>('[role="dialog"]')).toBeNull();
-      expect(document.querySelector<HTMLElement>('[aria-label="Task 상세"]')).toBeNull();
-      expect(document.querySelector<HTMLElement>('[aria-label="Task 관리"]')).not.toBeNull();
-      expect(document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.classList.contains("active")).toBe(true);
-      const archivedCard = [...document.querySelectorAll<HTMLButtonElement>('[data-action="select-local-task"]')]
-        .find((item) => item.dataset.id === deletedTaskId);
-      expect(archivedCard).not.toBeUndefined();
-      expect(archivedCard?.textContent).toContain("보관");
-      archivedCard?.click();
-      expect(document.querySelector<HTMLButtonElement>('[data-action="archive-local-task"]')?.textContent).toBe("Task 복원");
+      expect([...document.querySelectorAll<HTMLButtonElement>('[data-action="select-local-task"]')]
+        .some((item) => item.dataset.id === deletedTaskId)).toBe(false);
+
+      // 저장에도 삭제가 실려야 다음에 패널을 열 때 되살아나지 않는다.
+      const saved = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "save")?.payload;
+      expect(saved.deletions.tasks).toEqual([deletedTaskId]);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("archives instead of deleting when the source contract has no delete", async () => {
+    const dom = await mountPanel((bootstrap: any) => {
+      bootstrap.dataSource = {
+        config: { schemaVersion: 1, mode: "structured", url: "https://example.test/" },
+        status: "ready",
+        catalog: [],
+        capabilities: { domainMutation: true, milestoneMutation: true, taskMutation: true, todoMutation: true, graphCommit: true },
+      };
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-delete"]')?.click();
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      // 구조화 원천의 계약에는 삭제가 없다. 지운 척하지 않고 그렇게 말한다.
+      expect(dialog?.textContent).toContain("삭제 대신 보관만 지원");
+      expect(dialog?.querySelector('[data-action="confirm-task-delete"]')?.textContent).toBe("Task 보관");
     } finally {
       dom.window.close();
     }
@@ -1341,7 +1771,7 @@ describe("panel accessibility", () => {
       document.querySelector<HTMLButtonElement>('.topbar [data-action="open-run"]')?.click();
       let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
       expect(dialog?.textContent).toContain("현재 프로젝트 추천");
-      expect(dialog?.querySelector<HTMLInputElement>('[data-action="toggle-run-project"][data-project-id="repo:current-project"]')?.checked).toBe(true);
+      expect(dialog?.querySelector<HTMLInputElement>('[data-action="toggle-run-worktree"][data-project-id="repo:current-project"]')?.checked).toBe(true);
       expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="run-routing"][data-field="model"]')?.value).toBe("gpt-5.6-sol");
       expect(dialog?.querySelectorAll(".run-route-row")).toHaveLength(0);
       expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="run-condition"]')).toBeNull();
@@ -1740,7 +2170,7 @@ describe("work process and branch execution surface", () => {
       await settle(dom);
       await waitForCommands(host, 2);
 
-      const dispatch = host.commands.map(decodeCommand).find((entry) => entry.command === "dispatch")?.payload;
+      const dispatch = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "dispatch")?.payload;
       // 프로젝트마다 자기 워크트리로 간다. 하나의 라우팅으로 접으면 다른 프로젝트의
       // 작업이 엉뚱한 체크아웃에서 돈다.
       expect(dispatch?.executionMode).toBe("per_project");
@@ -1787,8 +2217,9 @@ describe("work process and branch execution surface", () => {
       expect(document.querySelector<HTMLSelectElement>('[data-scope="run-process"][data-field="startNewRun"]')?.value).toBe("resume");
       expect(document.querySelector<HTMLTextAreaElement>('[data-scope="run-process"][data-field="inputPrompt"]')?.value).toBe("  고객 A\n계약서 검토  ");
       expect(document.querySelector<HTMLTextAreaElement>('[data-scope="run-process"][data-field="inputPrompt"]')?.readOnly).toBe(true);
-      const branch = document.querySelector<HTMLSelectElement>('[data-scope="run-project-routing"][data-field="branch"]');
-      expect([...branch!.options].map((item) => item.textContent)).toContain("feature/review · /feature");
+      // 프로젝트의 워크트리가 트리에 그대로 나온다 — 고르는 단위가 워크트리다.
+      expect([...document.querySelectorAll<HTMLElement>('.run-target-worktree')]
+        .map((row) => row.textContent)).toEqual(expect.arrayContaining([expect.stringContaining("feature/review")]));
       const mode = document.querySelector<HTMLSelectElement>('[data-scope="run-process"][data-field="startNewRun"]');
       if (mode) { mode.value = "new"; mode.dispatchEvent(new Event("change", { bubbles: true })); }
       expect(document.querySelector<HTMLTextAreaElement>('[data-scope="run-process"][data-field="inputPrompt"]')?.readOnly).toBe(false);
@@ -1860,7 +2291,7 @@ describe("structured source work editing", () => {
 
       document.querySelector<HTMLButtonElement>('[data-action="save"]')?.click();
       await settle(dom);
-      const saved = host.commands.map(decodeCommand).find((entry) => entry.command === "save")?.payload;
+      const saved = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "save")?.payload;
       expect(saved.graphs.map((graph: any) => graph.name)).toContain("검수 흐름");
     } finally {
       dom.window.close();
@@ -1886,7 +2317,7 @@ describe("structured source work editing", () => {
       await waitForCommands(host, 1);
 
       // Task 생성은 다른 편집과 같은 저장 경로를 탄다. 별도 원천 왕복이 없다.
-      expect(host.commands.map(decodeCommand).map((entry) => entry.command)).toEqual(["save"]);
+      expect(host.commands.flatMap(decodeCommands).map((entry) => entry.command)).toEqual(["save"]);
       const detail = document.querySelector<HTMLElement>('[aria-label="Task 상세"]');
       expect(detail?.textContent).toContain("리뷰 반영");
       expect(document.querySelector('[role="dialog"]')).toBeNull();
@@ -1935,7 +2366,7 @@ describe("structured source work editing", () => {
       await settle(dom);
       await waitForCommands(host, 2);
 
-      const decoded = host.commands.map(decodeCommand);
+      const decoded = host.commands.flatMap(decodeCommands);
       expect(decoded.map((entry) => entry.command)).toEqual(["save", "dispatch"]);
       const dispatch = decoded[1]!.payload;
       expect(dispatch.executionMode).toBe("per_project");
@@ -2019,12 +2450,556 @@ describe("structured source work editing", () => {
       await settle(dom);
       await waitForCommands(host, 1);
 
-      const saved = host.commands.map(decodeCommand).find((entry) => entry.command === "save")?.payload;
+      const saved = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "save")?.payload;
       // 손대지 않은 항목을 함께 보내면 그 사이 원천에서 바뀐 값을 덮어쓰게 된다.
       expect(saved.tasks.map((task: any) => task.id)).toEqual(["task-edited"]);
       expect(saved.tasks[0]).toMatchObject({ title: "수정한 제목", version: 7 });
       expect(saved.todos).toBeUndefined();
       expect(saved.domains).toBeUndefined();
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("runs where the checked project is, not where a stale saved route points", async () => {
+    // 저장해 둔 실행 설정의 routing과 체크한 프로젝트가 어긋나 있으면, 창은 A를
+    // 체크한 채 B로 보낸다. 사용자에게는 "고른 프로젝트가 먹지 않는다"로 보인다.
+    const host = terminalHost([{ id: "shell" }]);
+    const dom = await mountPanel(({ store, targets }) => {
+      targets.environments = [{ id: "local", name: "this-device", local: true, connected: true }];
+      targets.projects = [
+        { id: "project-current", name: "current", environmentId: "local", repoId: "repo-current", worktreeId: "wt-current", path: "/src/current", branch: "refs/heads/main", current: true },
+        { id: "project-chosen", name: "chosen", environmentId: "local", repoId: "repo-chosen", worktreeId: "wt-chosen", path: "/src/chosen", branch: "refs/heads/master" },
+      ];
+      targets.branches = [
+        { id: "local:current", branch: "refs/heads/main", environmentId: "local", projectId: "project-current", repoId: "repo-current", worktreeId: "wt-current", path: "/src/current" },
+        { id: "local:chosen", branch: "refs/heads/master", environmentId: "local", projectId: "project-chosen", repoId: "repo-chosen", worktreeId: "wt-chosen", path: "/src/chosen" },
+      ];
+      store.tasks = [{
+        id: "task-routed", title: "라우팅 확인", prompt: "본문", draft: "본문", promptRevisions: [],
+        status: "ready", priority: "medium", tags: [],
+        createdAt: "2026-08-12T00:00:00.000Z", updatedAt: "2026-08-12T00:00:00.000Z",
+        metadata: {
+          orcaGraphRunSettings: {
+            schemaVersion: 1,
+            routing: { environmentId: "local", projectId: "project-current", branch: "main", model: "claude-opus-5" },
+            executionMode: "single_session",
+            selectedProjectIds: ["project-chosen"],
+            projectRoutings: {},
+            savedAt: "2026-08-12T00:10:00.000Z",
+          },
+        },
+      }];
+    }, host.configure);
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-routed"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-routed"]')?.click();
+
+      // 창이 말하는 실행 위치부터 체크한 프로젝트와 같아야 한다.
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect([...dialog?.querySelectorAll<HTMLInputElement>('[data-action="toggle-run-worktree"]:checked') ?? []]
+        .map((input) => input.dataset.projectId)).toEqual(["project-chosen"]);
+      expect(dialog?.querySelector(".run-route-effective")?.textContent).toContain("chosen");
+
+      dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 2);
+
+      const dispatched = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "dispatch")?.payload;
+      expect(dispatched?.targets[0]).toMatchObject({
+        projectId: "project-chosen", branch: "master", worktreeId: "wt-chosen",
+      });
+      // 통합 모델은 그대로 간다. 프로젝트만 선택을 따른다.
+      expect(dispatched?.targets[0].modelDefinition).toMatchObject({ id: "claude-opus-5" });
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("groups run targets by machine, project, and worktree the way Orca shows them", async () => {
+    const dom = await mountPanel(({ targets }) => {
+      targets.environments = [
+        { id: "local", name: "device-a", local: true, connected: true },
+        { id: "env-remote", name: "device-b", local: false, connected: true },
+      ];
+      targets.projects = [
+        { id: "project-app", name: "app", environmentId: "local", repoId: "repo-app", worktreeId: "repo-app::/src/app", path: "/src/app", branch: "refs/heads/main", current: true },
+        { id: "project-lib", name: "lib", environmentId: "local", repoId: "repo-lib", worktreeId: "repo-lib::/src/lib", path: "/src/lib", branch: "refs/heads/dev" },
+        { id: "project-far", name: "far", environmentId: "env-remote", repoId: "repo-far", worktreeId: "repo-far::/far", path: "/far", branch: "refs/heads/main" },
+      ];
+      targets.branches = [
+        { id: "b1", branch: "refs/heads/main", environmentId: "local", projectId: "project-app", worktreeId: "repo-app::/src/app", path: "/src/app", displayName: "main", main: true, active: true, liveTerminals: 2, sortOrder: 1 },
+        { id: "b2", branch: "refs/heads/review", environmentId: "local", projectId: "project-app", worktreeId: "repo-app::/src/app-review", path: "/src/app-review", displayName: "review", pinned: true, sortOrder: 2 },
+        { id: "b3", branch: "refs/heads/dev", environmentId: "local", projectId: "project-lib", worktreeId: "repo-lib::/src/lib", path: "/src/lib", displayName: "dev", sortOrder: 3 },
+        { id: "b4", branch: "refs/heads/main", environmentId: "env-remote", projectId: "project-far", worktreeId: "repo-far::/far", path: "/far", displayName: "main" },
+      ];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="canvas"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+
+      // 머신이 최상위 그룹이고, 이 Orca가 먼저 온다.
+      expect([...dialog?.querySelectorAll<HTMLElement>(".run-target-environment > header > strong") ?? []]
+        .map((item) => item.textContent)).toEqual(["device-a", "device-b"]);
+      // 프로젝트는 활성 프로젝트가 먼저, 워크트리는 핀 → 활성 → sortOrder 순.
+      const local = dialog?.querySelector<HTMLElement>(".run-target-environment.active");
+      expect([...local?.querySelectorAll<HTMLElement>(".run-target-project > header > strong") ?? []]
+        .map((item) => item.textContent)).toEqual(["app", "lib"]);
+      expect([...local?.querySelectorAll<HTMLInputElement>('[data-action="toggle-run-worktree"]') ?? []]
+        .map((input) => `${input.dataset.projectId}:${input.dataset.branch}`))
+        .toEqual(["project-app:review", "project-app:main", "project-lib:dev"]);
+      expect(local?.querySelector(".run-target-worktree")?.textContent).toContain("📌");
+      expect(local?.textContent).toContain("⌨ 2");
+
+      // 다른 머신의 워크트리를 고르면 실행 머신이 그쪽으로 옮겨 간다.
+      document.querySelector<HTMLInputElement>('[data-action="toggle-run-worktree"][data-project-id="project-far"]')?.click();
+      const machine = document.querySelector<HTMLSelectElement>('[data-scope="run-routing"][data-field="environmentId"]');
+      expect(machine?.value).toBe("env-remote");
+      expect([...document.querySelectorAll<HTMLInputElement>('[data-action="toggle-run-worktree"]:checked')]
+        .map((input) => input.dataset.projectId)).toEqual(["project-far"]);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("gives each selected project its own session and model, and dispatches one per project", async () => {
+    const host = terminalHost([{ id: "shell" }]);
+    const dom = await mountPanel(({ targets }) => {
+      targets.environments = [{ id: "local", name: "this-device", local: true, connected: true }];
+      targets.projects = [
+        { id: "project-api", name: "API", environmentId: "local", repoId: "repo-api", worktreeId: "wt-api", path: "/src/api", branch: "refs/heads/main" },
+        { id: "project-web", name: "Web", environmentId: "local", repoId: "repo-web", worktreeId: "wt-web", path: "/src/web", branch: "refs/heads/release" },
+      ];
+      targets.branches = [
+        { id: "b-api", branch: "refs/heads/main", environmentId: "local", projectId: "project-api", worktreeId: "wt-api", path: "/src/api" },
+        { id: "b-web", branch: "refs/heads/release", environmentId: "local", projectId: "project-web", worktreeId: "wt-web", path: "/src/web" },
+      ];
+      targets.sessions = [{
+        id: "term_web", title: "Web Codex", environmentId: "local", worktreeId: "wt-web", projectId: "project-web",
+        branch: "refs/heads/release", paneKey: "web:1", agentType: "codex", agentState: "done", connected: true, writable: true,
+      }];
+    }, host.configure);
+    try {
+      const { document, Event } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-design"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
+
+      document.querySelector<HTMLInputElement>('[data-action="toggle-run-worktree"][data-project-id="project-api"]')?.click();
+      document.querySelector<HTMLInputElement>('[data-action="toggle-run-worktree"][data-project-id="project-web"]')?.click();
+      const mode = document.querySelector<HTMLSelectElement>('[data-scope="task-run-mode"][data-field="executionMode"]');
+      expect(mode).not.toBeNull();
+      if (mode) {
+        mode.value = "per_project";
+        mode.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+
+      // 프로젝트별을 고르면 카드가 프로젝트 수만큼 생기고, 각 카드가 자기 세션·모델을 가진다.
+      let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.querySelectorAll(".task-project-run-card")).toHaveLength(2);
+      const models = [...dialog?.querySelectorAll<HTMLSelectElement>('[data-scope="task-run-project-routing"][data-field="model"]') ?? []];
+      expect(models).toHaveLength(2);
+      const apiModel = models.find((select) => select.dataset.locator === "/src/api");
+      if (apiModel) {
+        apiModel.value = "claude-opus-5";
+        apiModel.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      const webMode = document.querySelector<HTMLSelectElement>('[data-scope="task-run-project-routing"][data-field="targetMode"][data-locator="/src/web"]');
+      if (webMode) {
+        webMode.value = "session";
+        webMode.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      const webSession = dialog?.querySelector<HTMLSelectElement>('[data-scope="task-run-project-routing"][data-field="sessionId"][data-locator="/src/web"]');
+      expect(webSession?.value).toBe("term_web");
+
+      document.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 2);
+
+      const dispatched = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "dispatch")?.payload;
+      expect(dispatched?.executionMode).toBe("per_project");
+      // 선택한 프로젝트마다 하나씩, 각자의 설정으로 나간다.
+      expect(dispatched?.targets).toHaveLength(2);
+      expect(dispatched?.targets.find((target: any) => target.projectId === "project-api")).toMatchObject({
+        worktreeId: "wt-api", modelDefinition: { id: "claude-opus-5", agent: "claude" },
+      });
+      expect(dispatched?.targets.find((target: any) => target.projectId === "project-web")).toMatchObject({
+        sessionId: "term_web",
+      });
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("carries the whole graph definition so the session never looks it up elsewhere", async () => {
+    // 노드 목록만 보내면 세션은 각 노드가 무엇을 시키는지 알 수 없어, 그래프 정의를
+    // 바깥 저장소에서 찾다가 실패한다. 실제로 "Work Tasks에 그 그래프가 없다"며 멈췄다.
+    const host = terminalHost([{ id: "shell" }]);
+    const dom = await mountPanel(({ targets }) => {
+      targets.environments = [{ id: "local", name: "this-device", local: true, connected: true }];
+      targets.projects = [{ id: "project-api", name: "API", environmentId: "local", repoId: "repo-api", worktreeId: "wt-api", path: "/src/api", branch: "refs/heads/main", current: true }];
+      targets.branches = [{ id: "b-api", branch: "refs/heads/main", environmentId: "local", projectId: "project-api", worktreeId: "wt-api", path: "/src/api" }];
+    }, host.configure);
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="canvas"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 1);
+
+      const prompt = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "dispatch")?.payload.prompt as string;
+      expect(prompt).toContain("이 id로 다른 저장소나 도구를 조회하지 마십시오");
+      // 각 노드의 지시문이 그대로 실려야 세션이 그래프를 수행할 수 있다.
+      expect(prompt).toContain("요구사항을 분석하고");
+      expect(prompt).toContain("승인된 설계를 구현하고");
+      // 조건 노드는 판정 기준과 분기가 함께 실린다.
+      expect(prompt).toContain("판정 기준:");
+      expect(prompt).toMatch(/분기 y → /u);
+      expect(prompt).toContain("NODE <노드 id> running");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("tells each target the truth about where and on what it runs", async () => {
+    // 프로젝트별 실행은 대상마다 프로젝트·브랜치·모델이 다르다. 프롬프트가 한 벌이면
+    // 두 번째 대상부터는 자기 것이 아닌 실행 컨텍스트를 사실로 읽는다.
+    const host = terminalHost([{ id: "shell" }]);
+    const dom = await mountPanel(({ targets }) => {
+      targets.environments = [{ id: "local", name: "this-device", local: true, connected: true }];
+      targets.projects = [
+        { id: "project-api", name: "API", environmentId: "local", repoId: "repo-api", worktreeId: "wt-api", path: "/src/api", branch: "refs/heads/main" },
+        { id: "project-web", name: "Web", environmentId: "local", repoId: "repo-web", worktreeId: "wt-web", path: "/src/web", branch: "refs/heads/release" },
+      ];
+      targets.branches = [
+        { id: "b-api", branch: "refs/heads/main", environmentId: "local", projectId: "project-api", worktreeId: "wt-api", path: "/src/api" },
+        { id: "b-web", branch: "refs/heads/release", environmentId: "local", projectId: "project-web", worktreeId: "wt-web", path: "/src/web" },
+      ];
+    }, host.configure);
+    try {
+      const { document, Event } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-design"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
+      document.querySelector<HTMLInputElement>('[data-action="toggle-run-worktree"][data-project-id="project-api"]')?.click();
+      document.querySelector<HTMLInputElement>('[data-action="toggle-run-worktree"][data-project-id="project-web"]')?.click();
+      const mode = document.querySelector<HTMLSelectElement>('[data-scope="task-run-mode"][data-field="executionMode"]');
+      if (mode) {
+        mode.value = "per_project";
+        mode.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      const webModel = document.querySelector<HTMLSelectElement>('[data-scope="task-run-project-routing"][data-field="model"][data-locator="/src/web"]');
+      if (webModel) {
+        webModel.value = "claude-opus-5";
+        webModel.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      document.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 1);
+
+      const dispatched = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "dispatch")?.payload;
+      const api = dispatched.targets.find((target: any) => target.projectId === "project-api");
+      const web = dispatched.targets.find((target: any) => target.projectId === "project-web");
+      expect(api.prompt).toContain("- project: API");
+      expect(api.prompt).toContain("- model: gpt-5.6-sol");
+      expect(web.prompt).toContain("- project: Web");
+      expect(web.prompt).toContain("- model: claude-opus-5");
+      expect(web.prompt).not.toContain("gpt-5.6-sol");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("does not claim a model when the run goes into a session it did not start", async () => {
+    // 기존 세션의 모델은 플러그인이 정하지 않는다. 그런데도 모델 이름을 적으면
+    // 세션은 자기가 아닌 모델을 사실로 읽고, 자기소개 같은 작업이 그대로 틀린다.
+    const host = terminalHost([{ id: "shell" }]);
+    const dom = await mountPanel(({ targets }) => {
+      targets.environments = [{ id: "local", name: "this-device", local: true, connected: true }];
+      targets.projects = [{ id: "project-api", name: "API", environmentId: "local", repoId: "repo-api", worktreeId: "wt-api", path: "/src/api", branch: "refs/heads/main", current: true }];
+      targets.branches = [{ id: "b-api", branch: "refs/heads/main", environmentId: "local", projectId: "project-api", worktreeId: "wt-api", path: "/src/api" }];
+      targets.sessions = [{
+        id: "term_live", title: "Live Codex", environmentId: "local", worktreeId: "wt-api",
+        projectId: "project-api", branch: "refs/heads/main", paneKey: "a:1", agentType: "codex",
+        agentState: "done", connected: true, writable: true,
+      }];
+    }, host.configure);
+    try {
+      const { document, Event } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-design"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
+      const targetMode = document.querySelector<HTMLSelectElement>('[data-scope="task-run-routing"][data-field="targetMode"]');
+      if (targetMode) {
+        targetMode.value = "session";
+        targetMode.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      document.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 1);
+
+      const dispatched = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "dispatch")?.payload;
+      expect(dispatched.prompt).toContain("이 세션에서 이미 돌고 있는 에이전트");
+      expect(dispatched.prompt).not.toContain("- model: gpt-5.6-sol");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("launches new sessions without approval prompts unless the run says otherwise", async () => {
+    const host = terminalHost([{ id: "shell" }]);
+    const dom = await mountPanel(({ targets }) => {
+      targets.environments = [{ id: "local", name: "this-device", local: true, connected: true }];
+      targets.projects = [{ id: "project-app", name: "app", environmentId: "local", repoId: "repo-app", worktreeId: "wt-app", path: "/src/app", branch: "refs/heads/main", current: true }];
+      targets.branches = [{ id: "b-app", branch: "refs/heads/main", environmentId: "local", projectId: "project-app", worktreeId: "wt-app", path: "/src/app" }];
+    }, host.configure);
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-design"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
+
+      // 사람이 지켜보지 않는 세션이므로 승인 우회가 기본이다.
+      const toggle = document.querySelector<HTMLInputElement>('[data-action="toggle-task-run-auto-approve"]');
+      expect(toggle?.checked).toBe(true);
+      document.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 2);
+      expect(host.commands.flatMap(decodeCommands).find((entry) => entry.command === "dispatch")?.payload.targets[0].autoApprove).toBe(true);
+
+      // 실행 후에는 실행 현황으로 넘어간다. Task로 돌아와 다시 연다.
+      host.commands.length = 0;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-design"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
+      document.querySelector<HTMLInputElement>('[data-action="toggle-task-run-auto-approve"]')?.click();
+      expect(document.querySelector<HTMLInputElement>('[data-action="toggle-task-run-auto-approve"]')?.checked).toBe(false);
+      document.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 2);
+      expect(host.commands.flatMap(decodeCommands).find((entry) => entry.command === "dispatch")?.payload.targets[0].autoApprove).toBe(false);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("keeps saved per-project settings for a Task that has no target projects", async () => {
+    // Task에 대상 프로젝트를 붙이지 않고 트리에서 직접 고른 경우다. 저장해 둔
+    // 프로젝트별 설정을 잃으면 창은 고른 프로젝트마다 "사용할 수 없습니다"라고
+    // 말하고 실행 버튼이 잠긴다 — 고친 것이 그 상황이다.
+    const host = terminalHost([{ id: "shell" }]);
+    const dom = await mountPanel(({ store, targets }) => {
+      targets.environments = [{ id: "local", name: "this-device", local: true, connected: true }];
+      targets.projects = [
+        { id: "project-plan", name: "plan", environmentId: "local", repoId: "repo-plan", worktreeId: "wt-plan", path: "/src/plan", branch: "refs/heads/master" },
+        { id: "project-work", name: "work", environmentId: "local", repoId: "repo-work", worktreeId: "wt-work", path: "/src/work", branch: "refs/heads/dev" },
+      ];
+      targets.branches = [
+        { id: "b-plan", branch: "refs/heads/master", environmentId: "local", projectId: "project-plan", worktreeId: "wt-plan", path: "/src/plan" },
+        { id: "b-work", branch: "refs/heads/dev", environmentId: "local", projectId: "project-work", worktreeId: "wt-work", path: "/src/work" },
+      ];
+      store.tasks = [{
+        id: "task-two", title: "두 프로젝트", prompt: "본문", draft: "본문", promptRevisions: [],
+        status: "ready", priority: "medium", tags: [],
+        createdAt: "2026-08-12T00:00:00.000Z", updatedAt: "2026-08-12T00:00:00.000Z",
+        metadata: {
+          orcaGraphRunSettings: {
+            schemaVersion: 1,
+            routing: { environmentId: "local", model: "claude-opus-5" },
+            executionMode: "per_project",
+            selectedProjectIds: ["project-plan", "project-work"],
+            projectRoutings: {
+              "/src/plan": { environmentId: "local", projectId: "project-plan", branch: "master", model: "gpt-5.6-sol" },
+              "/src/work": { environmentId: "local", projectId: "project-work", branch: "dev", model: "gpt-5.6-sol" },
+            },
+            savedAt: "2026-08-12T00:10:00.000Z",
+          },
+        },
+      }];
+    }, host.configure);
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-two"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-two"]')?.click();
+
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).not.toContain("선택한 Orca 프로젝트를 사용할 수 없습니다");
+      expect(dialog?.querySelector(".run-configuration-errors")).toBeNull();
+      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.disabled).toBe(false);
+      expect(dialog?.querySelectorAll(".task-project-run-card")).toHaveLength(2);
+
+      document.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 1);
+
+      const dispatched = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "dispatch")?.payload;
+      expect(dispatched?.executionMode).toBe("per_project");
+      expect(dispatched?.targets.map((target: any) => target.worktreeId).sort()).toEqual(["wt-plan", "wt-work"]);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("comes back to the screen it was on, not the canvas", async () => {
+    // 패널에는 저장소가 없어 다시 열면 처음 화면(캔버스)으로 돌아간다. 저장할 때
+    // 지금 화면을 함께 남겨 두고, 다음에 열 때 그 화면으로 돌아간다.
+    const host = terminalHost([{ id: "shell" }]);
+    const dom = await mountPanel(undefined, host.configure);
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="new-local-task"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="save"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 1);
+
+      const saved = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "save")?.payload;
+      expect(saved.panelView).toMatchObject({ mode: "tasks" });
+      dom.window.close();
+    } finally {
+      // 위에서 닫았다면 두 번 닫아도 안전하다.
+    }
+
+    // 다음에 열 때 그 화면으로 돌아온다.
+    const reopened = await mountPanel(({ store }) => {
+      store.panelView = { mode: "tasks", selectedTaskId: "task-design", taskDetailOpen: true };
+    });
+    try {
+      expect(reopened.window.document.querySelector('[aria-label="Task 상세"]')).not.toBeNull();
+      expect(reopened.window.document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.classList.contains("active")).toBe(true);
+    } finally {
+      reopened.window.close();
+    }
+  });
+
+  it("forgets a session that has since closed instead of blocking every node", async () => {
+    // 그래프 기본값에는 지난 실행에서 고른 세션 id가 남는다. 그 세션이 닫히면 모든
+    // 노드가 "선택한 세션을 사용할 수 없습니다"로 막히고, 어디를 고쳐야 하는지도
+    // 알 수 없다 — 살아 있지 않은 세션은 지정하지 않은 것으로 본다.
+    const dom = await mountPanel(({ store, targets }) => {
+      targets.environments = [{ id: "local", name: "this-device", local: true, connected: true }];
+      targets.projects = [{ id: "project-api", name: "API", environmentId: "local", repoId: "repo-api", worktreeId: "wt-api", path: "/src/api", branch: "refs/heads/main", current: true }];
+      targets.branches = [{ id: "b-api", branch: "refs/heads/main", environmentId: "local", projectId: "project-api", worktreeId: "wt-api", path: "/src/api" }];
+      targets.sessions = [];
+      store.graphs[0].defaults = {
+        environmentId: "local", projectId: "project-api", branch: "main",
+        sessionId: "term_closed_yesterday", model: "gpt-5.6-sol",
+      };
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="canvas"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
+
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.textContent).not.toContain("세션을 사용할 수 없습니다");
+      expect(dialog?.querySelector(".run-configuration-errors")).toBeNull();
+      // 세션 대신 워크트리로 돌아간다 — 그 프로젝트에서 새 세션을 연다.
+      expect(dialog?.querySelector(".run-route-effective")?.textContent).toContain("새 세션 · API");
+      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.disabled).toBe(false);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("says what to do when this device has never read its Orca targets", async () => {
+    // 새로 설치한 장치의 상태다. 대상 파일이 없어 패널은 패키지 기본값(프로젝트 0)을
+    // 싣고 열린다. 그 상태에서 "현재 컨텍스트로 실행을 시도한다"는 안내는 거짓이다 —
+    // 고를 워크트리도 세션도 없으므로 보내면 반드시 실패한다.
+    const dom = await mountPanel(({ targets }) => {
+      targets.environments = [{ id: "local", name: "local", local: true, connected: true }];
+      targets.projects = [];
+      targets.branches = [];
+      targets.sessions = [];
+    });
+    try {
+      const { document } = dom.window;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="canvas"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
+
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.querySelectorAll('[data-action="toggle-run-worktree"]')).toHaveLength(0);
+      expect(dialog?.textContent).toContain("Orca 대상 갱신");
+      expect(dialog?.textContent).not.toContain("현재 Orca 컨텍스트로 실행을 시도합니다");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("sends a Task to a chosen worktree and a Graph to a live session", async () => {
+    // 요구사항 두 가지를 한 번에 확인한다. 이 Orca의 프로젝트·워크트리·세션을
+    // 고를 수 있어야 하고, 고른 것이 실제로 보낼 수 있는 대상으로 나가야 한다.
+    const host = terminalHost([{ id: "shell" }]);
+    const dom = await mountPanel(({ targets }) => {
+      targets.environments = [{ id: "local", name: "this-device", local: true, connected: true }];
+      targets.projects = [{
+        id: "github:me/app", name: "app", environmentId: "local", repoId: "repo-app",
+        worktreeId: "repo-app::/src/app", path: "/src/app", branch: "refs/heads/main", current: true,
+      }];
+      targets.branches = [
+        { id: "local:main", branch: "refs/heads/main", environmentId: "local", projectId: "github:me/app", repoId: "repo-app", worktreeId: "repo-app::/src/app", path: "/src/app" },
+        { id: "local:review", branch: "refs/heads/review", environmentId: "local", projectId: "github:me/app", repoId: "repo-app", worktreeId: "repo-app::/src/app-review", path: "/src/app-review" },
+      ];
+      targets.sessions = [{
+        id: "term_live", title: "Live Claude", environmentId: "local", worktreeId: "repo-app::/src/app",
+        projectId: "github:me/app", branch: "refs/heads/main", paneKey: "tab:leaf",
+        agentType: "claude", agentState: "done", connected: true, writable: true,
+      }];
+    }, host.configure);
+    try {
+      const { document, Event } = dom.window;
+
+      // Task — 이 장치의 프로젝트를 고르고, 그 프로젝트의 다른 워크트리로 보낸다.
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="tasks"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="select-local-task"][data-id="task-design"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-task-run"][data-id="task-design"]')?.click();
+      let dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect([...dialog?.querySelectorAll<HTMLElement>(".run-target-project > header > strong") ?? []]
+        .map((option) => option.textContent)).toEqual(["app"]);
+      // 프로젝트 아래에 워크트리가 그대로 나열되고, 고르는 단위가 워크트리다.
+      expect([...dialog?.querySelectorAll<HTMLInputElement>('[data-action="toggle-run-worktree"]') ?? []]
+        .map((input) => input.dataset.branch)).toEqual(["main", "review"]);
+      dialog?.querySelector<HTMLInputElement>('[data-action="toggle-run-worktree"][data-branch="review"]')?.click();
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      document.querySelector<HTMLButtonElement>('[data-action="confirm-task-run"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 2);
+
+      const taskDispatch = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "dispatch")?.payload;
+      expect(taskDispatch?.itemKind).toBe("task");
+      // 고른 워크트리가 그대로 나가야 세션이 그 체크아웃에서 열린다.
+      expect(taskDispatch?.targets[0]).toMatchObject({
+        projectId: "github:me/app", branch: "review", worktreeId: "repo-app::/src/app-review",
+      });
+      expect(taskDispatch?.targets[0].modelDefinition).toMatchObject({ id: "gpt-5.6-sol", agent: "codex" });
+
+      // Graph — 이미 떠 있는 세션으로 보낸다. 이때는 새 세션을 만들지 않는다.
+      host.commands.length = 0;
+      document.querySelector<HTMLButtonElement>('[data-action="set-view"][data-id="canvas"]')?.click();
+      document.querySelector<HTMLButtonElement>('[data-action="open-run"]')?.click();
+      const targetMode = document.querySelector<HTMLSelectElement>('[data-scope="run-routing"][data-field="targetMode"]');
+      if (targetMode) {
+        targetMode.value = "session";
+        targetMode.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+      expect(dialog?.querySelector<HTMLSelectElement>('[data-scope="run-routing"][data-field="sessionId"]')?.value).toBe("term_live");
+      expect(dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.disabled).toBe(false);
+      dialog?.querySelector<HTMLButtonElement>('[data-action="confirm-run"]')?.click();
+      await settle(dom);
+      await waitForCommands(host, 2);
+
+      const graphDispatch = host.commands.flatMap(decodeCommands).find((entry) => entry.command === "dispatch")?.payload;
+      expect(graphDispatch?.itemKind).toBe("graph");
+      expect(graphDispatch?.targets[0]).toMatchObject({ sessionId: "term_live" });
+      expect(graphDispatch?.targets[0].worktreeId).toBeUndefined();
     } finally {
       dom.window.close();
     }
